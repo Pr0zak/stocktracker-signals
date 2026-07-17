@@ -63,6 +63,8 @@ trend. A strongly extended move is a reason for caution, not for chasing.
 When the picture is mixed or weak, return "hold" with lower conviction rather than forcing a call. \
 Reserve high conviction for genuine confluence.
 - Always give a concrete invalidation (a price level or condition that would flip your view).
+- If the snapshot includes `recent_news` (headlines) or `next_earnings` (a date), use them to \
+populate `catalysts` and sharpen `key_risks` — but do NOT invent news beyond what is provided.
 - This is decision support, not investment advice."""
 
 

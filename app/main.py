@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from . import selfupdate, settings_store
 from .analyst import analyze
 from .market import fetch_series, summarize
+from .news import fetch_context
 from .scan_job import LATEST, run_scan
 
 _http: httpx.AsyncClient | None = None
@@ -81,6 +82,9 @@ _PAGE = """<!doctype html>
     <label for="key">Anthropic API key</label>
     <input id="key" type="password" autocomplete="off" placeholder="leave blank to keep current">
     <div class="hint" id="keyhint"></div>
+    <label for="fkey">Finnhub API key <span class="hint">— optional, adds news + earnings context</span></label>
+    <input id="fkey" type="password" autocomplete="off" placeholder="leave blank to keep current">
+    <div class="hint" id="fkeyhint"></div>
     <label for="deep">Deep model <span class="hint">— on-demand deep dives</span></label>
     <input id="deep" autocomplete="off">
     <label for="scan">Scan model <span class="hint">— cheap watchlist scans</span></label>
@@ -103,7 +107,8 @@ _PAGE = """<!doctype html>
       <button type="button" class="secondary" onclick="addSym('cwatch')">Add</button>
     </div>
     <div class="chips" id="cwatch-chips"></div>
-    <div class="hint" style="margin-top:.7rem">Scanned nightly at 06:30; the app notifies you when a signal flips.</div>
+    <div class="hint" style="margin-top:.7rem">Auto-synced from the app when it connects (you can also edit here).
+    Scanned nightly at 06:30 — the app notifies you when a signal flips.</div>
   </div>
 
   <button class="save" type="submit">Save settings</button>
@@ -167,6 +172,8 @@ Decision support only — not investment advice.</p>
     $("keyhint").textContent = s.anthropic_api_key_set
       ? "Key is set (" + s.anthropic_api_key_hint + "). Leave blank to keep it."
       : "No key set — the analyst can't run until you add one.";
+    $("fkeyhint").textContent = s.finnhub_api_key_set
+      ? "Key is set. Leave blank to keep it." : "No Finnhub key — news/earnings context is off.";
   }
   $("f").onsubmit = async (e) => {
     e.preventDefault();
@@ -175,11 +182,12 @@ Decision support only — not investment advice.</p>
                    verdict_ttl_seconds: Number($("ttl").value),
                    watchlist: lists.watch, crypto_watchlist: lists.cwatch };
     if ($("key").value) body.anthropic_api_key = $("key").value;
+    if ($("fkey").value) body.finnhub_api_key = $("fkey").value;
     const r = await fetch("/api/settings", { method: "POST",
       headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const st = $("status");
     st.textContent = r.ok ? "Saved ✓" : "Save failed"; st.className = r.ok ? "ok-t" : "err-t";
-    $("key").value = ""; load();
+    $("key").value = ""; $("fkey").value = ""; load();
   };
 
   async function checkVersion() {
@@ -216,6 +224,7 @@ async def get_settings() -> dict:
     return {
         "anthropic_api_key_set": bool(key),
         "anthropic_api_key_hint": ("…" + key[-4:]) if len(key) >= 4 else ("set" if key else ""),
+        "finnhub_api_key_set": bool(cfg.get("finnhub_api_key", "")),
         "deep_model": cfg["deep_model"],
         "scan_model": cfg["scan_model"],
         "verdict_ttl_seconds": cfg["verdict_ttl_seconds"],
@@ -226,6 +235,7 @@ async def get_settings() -> dict:
 
 class SettingsPatch(BaseModel):
     anthropic_api_key: str | None = None
+    finnhub_api_key: str | None = None
     deep_model: str | None = None
     scan_model: str | None = None
     verdict_ttl_seconds: int | None = None
@@ -286,6 +296,8 @@ async def _build_signal(symbol: str, *, deep: bool, crypto: bool) -> dict:
             bench_closes = None
 
     summary = summarize(series, bench_closes)
+    if not crypto:  # optional news/earnings context (Finnhub, stocks only)
+        summary.update(await fetch_context(_http, series.symbol))
     try:
         verdict, usage = await analyze(summary, deep=deep)
     except Exception as e:  # noqa: BLE001

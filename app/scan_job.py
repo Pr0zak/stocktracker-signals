@@ -19,6 +19,7 @@ import httpx
 from . import settings_store
 from .analyst import analyze
 from .market import fetch_series, summarize
+from .news import fetch_context
 
 LATEST = Path(__file__).resolve().parent.parent / "data" / "scan_latest.json"
 
@@ -28,6 +29,8 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
     if len(series.closes) < 30:
         raise ValueError("not enough history")
     summary = summarize(series, None if crypto else bench_closes)
+    if not crypto:
+        summary.update(await fetch_context(client, series.symbol))
     verdict, usage = await analyze(summary, deep=False)
     return {
         "symbol": series.symbol,

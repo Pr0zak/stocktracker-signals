@@ -25,6 +25,7 @@ def _split(s: str) -> list[str]:
 def _defaults() -> dict:
     return {
         "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
+        "finnhub_api_key": os.environ.get("FINNHUB_API_KEY", ""),
         "deep_model": os.environ.get("DEEP_MODEL", "claude-opus-4-8"),
         "scan_model": os.environ.get("SCAN_MODEL", "claude-haiku-4-5"),
         "verdict_ttl_seconds": int(os.environ.get("VERDICT_TTL_SECONDS", "14400")),
@@ -55,7 +56,7 @@ def update(patch: dict) -> dict:
     """Apply a partial update. Empty strings are treated as "leave unchanged" so a blank key field
     in the UI never wipes the stored key."""
     with _lock:
-        for k in ("anthropic_api_key", "deep_model", "scan_model"):
+        for k in ("anthropic_api_key", "finnhub_api_key", "deep_model", "scan_model"):
             v = patch.get(k)
             if v is not None and str(v).strip() != "":
                 _current[k] = str(v).strip()
