@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import selfupdate, settings_store, usage_store
-from . import shorts
+from . import cycle, shorts
 from .analyst import analyze, plan_entry, recommend
 from .discover import discover
 from .market import fetch_series, summarize
@@ -379,6 +379,8 @@ async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | No
             bench_closes = None
 
     summary = summarize(series, None if crypto else bench_closes)
+    if crypto:  # multi-year trend + (BTC) halving-cycle position — weak-sample context, flagged as such
+        summary.update(await cycle.crypto_context(_http, series.symbol, series.closes))
     if not crypto:  # optional news/earnings context (Finnhub, stocks only)
         summary.update(await fetch_context(_http, series.symbol))
         # Short-pressure context (FINRA SI + daily short volume + SEC FTDs) — best-effort; the
@@ -496,6 +498,13 @@ async def calendar_endpoint(symbol: str | None = None) -> dict:
         except Exception:  # noqa: BLE001
             continue
     events = await shorts.calendar(_http, syms, earnings)
+    # Next Bitcoin halving (estimated) — shown whenever the watchlist has BTC exposure.
+    if symbol is None and any("BTC" in c.upper() for c in cfg.get("crypto_watchlist", [])):
+        events.append({
+            "date": cycle.NEXT_HALVING_EST.isoformat(), "symbol": "BTC-USD",
+            "label": "Bitcoin halving (~estimated from block schedule)", "kind": "btc_halving",
+        })
+        events.sort(key=lambda x: x["date"])
     payload = {"as_of": now, "symbol": symbol.upper() if symbol else None, "events": events, "cached": False}
     _cache[key] = (now, payload)
     return payload

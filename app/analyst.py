@@ -81,6 +81,12 @@ were NOT bullish here). If `upcoming_within_14d` lists near-term dates (SI publi
 earnings, speculative t35_echo), you may cite them in `catalysts` with their real meaning — an SI \
 publication reveals positioning, OPEX affects hedging flows, a t35_echo is a speculative retail \
 theory and must be labeled as such if mentioned.
+- Crypto snapshots may include `long_term_trend` (price vs 200-week SMA, Mayer Multiple, distance \
+from ATH, 3y CAGR) and, for BTC, `btc_halving_cycle` (cycle position, phase, and a past-cycle \
+analog of 12-month-forward returns from this position). Use them to frame the MULTI-YEAR regime — \
+price above a rising 200-week SMA is a structurally healthier base than below it — but respect the \
+attached sample-size note: four halvings is anecdote-grade evidence. Never let cycle folklore \
+override what current price and momentum are actually doing.
 - If the snapshot includes `recent_news` (headlines) or `next_earnings` (a date), use them to \
 populate `catalysts` and sharpen `key_risks` — but do NOT invent news beyond what is provided.
 - If the snapshot includes a `position` block, the user ALREADY HOLDS this asset (shares, average \

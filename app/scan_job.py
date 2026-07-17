@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 
-from . import settings_store, shorts, usage_store
+from . import cycle, settings_store, shorts, usage_store
 from .analyst import analyze
 from .market import fetch_series, summarize
 from .news import fetch_context
@@ -31,6 +31,11 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
         raise ValueError("not enough history")
     summary = summarize(series, None if crypto else bench_closes)
     squeeze = None
+    if crypto:
+        try:
+            summary.update(await cycle.crypto_context(client, series.symbol, series.closes))
+        except Exception:  # noqa: BLE001
+            pass
     if not crypto:
         summary.update(await fetch_context(client, series.symbol))
         try:  # short-pressure enrichment — best-effort, cached across the whole scan
