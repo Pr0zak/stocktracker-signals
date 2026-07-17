@@ -178,6 +178,8 @@ unless its setup is clearly the best available.
 uninvested is a valid recommendation.
 - List every candidate you considered but did not pick in `passed` (symbols only).
 - overview = 2-3 sentences: the market context and why these picks (or why none).
+- Stay COMPACT: each pick's thesis and timing at most 25 words each. The full response must not run
+long — verbosity gets it truncated.
 - conviction is a 0-100 scale (reserve 70+ for genuine confluence).
 - If snapshots include `short_pressure`: high short interest is a bearish base rate. Never pick a \
 heavily-shorted name as a squeeze play unless its state is "ignition", and say so explicitly with \
@@ -224,7 +226,7 @@ def _render(summary: dict) -> str:
     )
 
 
-async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tokens: int = 2048):
+async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tokens: int = 4096):
     """One structured-output Claude call on the configured scan/deep model. Returns (parsed, usage)."""
     cfg = settings_store.get()
     model = cfg["deep_model"] if deep else cfg["scan_model"]
@@ -240,6 +242,9 @@ async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tok
         kwargs["thinking"] = {"type": "adaptive"}
 
     resp = await _get_client().messages.parse(**kwargs)
+    if resp.stop_reason == "max_tokens":
+        # Truncated JSON parses as garbage — fail with a clear cause instead of a pydantic stack.
+        raise RuntimeError(f"analyst output hit the {max_tokens}-token cap and was truncated — retry")
     parsed = resp.parsed_output
     if parsed is None:
         raise RuntimeError(f"analyst returned no structured output (stop_reason={resp.stop_reason})")
@@ -273,7 +278,7 @@ async def recommend(summaries: list[dict], *, cash: float, deep: bool = False) -
         + json.dumps(summaries, indent=2)
         + "\n\nReturn your structured recommendations for deploying this cash."
     )
-    recs, usage = await _parse(REC_SYSTEM, prompt, RecommendationSet, deep=deep, max_tokens=4096)
+    recs, usage = await _parse(REC_SYSTEM, prompt, RecommendationSet, deep=deep, max_tokens=8192)
     for p in recs.picks:
         p.conviction = max(0, min(100, p.conviction))
     return recs, usage
