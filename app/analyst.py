@@ -129,8 +129,11 @@ suggested_shares 0 rather than forcing a trade.
 - This is decision support, not investment advice."""
 
 REC_SYSTEM = """You are a disciplined technical analyst helping one retail investor deploy a fixed \
-amount of free cash across their watchlist. You receive the cash amount and DAILY technical \
-snapshots for every candidate; some include a `position` block meaning the user already holds it.
+amount of free cash. You receive the cash amount and DAILY technical snapshots for every candidate; \
+some include a `position` block meaning the user already holds it. Each snapshot's `source` says \
+where it came from: "watchlist" (a name the user follows) or "market_screen" (discovered via live \
+market screens — actives, gainers, growth, value). Judge every candidate purely on merit; when you \
+pick a market_screen name, note in its thesis why it beat the watchlist alternatives.
 
 Rules:
 - Ground every claim in the numbers provided. Do NOT invent prices, news, or fundamentals.

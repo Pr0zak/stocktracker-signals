@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from . import selfupdate, settings_store, usage_store
 from .analyst import analyze, plan_entry, recommend
+from .discover import discover
 from .market import fetch_series, summarize
 from .news import fetch_context
 from .scan_job import LATEST, run_scan
@@ -480,43 +481,53 @@ class RecommendRequest(BaseModel):
     cash: float
     deep: bool = False
     holdings: list[Holding] = []  # transient — informs concentration, never persisted
+    scope: str = "watchlist"     # "watchlist" | "market" (adds live-screened candidates)
 
 
 @app.post("/recommendations")
 async def recommendations(req: RecommendRequest) -> dict:
-    """Rank the synced watchlist for NEW money: the analyst sees every candidate's snapshot at once
-    (cross-comparison), picks the top 2-4, and spreads the cash across them with share counts."""
+    """Rank candidates for NEW money: the analyst sees every snapshot at once (cross-comparison),
+    picks the top 2-4, and spreads the cash across them with share counts. scope="market" widens the
+    pool beyond the watchlist with candidates from live Yahoo screeners."""
     if req.cash <= 0:
         raise HTTPException(status_code=422, detail="cash must be > 0")
+    market = req.scope == "market"
     cfg = settings_store.get()
     stocks = cfg.get("watchlist", [])
     cryptos = cfg.get("crypto_watchlist", [])
-    if not stocks and not cryptos:
+    if not stocks and not cryptos and not market:
         raise HTTPException(status_code=422, detail="watchlist is empty — open the app to sync it")
+
+    assert _http is not None
+    discovered: list[str] = []
+    if market:
+        exclude = {s.upper() for s in stocks} | {c.upper() for c in cryptos}
+        discovered = await discover(_http, exclude)
 
     holdings = {h.symbol.upper(): h for h in req.holdings}
     key = (
         "recs", round(req.cash, 2), req.deep, tuple(sorted(stocks)), tuple(sorted(cryptos)),
         tuple(sorted((s, h.shares, h.avg_cost) for s, h in holdings.items())),
+        req.scope, tuple(discovered),
     )
     now = time.time()
     hit = _cache.get(key)
     if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
         return {**hit[1], "cached": True}
 
-    assert _http is not None
     bench: list[float] | None = None
-    if stocks:  # fetch the S&P once for all equity snapshots
+    if stocks or discovered:  # fetch the S&P once for all equity snapshots
         try:
             bench = (await fetch_series(_http, "^GSPC")).closes
         except Exception:  # noqa: BLE001 — relative strength just gets skipped
             bench = None
 
-    async def snap(sym: str, crypto: bool) -> dict | None:
+    async def snap(sym: str, crypto: bool, source: str) -> dict | None:
         try:
             s = await _snapshot(sym, crypto=crypto, bench_closes=bench)
         except HTTPException:
             return None  # skip unfetchable symbols rather than failing the whole ranking
+        s["source"] = source
         h = holdings.get(str(s.get("symbol", sym)).upper())
         if h:
             pos = _position_block(s, h.shares, h.avg_cost)
@@ -526,8 +537,9 @@ async def recommendations(req: RecommendRequest) -> dict:
 
     snaps = [
         s for s in await asyncio.gather(
-            *[snap(x, False) for x in stocks],
-            *[snap(x, True) for x in cryptos],
+            *[snap(x, False, "watchlist") for x in stocks],
+            *[snap(x, True, "watchlist") for x in cryptos],
+            *[snap(x, False, "market_screen") for x in discovered],
         ) if s
     ]
     if not snaps:
@@ -555,6 +567,8 @@ async def recommendations(req: RecommendRequest) -> dict:
         "model": usage["model"],
         "as_of": now,
         "cash": req.cash,
+        "scope": req.scope,
+        "discovered": discovered,
         "considered": len(snaps),
         "overview": recs.overview,
         "picks": [p.model_dump() for p in recs.picks],
