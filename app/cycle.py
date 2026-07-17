@@ -52,7 +52,8 @@ def halving_cycle(today: date | None = None) -> dict:
 
 
 async def _weekly_max(client: httpx.AsyncClient, symbol: str) -> tuple[list[str], list[float]]:
-    data = await _fetch_chart(client, symbol, rng="max", interval="1wk")
+    # Explicit 10y beats "max": Yahoo's max+1wk combo truncates to ~3y for some crypto symbols.
+    data = await _fetch_chart(client, symbol, rng="10y", interval="1wk")
     result = data["chart"]["result"][0]
     ts = result.get("timestamp") or []
     closes_raw = (result.get("indicators", {}).get("quote") or [{}])[0].get("close") or []
