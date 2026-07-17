@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
@@ -102,10 +103,26 @@ async def run_scan() -> dict:
             *[one(s, True) for s in cryptos],
         ))
 
+    # Day-of / day-before key-date alerts (SI publication, OPEX, earnings, speculative T+35 echoes)
+    # so the app can warn BEFORE the event, not after.
+    date_alerts: list[str] = []
+    try:
+        async with httpx.AsyncClient() as c2:
+            cal = await shorts.calendar(c2, stocks)
+        today, tomorrow = date.today().isoformat(), (date.today() + timedelta(days=1)).isoformat()
+        for e in cal:
+            if e["date"] in (today, tomorrow):
+                when = "Today" if e["date"] == today else "Tomorrow"
+                sym = f"{e['symbol']} " if e.get("symbol") else ""
+                date_alerts.append(f"{when}: {sym}{e['label']}")
+    except Exception:  # noqa: BLE001 — alerts are enrichment
+        pass
+
     payload = {
         "generated_at": time.time(),
         "results": results,
         "flips": [r["symbol"] for r in results if r.get("flipped")],
+        "date_alerts": date_alerts,
         "total_cost_usd": round(sum(r.get("cost_usd", 0.0) for r in results), 6),
     }
     LATEST.parent.mkdir(parents=True, exist_ok=True)

@@ -281,6 +281,31 @@ def _add_business_days(d: date, n: int) -> date:
     return d
 
 
+async def calendar(client: httpx.AsyncClient, symbols: list[str], earnings: dict[str, str] | None = None) -> list[dict]:
+    """Watchlist-wide catalyst calendar: global dates once (SI settlement/publication, OPEX) plus
+    per-symbol speculative T+35 echoes and known earnings dates. Sorted soonest-first."""
+    events: list[dict] = [{**e, "symbol": None} for e in upcoming_dates(None)]
+    today = date.today()
+    for sym in symbols:
+        f = await ftd(client, sym)
+        for sd in (f or {}).get("spike_dates", []):
+            try:
+                echo = datetime.strptime(sd, "%Y%m%d").date() + timedelta(days=35)
+            except ValueError:
+                continue
+            if today <= echo <= today + timedelta(days=60):
+                events.append({
+                    "date": echo.isoformat(), "symbol": sym,
+                    "label": f"T+35 echo of {sd[:4]}-{sd[4:6]}-{sd[6:]} FTD spike (speculative)",
+                    "kind": "t35_echo",
+                })
+        e = (earnings or {}).get(sym)
+        if e:
+            events.append({"date": e, "symbol": sym, "label": "Earnings", "kind": "earnings"})
+    events.sort(key=lambda x: x["date"])
+    return events[:30]
+
+
 def upcoming_dates(ftd_spikes: list[str] | None = None) -> list[dict]:
     """Known/estimated future dates that matter for short mechanics, soonest first."""
     today = date.today()
@@ -381,7 +406,10 @@ async def short_pressure(
         "short_vol_days": (sv or {}).get("days"),
         "ftd_latest": (f or {}).get("latest"),
         "ftd_trend": (f or {}).get("trend"),
-        "ftd_series": (f or {}).get("series", [])[-16:],
+        # Object form for clients (kotlinx-friendly), most recent ~16 settlement days.
+        "ftd_series": [
+            {"date": d, "qty": q} for d, q, _ in (f or {}).get("series", [])[-16:]
+        ],
         "event_study": study,
         "upcoming": upcoming_dates((f or {}).get("spike_dates")),
         "reasons": reasons,
