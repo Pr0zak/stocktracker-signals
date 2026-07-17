@@ -118,6 +118,9 @@ _PAGE = """<!doctype html>
     <button type="button" class="ok" id="update" style="display:none">Update &amp; restart</button>
   </div>
   <div id="upstatus"></div>
+  <div class="hint" style="margin-top:.8rem">
+    <a href="https://github.com/Pr0zak/stocktracker-signals" target="_blank" rel="noopener">github.com/Pr0zak/stocktracker-signals</a>
+  </div>
 </div>
 
 <p class="hint">API: <code>GET /signal/{symbol}</code> · <code>POST /scan/run</code> · <code>GET /scan/latest</code> · <code>GET /health</code>.
