@@ -16,7 +16,7 @@ from pathlib import Path
 
 import httpx
 
-from . import settings_store
+from . import settings_store, usage_store
 from .analyst import analyze
 from .market import fetch_series, summarize
 from .news import fetch_context
@@ -32,6 +32,7 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
     if not crypto:
         summary.update(await fetch_context(client, series.symbol))
     verdict, usage = await analyze(summary, deep=False)
+    usage_store.record(usage, symbol=series.symbol, kind="scan")
     return {
         "symbol": series.symbol,
         "signal": verdict.signal.value,

@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from . import selfupdate, settings_store
+from . import selfupdate, settings_store, usage_store
 from .analyst import analyze
 from .market import fetch_series, summarize
 from .news import fetch_context
@@ -67,6 +67,12 @@ _PAGE = """<!doctype html>
   .synced { font-size: .85rem; margin: .1rem 0 .5rem; color: var(--muted); }
   .synced.fresh { color: var(--ok); }
   .synced.stale { color: #d97706; }
+  .usage-totals { font-size: 1rem; margin: .1rem 0 .3rem; }
+  .usage-totals b { color: var(--accent); }
+  #usage-chart svg { display: block; width: 100%; height: auto; margin: .5rem 0 .2rem; }
+  #usage-chart .bar { fill: var(--accent); }
+  #usage-chart .bar.zero { fill: rgba(136,136,136,.28); }
+  #usage-chart .axis { fill: var(--muted); font-size: 9px; }
   .save { margin-top: .4rem; }
   #status, #upstatus { font-size: .88rem; min-height: 1.1rem; margin-top: .6rem; }
   .ok-t { color: var(--ok); } .err-t { color: var(--err); }
@@ -108,6 +114,14 @@ _PAGE = """<!doctype html>
   <button class="save" type="submit">Save settings</button>
   <div id="status"></div>
 </form>
+
+<div class="card">
+  <h2>AI usage</h2>
+  <div id="usage-totals" class="usage-totals">loading…</div>
+  <div id="usage-chart"></div>
+  <div class="hint">Daily tokens over the last 30 days (hover a bar for the day's detail).</div>
+  <div id="usage-models" class="hint"></div>
+</div>
 
 <div class="card">
   <h2>Service</h2>
@@ -163,6 +177,41 @@ Decision support only — not investment advice.</p>
     try { renderSynced((await (await fetch("/api/settings")).json()).watchlist_synced_at); } catch (e) {}
   }
 
+  const fmt = (n) => Number(n).toLocaleString();
+  function drawUsageChart(series) {
+    const box = $("usage-chart");
+    const W = 520, H = 130, padL = 6, padT = 8, padB = 18;
+    const n = series.length;
+    const max = Math.max(1, ...series.map((d) => d.tokens));
+    const bw = (W - padL) / n;
+    const bars = series.map((d, i) => {
+      const h = (d.tokens / max) * (H - padT - padB);
+      const x = padL + i * bw, y = H - padB - h;
+      const t = d.date + ": " + fmt(d.tokens) + " tokens · $" + d.cost_usd.toFixed(4) +
+        " · " + d.calls + " call" + (d.calls === 1 ? "" : "s");
+      return '<rect class="bar' + (d.tokens ? '' : ' zero') + '" x="' + x.toFixed(1) +
+        '" y="' + y.toFixed(1) + '" width="' + Math.max(1, bw - 1.5).toFixed(1) +
+        '" height="' + Math.max(1, h).toFixed(1) + '" rx="1"><title>' + t + '</title></rect>';
+    }).join("");
+    const md = (s) => s.slice(5);
+    const lbl = '<text class="axis" x="' + padL + '" y="' + (H - 5) + '">' + md(series[0].date) + '</text>' +
+      '<text class="axis" x="' + (W / 2) + '" y="' + (H - 5) + '" text-anchor="middle">' + md(series[Math.floor(n / 2)].date) + '</text>' +
+      '<text class="axis" x="' + W + '" y="' + (H - 5) + '" text-anchor="end">' + md(series[n - 1].date) + '</text>';
+    box.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="daily AI token usage">' + bars + lbl + '</svg>';
+  }
+  async function loadUsage() {
+    try {
+      const u = await (await fetch("/api/usage?days=30")).json();
+      $("usage-totals").innerHTML = "<b>" + fmt(u.total_tokens) + "</b> tokens · <b>$" +
+        u.total_cost_usd.toFixed(4) + "</b> · " + fmt(u.total_calls) + " calls" +
+        ' <span class="hint">(' + fmt(u.total_input_tokens) + " in / " + fmt(u.total_output_tokens) + " out, all-time)</span>";
+      drawUsageChart(u.series);
+      const models = Object.entries(u.by_model).sort((a, b) => b[1].cost_usd - a[1].cost_usd)
+        .map(([m, v]) => m + " — " + fmt(v.calls) + " calls · $" + v.cost_usd.toFixed(4)).join("<br>");
+      $("usage-models").innerHTML = models || "No calls recorded yet.";
+    } catch (e) { $("usage-totals").textContent = "usage unavailable"; }
+  }
+
   async function load() {
     const s = await (await fetch("/api/settings")).json();
     $("deep").value = s.deep_model; $("scan").value = s.scan_model; $("ttl").value = s.verdict_ttl_seconds;
@@ -204,8 +253,8 @@ Decision support only — not investment advice.</p>
     setTimeout(() => { $("upstatus").textContent = "Restarted. Reloading…"; location.reload(); }, 6000);
   };
 
-  load(); checkVersion();
-  setInterval(refreshSynced, 60000); // keep the heartbeat live while the page is open
+  load(); checkVersion(); loadUsage();
+  setInterval(() => { refreshSynced(); loadUsage(); }, 60000); // keep heartbeat + usage live
 </script>
 </body></html>"""
 
@@ -246,6 +295,12 @@ class SettingsPatch(BaseModel):
 async def post_settings(patch: SettingsPatch) -> dict:
     settings_store.update(patch.model_dump(exclude_none=True))
     return await get_settings()
+
+
+@app.get("/api/usage")
+async def api_usage(days: int = 30) -> dict:
+    """All-time token/cost totals + a per-day series for the last `days` days."""
+    return await asyncio.to_thread(usage_store.summary, max(1, min(365, days)))
 
 
 @app.get("/api/version")
@@ -301,6 +356,7 @@ async def _build_signal(symbol: str, *, deep: bool, crypto: bool) -> dict:
         verdict, usage = await analyze(summary, deep=deep)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+    usage_store.record(usage, symbol=series.symbol, kind="deep" if deep else "signal")
 
     payload = {
         "symbol": series.symbol,
