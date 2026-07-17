@@ -61,11 +61,8 @@ _PAGE = """<!doctype html>
   button.secondary { background: #8883; color: inherit; }
   button.ok { background: var(--ok); }
   .chips { margin-top: .6rem; min-height: 1.1rem; }
-  .chip { display: inline-flex; align-items: center; gap: .3rem; background: rgba(37,99,235,.15);
-          border-radius: 1rem; padding: .22rem .3rem .22rem .7rem; margin: .15rem .25rem .15rem 0; font-size: .85rem; }
-  .chip .x { all: unset; cursor: pointer; width: 1.1rem; height: 1.1rem; line-height: 1.05rem;
-             text-align: center; border-radius: 50%; color: var(--muted); }
-  .chip .x:hover { background: #8884; color: inherit; }
+  .chip { display: inline-flex; align-items: center; background: rgba(37,99,235,.15);
+          border-radius: 1rem; padding: .22rem .7rem; margin: .15rem .25rem .15rem 0; font-size: .85rem; }
   .empty { color: var(--muted); font-size: .82rem; }
   .save { margin-top: .4rem; }
   #status, #upstatus { font-size: .88rem; min-height: 1.1rem; margin-top: .6rem; }
@@ -94,21 +91,14 @@ _PAGE = """<!doctype html>
   </div>
 
   <div class="card">
-    <h2>Nightly watchlist</h2>
+    <h2>Nightly watchlist <span class="hint">— synced from the app</span></h2>
     <label>Stocks</label>
-    <div class="row">
-      <input id="watch-in" autocomplete="off" placeholder="e.g. NVDA — Enter or Add">
-      <button type="button" class="secondary" onclick="addSym('watch')">Add</button>
-    </div>
     <div class="chips" id="watch-chips"></div>
-    <label>Crypto <span class="hint">— Yahoo form, e.g. BTC-USD</span></label>
-    <div class="row">
-      <input id="cwatch-in" autocomplete="off" placeholder="e.g. BTC-USD — Enter or Add">
-      <button type="button" class="secondary" onclick="addSym('cwatch')">Add</button>
-    </div>
+    <label style="margin-top:.7rem">Crypto</label>
     <div class="chips" id="cwatch-chips"></div>
-    <div class="hint" style="margin-top:.7rem">Auto-synced from the app when it connects (you can also edit here).
-    Scanned nightly at 06:30 — the app notifies you when a signal flips.</div>
+    <div class="hint" style="margin-top:.7rem">The app is the source of truth — it pushes your watchlist
+    here automatically, so add/remove symbols in the app, not on this page. Scanned nightly at 06:30;
+    the app notifies you when a signal flips.</div>
   </div>
 
   <button class="save" type="submit">Save settings</button>
@@ -133,42 +123,24 @@ Decision support only — not investment advice.</p>
 
 <script>
   const $ = (id) => document.getElementById(id);
-  const lists = { watch: [], cwatch: [] };
 
-  function renderChips(kind) {
+  // Read-only chips — the watchlist is owned by the app and synced up via POST /api/settings.
+  function renderChips(kind, syms) {
     const box = $(kind + "-chips");
     box.innerHTML = "";
-    if (!lists[kind].length) { box.innerHTML = '<span class="empty">none</span>'; return; }
-    lists[kind].forEach((sym, i) => {
+    if (!syms.length) { box.innerHTML = '<span class="empty">none yet — connect the app to sync</span>'; return; }
+    syms.forEach((sym) => {
       const chip = document.createElement("span");
       chip.className = "chip";
       const b = document.createElement("b"); b.textContent = sym; chip.appendChild(b);
-      const x = document.createElement("button");
-      x.className = "x"; x.type = "button"; x.textContent = "×";
-      x.onclick = () => { lists[kind].splice(i, 1); renderChips(kind); };
-      chip.appendChild(x);
       box.appendChild(chip);
     });
   }
-  function addSym(kind) {
-    const inp = $(kind + "-in");
-    inp.value.split(/[ ,]+/).forEach((raw) => {
-      const s = raw.trim().toUpperCase();
-      if (s && !lists[kind].includes(s)) lists[kind].push(s);
-    });
-    inp.value = ""; renderChips(kind); inp.focus();
-  }
-  ["watch", "cwatch"].forEach((kind) => {
-    $(kind + "-in").addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { e.preventDefault(); addSym(kind); }
-    });
-  });
 
   async function load() {
     const s = await (await fetch("/api/settings")).json();
     $("deep").value = s.deep_model; $("scan").value = s.scan_model; $("ttl").value = s.verdict_ttl_seconds;
-    lists.watch = (s.watchlist || []).slice(); lists.cwatch = (s.crypto_watchlist || []).slice();
-    renderChips("watch"); renderChips("cwatch");
+    renderChips("watch", s.watchlist || []); renderChips("cwatch", s.crypto_watchlist || []);
     $("keyhint").textContent = s.anthropic_api_key_set
       ? "Key is set (" + s.anthropic_api_key_hint + "). Leave blank to keep it."
       : "No key set — the analyst can't run until you add one.";
@@ -177,10 +149,8 @@ Decision support only — not investment advice.</p>
   }
   $("f").onsubmit = async (e) => {
     e.preventDefault();
-    addSym("watch"); addSym("cwatch"); // fold in any typed-but-not-added text
     const body = { deep_model: $("deep").value, scan_model: $("scan").value,
-                   verdict_ttl_seconds: Number($("ttl").value),
-                   watchlist: lists.watch, crypto_watchlist: lists.cwatch };
+                   verdict_ttl_seconds: Number($("ttl").value) };
     if ($("key").value) body.anthropic_api_key = $("key").value;
     if ($("fkey").value) body.finnhub_api_key = $("fkey").value;
     const r = await fetch("/api/settings", { method: "POST",
