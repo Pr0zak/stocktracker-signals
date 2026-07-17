@@ -406,6 +406,7 @@ async def short_pressure(
         "short_vol_days": (sv or {}).get("days"),
         "ftd_latest": (f or {}).get("latest"),
         "ftd_trend": (f or {}).get("trend"),
+        "ftd_spike_dates": (f or {}).get("spike_dates", []),
         # Object form for clients (kotlinx-friendly), most recent ~16 settlement days.
         "ftd_series": [
             {"date": d, "qty": q} for d, q, _ in (f or {}).get("series", [])[-16:]

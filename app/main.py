@@ -474,28 +474,29 @@ async def shorts_endpoint(symbol: str) -> dict:
 
 
 @app.get("/calendar")
-async def calendar_endpoint() -> dict:
-    """Watchlist-wide catalyst calendar: SI settlements/publications, OPEX, earnings, and
-    clearly-labeled speculative T+35 FTD-echo windows. Cached 1h."""
+async def calendar_endpoint(symbol: str | None = None) -> dict:
+    """Catalyst calendar: SI settlements/publications, OPEX, earnings, and clearly-labeled
+    speculative T+35 FTD-echo windows. Whole watchlist by default; `symbol` narrows to one stock
+    (works for non-watchlist symbols too — echoes and earnings are fetched on demand). Cached 1h."""
     cfg = settings_store.get()
-    stocks = cfg.get("watchlist", [])
-    # Watchlist is part of the cache identity so a just-synced add/remove refreshes immediately.
-    key = ("calendar", tuple(sorted(stocks)))
+    syms = [symbol.upper()] if symbol else cfg.get("watchlist", [])
+    # Symbol set is part of the cache identity so a just-synced add/remove refreshes immediately.
+    key = ("calendar", tuple(sorted(syms)))
     now = time.time()
     hit = _cache.get(key)
     if hit and now - hit[0] < 3600:
         return {**hit[1], "cached": True}
     assert _http is not None
     earnings: dict[str, str] = {}
-    for s in stocks:  # Finnhub next-earnings, best-effort (already cached upstream by TTLs)
+    for s in syms:  # Finnhub next-earnings, best-effort (already cached upstream by TTLs)
         try:
             ctx = await fetch_context(_http, s)
             if ctx.get("next_earnings"):
                 earnings[s] = ctx["next_earnings"]
         except Exception:  # noqa: BLE001
             continue
-    events = await shorts.calendar(_http, stocks, earnings)
-    payload = {"as_of": now, "events": events, "cached": False}
+    events = await shorts.calendar(_http, syms, earnings)
+    payload = {"as_of": now, "symbol": symbol.upper() if symbol else None, "events": events, "cached": False}
     _cache[key] = (now, payload)
     return payload
 
