@@ -342,6 +342,23 @@ def _position_block(summary: dict, shares: float | None, avg_cost: float | None)
     }
 
 
+def _sanitize_plan(p, cash: float, crypto: bool) -> None:
+    """Enforce the numeric contract the prompt only requests: entry zone ordered, allocation within
+    the cash, shares consistent with allocation/entry (whole for stocks, 6dp for crypto)."""
+    if p.entry_low > p.entry_high:
+        p.entry_low, p.entry_high = p.entry_high, p.entry_low
+    if p.action in ("wait", "avoid"):
+        p.allocation_usd = 0.0
+        p.suggested_shares = 0.0
+        return
+    p.allocation_usd = round(max(0.0, min(p.allocation_usd, cash)), 2)
+    mid = (p.entry_low + p.entry_high) / 2
+    if mid > 0:
+        p.suggested_shares = (
+            round(p.allocation_usd / mid, 6) if crypto else float(int(p.allocation_usd / mid))
+        )
+
+
 async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | None = None) -> dict:
     """Fetch + summarize one asset's daily technicals (plus news/earnings for stocks). Pass
     `bench_closes` to reuse an already-fetched S&P series (batch callers); stocks fetch it otherwise."""
@@ -372,7 +389,7 @@ async def _build_signal(
     cfg = settings_store.get()
     # Position is part of the cache identity: a different holding must yield a fresh, re-personalized
     # verdict rather than a stale one keyed only on the symbol.
-    key = (symbol.upper(), deep, shares, avg_cost)
+    key = (symbol.upper(), crypto, deep, shares, avg_cost)
     now = time.time()
     hit = _cache.get(key)
     if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
@@ -387,10 +404,10 @@ async def _build_signal(
         verdict, usage = await analyze(summary, deep=deep)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
-    usage_store.record(usage, symbol=series.symbol, kind="deep" if deep else "signal")
+    usage_store.record(usage, symbol=summary.get("symbol", symbol.upper()), kind="deep" if deep else "signal")
 
     payload = {
-        "symbol": series.symbol,
+        "symbol": summary.get("symbol", symbol.upper()),
         "model": cfg["deep_model"] if deep else cfg["scan_model"],
         "as_of": now,
         "summary": summary,
@@ -423,7 +440,7 @@ async def plan(
     if cash <= 0:
         raise HTTPException(status_code=422, detail="cash must be > 0")
     cfg = settings_store.get()
-    key = ("plan", symbol.upper(), round(cash, 2), deep, shares, avg_cost)
+    key = ("plan", symbol.upper(), crypto, round(cash, 2), deep, shares, avg_cost)
     now = time.time()
     hit = _cache.get(key)
     if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
@@ -437,6 +454,7 @@ async def plan(
         entry, usage = await plan_entry(summary, cash=cash, deep=deep)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+    _sanitize_plan(entry, cash, crypto)
     usage_store.record(usage, symbol=summary.get("symbol", symbol), kind="plan")
 
     payload = {
@@ -519,6 +537,18 @@ async def recommendations(req: RecommendRequest) -> dict:
         recs, usage = await recommend(snaps, cash=req.cash, deep=req.deep)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+    # Enforce what the prompt only asks for: actionable picks, allocations that sum within the cash.
+    actionable = [p for p in recs.picks if p.action in ("buy_now", "buy_on_pullback")]
+    dropped = [p.symbol for p in recs.picks if p.action not in ("buy_now", "buy_on_pullback")]
+    total = sum(p.allocation_usd for p in actionable)
+    if total > req.cash > 0:
+        scale = req.cash / total
+        for p in actionable:
+            p.allocation_usd *= scale
+    for p in actionable:
+        _sanitize_plan(p, req.cash, p.symbol.upper().endswith("-USD"))
+    recs.picks = actionable
+    recs.passed = list(dict.fromkeys([*recs.passed, *dropped]))  # dropped picks show as passed
     usage_store.record(usage, symbol="WATCHLIST", kind="recommend")
 
     payload = {
