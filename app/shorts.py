@@ -34,9 +34,10 @@ import httpx
 _DATA_DIR = Path(os.environ.get("SIGNALS_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
 _DIR = _DATA_DIR / "shorts"
 _UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-# SEC fair-access policy asks for an identifying UA; Akamai 403s requests without an Accept header.
+# SEC fair access asks for an identifying UA (set SEC_CONTACT in .env to append an email); their
+# WAF 403s a missing Accept header and bot-looking UAs containing parenthesized URLs.
 _SEC_UA = {
-    "User-Agent": "StockTracker-Signals personal use (github.com/Pr0zak/stocktracker-signals)",
+    "User-Agent": ("StockTracker-Signals/1.0 personal research " + os.environ.get("SEC_CONTACT", "")).strip(),
     "Accept": "*/*",
 }
 
