@@ -326,9 +326,14 @@ async def health() -> dict:
 
 # --- signals ---
 
-async def _build_signal(symbol: str, *, deep: bool, crypto: bool) -> dict:
+async def _build_signal(
+    symbol: str, *, deep: bool, crypto: bool,
+    shares: float | None = None, avg_cost: float | None = None,
+) -> dict:
     cfg = settings_store.get()
-    key = (symbol.upper(), deep)
+    # Position is part of the cache identity: a different holding must yield a fresh, re-personalized
+    # verdict rather than a stale one keyed only on the symbol.
+    key = (symbol.upper(), deep, shares, avg_cost)
     now = time.time()
     hit = _cache.get(key)
     if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
@@ -352,6 +357,17 @@ async def _build_signal(symbol: str, *, deep: bool, crypto: bool) -> dict:
     summary = summarize(series, bench_closes)
     if not crypto:  # optional news/earnings context (Finnhub, stocks only)
         summary.update(await fetch_context(_http, series.symbol))
+    # Personalize when the user holds this asset — the analyst frames the verdict as add/hold/trim.
+    price = summary.get("price")
+    if shares and avg_cost and shares > 0 and avg_cost > 0 and price:
+        summary["position"] = {
+            "shares": round(shares, 6),
+            "avg_cost": round(avg_cost, 4),
+            "position_value": round(shares * price, 2),
+            "unrealized_gain_pct": round((price - avg_cost) / avg_cost * 100.0, 2),
+            "unrealized_gain_abs": round(shares * (price - avg_cost), 2),
+            "currency": summary.get("currency", "USD"),
+        }
     try:
         verdict, usage = await analyze(summary, deep=deep)
     except Exception as e:  # noqa: BLE001
@@ -372,10 +388,14 @@ async def _build_signal(symbol: str, *, deep: bool, crypto: bool) -> dict:
 
 
 @app.get("/signal/{symbol}")
-async def signal(symbol: str, deep: bool = False, crypto: bool = False) -> dict:
+async def signal(
+    symbol: str, deep: bool = False, crypto: bool = False,
+    shares: float | None = None, avg_cost: float | None = None,
+) -> dict:
     """One asset's analyst verdict. `deep=true` uses the deep model; crypto symbols use Yahoo's
-    `BTC-USD` form with `crypto=true` (skips the S&P benchmark)."""
-    return await _build_signal(symbol, deep=deep, crypto=crypto)
+    `BTC-USD` form with `crypto=true` (skips the S&P benchmark). Optional `shares` + `avg_cost`
+    personalize the verdict as an add/hold/trim call on an existing position."""
+    return await _build_signal(symbol, deep=deep, crypto=crypto, shares=shares, avg_cost=avg_cost)
 
 
 class ScanRequest(BaseModel):

@@ -65,6 +65,14 @@ Reserve high conviction for genuine confluence.
 - Always give a concrete invalidation (a price level or condition that would flip your view).
 - If the snapshot includes `recent_news` (headlines) or `next_earnings` (a date), use them to \
 populate `catalysts` and sharpen `key_risks` — but do NOT invent news beyond what is provided.
+- If the snapshot includes a `position` block, the user ALREADY HOLDS this asset (shares, average \
+cost, position value, unrealized gain %). Frame the verdict as an action ON THAT POSITION: read \
+"buy" as ADD, "sell" as TRIM / reduce, "hold" as keep-as-is, and say which in the thesis. Weigh the \
+position's SIZE and unrealized gain — a large, well-in-profit position argues for protecting gains \
+(trim into strength, tighter invalidation) over adding; a small or modestly-underwater position near \
+support may justify adding. Never advise averaging down merely because it is red. Set the invalidation \
+relative to their average cost when relevant. Judge size only from the numbers given — you do NOT \
+know their total net worth or other holdings, so don't assume overall concentration.
 - This is decision support, not investment advice."""
 
 
