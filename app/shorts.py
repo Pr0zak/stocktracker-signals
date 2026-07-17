@@ -9,10 +9,14 @@ Sources (all free, no keys):
 - SEC fails-to-deliver half-month zips — FTD share counts per settlement day. Published with a
   2-4 week lag, so treated as context/confirmation, never timing.
 
-Evidence stance baked into the evaluation: high short interest is BEARISH on average (shorts are
-informed); the squeeze case is conditional — high days-to-cover ("fuel") only matters once price
-and volume confirm ("ignition"). FTD "T+35 cycle" theories have weak evidence; echo dates are
-surfaced but explicitly labeled speculative.
+Evidence stance (verified against the peer-reviewed literature, 2026-07-17 research pass): high
+short interest — and especially high days-to-cover — is BEARISH on average, because shorts are
+informed (Boehmer/Jones/Zhang 2008; Asquith/Pathak/Ritter 2005; NBER w21166); the effect is
+concentrated in small/illiquid names and weak-to-absent for large liquid stocks. The squeeze case
+is conditional and rare — "fuel" (high days-to-cover) only matters once price and volume confirm
+("ignition"), and even the GME 2021 rally was mostly retail buying, not short covering (SEC staff
+report). FTDs are lagging/contemporaneous (they rise AFTER declines), never predictive. The
+"T+35 cycle" theory has NO empirical support; echo dates are surfaced only labeled as folklore.
 
 Everything caches under data/shorts/ so watchlist-wide scans cost one download per file, not per
 symbol. All fetchers are best-effort and return None rather than raise.
@@ -299,7 +303,7 @@ async def calendar(client: httpx.AsyncClient, symbols: list[str], earnings: dict
             if today <= echo <= today + timedelta(days=60):
                 events.append({
                     "date": echo.isoformat(), "symbol": sym,
-                    "label": f"T+35 echo of {sd[:4]}-{sd[4:6]}-{sd[6:]} FTD spike (speculative)",
+                    "label": f"T+35 echo of {sd[:4]}-{sd[4:6]}-{sd[6:]} FTD spike — folklore, no empirical support",
                     "kind": "t35_echo",
                 })
         e = (earnings or {}).get(sym)
@@ -342,7 +346,7 @@ def upcoming_dates(ftd_spikes: list[str] | None = None) -> list[dict]:
         if today <= echo <= today + timedelta(days=45):
             out.append({
                 "date": echo.isoformat(),
-                "label": f"T+35 echo of {sd[:4]}-{sd[4:6]}-{sd[6:]} FTD spike (speculative)",
+                "label": f"T+35 echo of {sd[:4]}-{sd[4:6]}-{sd[6:]} FTD spike — folklore, no empirical support",
                 "kind": "t35_echo",
             })
     out.sort(key=lambda x: x["date"])

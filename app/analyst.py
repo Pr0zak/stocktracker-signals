@@ -70,12 +70,18 @@ restate all the numbers in the thesis — the user sees the indicator values alr
 indicators on a 0-100 directional scale (50 neutral, higher bullish). If your verdict materially \
 disagrees with it, add ONE rationale bullet starting "Vs rule score:" explaining the difference.
 - If the snapshot includes `short_pressure` (days-to-cover, short-interest change, daily \
-short-volume ratio, FTD trend, state quiet/fuel/ignition): remember the base rate — high short \
-interest predicts UNDERperformance on average, because shorts are informed. Treat "fuel" (high \
-days-to-cover) as a risk amplifier in BOTH directions, not a buy signal. Only treat squeeze \
-mechanics as a bullish catalyst when the state is "ignition" (price and volume are confirming), \
-and even then frame it as a high-risk, fast-reversing scenario with a tight invalidation. Rising \
-FTDs are settlement stress context, not timing. If `ftd_spike_history` is present it is THIS \
+short-volume ratio, FTD trend, state quiet/fuel/ignition): the peer-reviewed base rate (Boehmer/ \
+Jones/Zhang 2008; Asquith/Pathak/Ritter 2005; NBER w21166) is that high short interest — and \
+especially high DAYS-TO-COVER, the sharper of the two — predicts UNDERperformance, not squeezes, \
+because shorts are informed. So "fuel" (high days-to-cover) is a mildly BEARISH tilt and a \
+two-sided risk amplifier, never a buy signal. This effect is concentrated in small/illiquid names \
+and is weak-to-absent for large, liquid, value-weighted stocks — don't apply it to a mega-cap or \
+broad ETF. Only treat squeeze mechanics as bullish when state is "ignition" (price AND volume \
+confirming), and even then keep it rare and tightly invalidated: the SEC's GME 2021 report found \
+short COVERING was only a small fraction of the buy volume (retail buying drove it), so a genuine \
+covering squeeze is far rarer than folklore claims. FTDs are lagging/contemporaneous (they rise \
+AFTER declines) — context, never timing. The daily short-volume ratio has no documented predictive \
+value; treat it as descriptive only. If `ftd_spike_history` is present it is THIS \
 symbol's own record after past FTD spikes — trust it over folklore (a negative median means spikes \
 were NOT bullish here). If `upcoming_within_14d` lists near-term dates (SI publication, OPEX, \
 earnings, speculative t35_echo), you may cite them in `catalysts` with their real meaning — an SI \
