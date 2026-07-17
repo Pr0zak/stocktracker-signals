@@ -1,0 +1,344 @@
+"""StockTracker Signals — Tier-2 Claude analyst service. Decision support only, not advice."""
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+
+from . import selfupdate, settings_store
+from .analyst import analyze
+from .market import fetch_series, summarize
+from .scan_job import LATEST, run_scan
+
+_http: httpx.AsyncClient | None = None
+_cache: dict[tuple[str, bool], tuple[float, dict]] = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _http
+    _http = httpx.AsyncClient()
+    try:
+        yield
+    finally:
+        await _http.aclose()
+
+
+app = FastAPI(title="StockTracker Signals", version="0.2.0", lifespan=lifespan)
+
+
+# --- settings UI + API ---
+
+_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StockTracker Signals</title>
+<style>
+  :root { color-scheme: light dark; --accent:#2563eb; --ok:#16a34a; --err:#dc2626; --muted:#888; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 36rem; margin: 1.5rem auto;
+         padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; margin: 0 0 .2rem; }
+  .sub { color: var(--muted); margin: 0 0 1.4rem; }
+  .card { border: 1px solid #8883; border-radius: .9rem; padding: 1rem 1.1rem; margin-bottom: 1.1rem; }
+  .card h2 { font-size: 1rem; margin: 0 0 .8rem; }
+  label { display: block; margin: .85rem 0 .3rem; font-weight: 600; font-size: .88rem; }
+  .card label:first-of-type { margin-top: 0; }
+  input { width: 100%; padding: .55rem .65rem; font-size: 1rem; border: 1px solid #8886;
+          border-radius: .5rem; background: transparent; color: inherit; }
+  .hint { font-size: .8rem; color: var(--muted); font-weight: 400; }
+  .row { display: flex; gap: .5rem; align-items: center; }
+  .row input { flex: 1; }
+  button { padding: .55rem 1.1rem; font-size: .95rem; border: 0; border-radius: .5rem;
+           background: var(--accent); color: #fff; cursor: pointer; white-space: nowrap; }
+  button.secondary { background: #8883; color: inherit; }
+  button.ok { background: var(--ok); }
+  .chips { margin-top: .6rem; min-height: 1.1rem; }
+  .chip { display: inline-flex; align-items: center; gap: .3rem; background: rgba(37,99,235,.15);
+          border-radius: 1rem; padding: .22rem .3rem .22rem .7rem; margin: .15rem .25rem .15rem 0; font-size: .85rem; }
+  .chip .x { all: unset; cursor: pointer; width: 1.1rem; height: 1.1rem; line-height: 1.05rem;
+             text-align: center; border-radius: 50%; color: var(--muted); }
+  .chip .x:hover { background: #8884; color: inherit; }
+  .empty { color: var(--muted); font-size: .82rem; }
+  .save { margin-top: .4rem; }
+  #status, #upstatus { font-size: .88rem; min-height: 1.1rem; margin-top: .6rem; }
+  .ok-t { color: var(--ok); } .err-t { color: var(--err); }
+  code { background: #8882; padding: .1rem .3rem; border-radius: .3rem; font-size: .85em; }
+</style></head>
+<body>
+<h1>StockTracker Signals</h1>
+<p class="sub">Tier-2 Claude analyst — configuration</p>
+
+<form id="f">
+  <div class="card">
+    <h2>Connection &amp; models</h2>
+    <label for="key">Anthropic API key</label>
+    <input id="key" type="password" autocomplete="off" placeholder="leave blank to keep current">
+    <div class="hint" id="keyhint"></div>
+    <label for="deep">Deep model <span class="hint">— on-demand deep dives</span></label>
+    <input id="deep" autocomplete="off">
+    <label for="scan">Scan model <span class="hint">— cheap watchlist scans</span></label>
+    <input id="scan" autocomplete="off">
+    <label for="ttl">Verdict cache TTL <span class="hint">— seconds</span></label>
+    <input id="ttl" type="number" min="0" autocomplete="off">
+  </div>
+
+  <div class="card">
+    <h2>Nightly watchlist</h2>
+    <label>Stocks</label>
+    <div class="row">
+      <input id="watch-in" autocomplete="off" placeholder="e.g. NVDA — Enter or Add">
+      <button type="button" class="secondary" onclick="addSym('watch')">Add</button>
+    </div>
+    <div class="chips" id="watch-chips"></div>
+    <label>Crypto <span class="hint">— Yahoo form, e.g. BTC-USD</span></label>
+    <div class="row">
+      <input id="cwatch-in" autocomplete="off" placeholder="e.g. BTC-USD — Enter or Add">
+      <button type="button" class="secondary" onclick="addSym('cwatch')">Add</button>
+    </div>
+    <div class="chips" id="cwatch-chips"></div>
+    <div class="hint" style="margin-top:.7rem">Scanned nightly at 06:30; the app notifies you when a signal flips.</div>
+  </div>
+
+  <button class="save" type="submit">Save settings</button>
+  <div id="status"></div>
+</form>
+
+<div class="card">
+  <h2>Service</h2>
+  <div id="version" class="hint">version …</div>
+  <div class="row" style="margin-top:.8rem">
+    <button type="button" class="secondary" id="check">Check for updates</button>
+    <button type="button" class="ok" id="update" style="display:none">Update &amp; restart</button>
+  </div>
+  <div id="upstatus"></div>
+</div>
+
+<p class="hint">API: <code>GET /signal/{symbol}</code> · <code>POST /scan/run</code> · <code>GET /scan/latest</code> · <code>GET /health</code>.
+Decision support only — not investment advice.</p>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const lists = { watch: [], cwatch: [] };
+
+  function renderChips(kind) {
+    const box = $(kind + "-chips");
+    box.innerHTML = "";
+    if (!lists[kind].length) { box.innerHTML = '<span class="empty">none</span>'; return; }
+    lists[kind].forEach((sym, i) => {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      const b = document.createElement("b"); b.textContent = sym; chip.appendChild(b);
+      const x = document.createElement("button");
+      x.className = "x"; x.type = "button"; x.textContent = "×";
+      x.onclick = () => { lists[kind].splice(i, 1); renderChips(kind); };
+      chip.appendChild(x);
+      box.appendChild(chip);
+    });
+  }
+  function addSym(kind) {
+    const inp = $(kind + "-in");
+    inp.value.split(/[ ,]+/).forEach((raw) => {
+      const s = raw.trim().toUpperCase();
+      if (s && !lists[kind].includes(s)) lists[kind].push(s);
+    });
+    inp.value = ""; renderChips(kind); inp.focus();
+  }
+  ["watch", "cwatch"].forEach((kind) => {
+    $(kind + "-in").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); addSym(kind); }
+    });
+  });
+
+  async function load() {
+    const s = await (await fetch("/api/settings")).json();
+    $("deep").value = s.deep_model; $("scan").value = s.scan_model; $("ttl").value = s.verdict_ttl_seconds;
+    lists.watch = (s.watchlist || []).slice(); lists.cwatch = (s.crypto_watchlist || []).slice();
+    renderChips("watch"); renderChips("cwatch");
+    $("keyhint").textContent = s.anthropic_api_key_set
+      ? "Key is set (" + s.anthropic_api_key_hint + "). Leave blank to keep it."
+      : "No key set — the analyst can't run until you add one.";
+  }
+  $("f").onsubmit = async (e) => {
+    e.preventDefault();
+    addSym("watch"); addSym("cwatch"); // fold in any typed-but-not-added text
+    const body = { deep_model: $("deep").value, scan_model: $("scan").value,
+                   verdict_ttl_seconds: Number($("ttl").value),
+                   watchlist: lists.watch, crypto_watchlist: lists.cwatch };
+    if ($("key").value) body.anthropic_api_key = $("key").value;
+    const r = await fetch("/api/settings", { method: "POST",
+      headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const st = $("status");
+    st.textContent = r.ok ? "Saved ✓" : "Save failed"; st.className = r.ok ? "ok-t" : "err-t";
+    $("key").value = ""; load();
+  };
+
+  async function checkVersion() {
+    $("version").textContent = "checking…";
+    const v = await (await fetch("/api/version")).json();
+    let label = "version " + v.version;
+    if (!v.git) label += " · (not a git checkout — updates disabled)";
+    else if (v.update_available) label += " · " + v.behind + " update" + (v.behind > 1 ? "s" : "") + " available";
+    else label += " · up to date";
+    $("version").textContent = label;
+    $("update").style.display = v.update_available ? "inline-block" : "none";
+  }
+  $("check").onclick = checkVersion;
+  $("update").onclick = async () => {
+    $("upstatus").textContent = "Updating — the service will restart…"; $("upstatus").className = "";
+    try { await fetch("/api/update", { method: "POST" }); } catch (e) {}
+    setTimeout(() => { $("upstatus").textContent = "Restarted. Reloading…"; location.reload(); }, 6000);
+  };
+
+  load(); checkVersion();
+</script>
+</body></html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home() -> str:
+    return _PAGE
+
+
+@app.get("/api/settings")
+async def get_settings() -> dict:
+    cfg = settings_store.get()
+    key = cfg["anthropic_api_key"]
+    return {
+        "anthropic_api_key_set": bool(key),
+        "anthropic_api_key_hint": ("…" + key[-4:]) if len(key) >= 4 else ("set" if key else ""),
+        "deep_model": cfg["deep_model"],
+        "scan_model": cfg["scan_model"],
+        "verdict_ttl_seconds": cfg["verdict_ttl_seconds"],
+        "watchlist": cfg.get("watchlist", []),
+        "crypto_watchlist": cfg.get("crypto_watchlist", []),
+    }
+
+
+class SettingsPatch(BaseModel):
+    anthropic_api_key: str | None = None
+    deep_model: str | None = None
+    scan_model: str | None = None
+    verdict_ttl_seconds: int | None = None
+    watchlist: str | list[str] | None = None
+    crypto_watchlist: str | list[str] | None = None
+
+
+@app.post("/api/settings")
+async def post_settings(patch: SettingsPatch) -> dict:
+    settings_store.update(patch.model_dump(exclude_none=True))
+    return await get_settings()
+
+
+@app.get("/api/version")
+async def api_version() -> dict:
+    return await asyncio.to_thread(selfupdate.status)
+
+
+@app.post("/api/update")
+async def api_update() -> dict:
+    return await asyncio.to_thread(selfupdate.update)
+
+
+@app.get("/health")
+async def health() -> dict:
+    cfg = settings_store.get()
+    return {
+        "ok": True,
+        "key_configured": bool(cfg["anthropic_api_key"]),
+        "deep_model": cfg["deep_model"],
+        "scan_model": cfg["scan_model"],
+    }
+
+
+# --- signals ---
+
+async def _build_signal(symbol: str, *, deep: bool, crypto: bool) -> dict:
+    cfg = settings_store.get()
+    key = (symbol.upper(), deep)
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
+        return {**hit[1], "cached": True}
+
+    assert _http is not None
+    try:
+        series = await fetch_series(_http, symbol)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
+    if len(series.closes) < 30:
+        raise HTTPException(status_code=422, detail="not enough history for a signal")
+
+    bench_closes = None
+    if not crypto:  # relative strength vs the S&P is equity-only
+        try:
+            bench_closes = (await fetch_series(_http, "^GSPC")).closes
+        except Exception:  # noqa: BLE001 — RS just gets skipped
+            bench_closes = None
+
+    summary = summarize(series, bench_closes)
+    try:
+        verdict, usage = await analyze(summary, deep=deep)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+
+    payload = {
+        "symbol": series.symbol,
+        "model": cfg["deep_model"] if deep else cfg["scan_model"],
+        "as_of": now,
+        "summary": summary,
+        "verdict": verdict.model_dump(),
+        "usage": usage,
+        "cached": False,
+    }
+    _cache[key] = (now, payload)
+    return payload
+
+
+@app.get("/signal/{symbol}")
+async def signal(symbol: str, deep: bool = False, crypto: bool = False) -> dict:
+    """One asset's analyst verdict. `deep=true` uses the deep model; crypto symbols use Yahoo's
+    `BTC-USD` form with `crypto=true` (skips the S&P benchmark)."""
+    return await _build_signal(symbol, deep=deep, crypto=crypto)
+
+
+class ScanRequest(BaseModel):
+    symbols: list[str]
+    crypto_symbols: list[str] = []
+
+
+@app.post("/scan")
+async def scan(req: ScanRequest) -> dict:
+    """Score a watchlist with the cheap scan model. MVP runs concurrently; the nightly job
+    (task #6) should move this to the Anthropic Batch API + prompt caching for ~50% cost."""
+    async def one(sym: str, crypto: bool) -> dict:
+        try:
+            return await _build_signal(sym, deep=False, crypto=crypto)
+        except HTTPException as e:
+            return {"symbol": sym.upper(), "error": e.detail}
+
+    results = await asyncio.gather(
+        *[one(s, False) for s in req.symbols],
+        *[one(s, True) for s in req.crypto_symbols],
+    )
+    return {"count": len(results), "results": results}
+
+
+@app.get("/scan/latest")
+async def scan_latest() -> dict:
+    """The most recent nightly-scan result (what the app polls). Empty until the first scan runs."""
+    if LATEST.exists():
+        return json.loads(LATEST.read_text())
+    return {"generated_at": None, "results": [], "flips": [], "total_cost_usd": 0.0}
+
+
+@app.post("/scan/run")
+async def scan_run() -> dict:
+    """Run the configured-watchlist scan now (also wired to a nightly systemd timer)."""
+    return await run_scan()
