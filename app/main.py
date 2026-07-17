@@ -477,13 +477,14 @@ async def shorts_endpoint(symbol: str) -> dict:
 async def calendar_endpoint() -> dict:
     """Watchlist-wide catalyst calendar: SI settlements/publications, OPEX, earnings, and
     clearly-labeled speculative T+35 FTD-echo windows. Cached 1h."""
-    key = ("calendar",)
+    cfg = settings_store.get()
+    stocks = cfg.get("watchlist", [])
+    # Watchlist is part of the cache identity so a just-synced add/remove refreshes immediately.
+    key = ("calendar", tuple(sorted(stocks)))
     now = time.time()
     hit = _cache.get(key)
     if hit and now - hit[0] < 3600:
         return {**hit[1], "cached": True}
-    cfg = settings_store.get()
-    stocks = cfg.get("watchlist", [])
     assert _http is not None
     earnings: dict[str, str] = {}
     for s in stocks:  # Finnhub next-earnings, best-effort (already cached upstream by TTLs)
