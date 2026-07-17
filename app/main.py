@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import selfupdate, settings_store, usage_store
-from .analyst import analyze
+from .analyst import analyze, plan_entry, recommend
 from .market import fetch_series, summarize
 from .news import fetch_context
 from .scan_job import LATEST, run_scan
@@ -136,7 +136,8 @@ _PAGE = """<!doctype html>
   </div>
 </div>
 
-<p class="hint">API: <code>GET /signal/{symbol}</code> · <code>POST /scan/run</code> · <code>GET /scan/latest</code> · <code>GET /health</code>.
+<p class="hint">API: <code>GET /signal/{symbol}</code> · <code>GET /plan/{symbol}?cash=</code> · <code>POST /recommendations</code> ·
+<code>POST /scan/run</code> · <code>GET /scan/latest</code> · <code>GET /health</code>.
 Decision support only — not investment advice.</p>
 
 <script>
@@ -326,6 +327,44 @@ async def health() -> dict:
 
 # --- signals ---
 
+def _position_block(summary: dict, shares: float | None, avg_cost: float | None) -> dict | None:
+    """The user's holding in the snapshot's terms (value, unrealized P/L), or None if not held."""
+    price = summary.get("price")
+    if not (shares and avg_cost and shares > 0 and avg_cost > 0 and price):
+        return None
+    return {
+        "shares": round(shares, 6),
+        "avg_cost": round(avg_cost, 4),
+        "position_value": round(shares * price, 2),
+        "unrealized_gain_pct": round((price - avg_cost) / avg_cost * 100.0, 2),
+        "unrealized_gain_abs": round(shares * (price - avg_cost), 2),
+        "currency": summary.get("currency", "USD"),
+    }
+
+
+async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | None = None) -> dict:
+    """Fetch + summarize one asset's daily technicals (plus news/earnings for stocks). Pass
+    `bench_closes` to reuse an already-fetched S&P series (batch callers); stocks fetch it otherwise."""
+    assert _http is not None
+    try:
+        series = await fetch_series(_http, symbol)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
+    if len(series.closes) < 30:
+        raise HTTPException(status_code=422, detail="not enough history for a signal")
+
+    if not crypto and bench_closes is None:  # relative strength vs the S&P is equity-only
+        try:
+            bench_closes = (await fetch_series(_http, "^GSPC")).closes
+        except Exception:  # noqa: BLE001 — RS just gets skipped
+            bench_closes = None
+
+    summary = summarize(series, None if crypto else bench_closes)
+    if not crypto:  # optional news/earnings context (Finnhub, stocks only)
+        summary.update(await fetch_context(_http, series.symbol))
+    return summary
+
+
 async def _build_signal(
     symbol: str, *, deep: bool, crypto: bool,
     shares: float | None = None, avg_cost: float | None = None,
@@ -339,35 +378,11 @@ async def _build_signal(
     if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
         return {**hit[1], "cached": True}
 
-    assert _http is not None
-    try:
-        series = await fetch_series(_http, symbol)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
-    if len(series.closes) < 30:
-        raise HTTPException(status_code=422, detail="not enough history for a signal")
-
-    bench_closes = None
-    if not crypto:  # relative strength vs the S&P is equity-only
-        try:
-            bench_closes = (await fetch_series(_http, "^GSPC")).closes
-        except Exception:  # noqa: BLE001 — RS just gets skipped
-            bench_closes = None
-
-    summary = summarize(series, bench_closes)
-    if not crypto:  # optional news/earnings context (Finnhub, stocks only)
-        summary.update(await fetch_context(_http, series.symbol))
+    summary = await _snapshot(symbol, crypto=crypto)
     # Personalize when the user holds this asset — the analyst frames the verdict as add/hold/trim.
-    price = summary.get("price")
-    if shares and avg_cost and shares > 0 and avg_cost > 0 and price:
-        summary["position"] = {
-            "shares": round(shares, 6),
-            "avg_cost": round(avg_cost, 4),
-            "position_value": round(shares * price, 2),
-            "unrealized_gain_pct": round((price - avg_cost) / avg_cost * 100.0, 2),
-            "unrealized_gain_abs": round(shares * (price - avg_cost), 2),
-            "currency": summary.get("currency", "USD"),
-        }
+    pos = _position_block(summary, shares, avg_cost)
+    if pos:
+        summary["position"] = pos
     try:
         verdict, usage = await analyze(summary, deep=deep)
     except Exception as e:  # noqa: BLE001
@@ -396,6 +411,129 @@ async def signal(
     `BTC-USD` form with `crypto=true` (skips the S&P benchmark). Optional `shares` + `avg_cost`
     personalize the verdict as an add/hold/trim call on an existing position."""
     return await _build_signal(symbol, deep=deep, crypto=crypto, shares=shares, avg_cost=avg_cost)
+
+
+@app.get("/plan/{symbol}")
+async def plan(
+    symbol: str, cash: float, crypto: bool = False, deep: bool = False,
+    shares: float | None = None, avg_cost: float | None = None,
+) -> dict:
+    """Scenario: "if I deployed $cash into this symbol" — one asset's entry plan (action, entry zone,
+    share count, stop/target, timing). Optional shares+avg_cost tell the analyst it's already held."""
+    if cash <= 0:
+        raise HTTPException(status_code=422, detail="cash must be > 0")
+    cfg = settings_store.get()
+    key = ("plan", symbol.upper(), round(cash, 2), deep, shares, avg_cost)
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
+        return {**hit[1], "cached": True}
+
+    summary = await _snapshot(symbol, crypto=crypto)
+    pos = _position_block(summary, shares, avg_cost)
+    if pos:
+        summary["position"] = pos
+    try:
+        entry, usage = await plan_entry(summary, cash=cash, deep=deep)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+    usage_store.record(usage, symbol=summary.get("symbol", symbol), kind="plan")
+
+    payload = {
+        "symbol": summary.get("symbol", symbol.upper()),
+        "model": usage["model"],
+        "as_of": now,
+        "cash": cash,
+        "plan": entry.model_dump(),
+        "usage": usage,
+        "cached": False,
+    }
+    _cache[key] = (now, payload)
+    return payload
+
+
+class Holding(BaseModel):
+    symbol: str
+    shares: float
+    avg_cost: float
+
+
+class RecommendRequest(BaseModel):
+    cash: float
+    deep: bool = False
+    holdings: list[Holding] = []  # transient — informs concentration, never persisted
+
+
+@app.post("/recommendations")
+async def recommendations(req: RecommendRequest) -> dict:
+    """Rank the synced watchlist for NEW money: the analyst sees every candidate's snapshot at once
+    (cross-comparison), picks the top 2-4, and spreads the cash across them with share counts."""
+    if req.cash <= 0:
+        raise HTTPException(status_code=422, detail="cash must be > 0")
+    cfg = settings_store.get()
+    stocks = cfg.get("watchlist", [])
+    cryptos = cfg.get("crypto_watchlist", [])
+    if not stocks and not cryptos:
+        raise HTTPException(status_code=422, detail="watchlist is empty — open the app to sync it")
+
+    holdings = {h.symbol.upper(): h for h in req.holdings}
+    key = (
+        "recs", round(req.cash, 2), req.deep, tuple(sorted(stocks)), tuple(sorted(cryptos)),
+        tuple(sorted((s, h.shares, h.avg_cost) for s, h in holdings.items())),
+    )
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
+        return {**hit[1], "cached": True}
+
+    assert _http is not None
+    bench: list[float] | None = None
+    if stocks:  # fetch the S&P once for all equity snapshots
+        try:
+            bench = (await fetch_series(_http, "^GSPC")).closes
+        except Exception:  # noqa: BLE001 — relative strength just gets skipped
+            bench = None
+
+    async def snap(sym: str, crypto: bool) -> dict | None:
+        try:
+            s = await _snapshot(sym, crypto=crypto, bench_closes=bench)
+        except HTTPException:
+            return None  # skip unfetchable symbols rather than failing the whole ranking
+        h = holdings.get(str(s.get("symbol", sym)).upper())
+        if h:
+            pos = _position_block(s, h.shares, h.avg_cost)
+            if pos:
+                s["position"] = pos
+        return s
+
+    snaps = [
+        s for s in await asyncio.gather(
+            *[snap(x, False) for x in stocks],
+            *[snap(x, True) for x in cryptos],
+        ) if s
+    ]
+    if not snaps:
+        raise HTTPException(status_code=502, detail="no watchlist symbols could be fetched")
+
+    try:
+        recs, usage = await recommend(snaps, cash=req.cash, deep=req.deep)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+    usage_store.record(usage, symbol="WATCHLIST", kind="recommend")
+
+    payload = {
+        "model": usage["model"],
+        "as_of": now,
+        "cash": req.cash,
+        "considered": len(snaps),
+        "overview": recs.overview,
+        "picks": [p.model_dump() for p in recs.picks],
+        "passed": recs.passed,
+        "usage": usage,
+        "cached": False,
+    }
+    _cache[key] = (now, payload)
+    return payload
 
 
 class ScanRequest(BaseModel):
