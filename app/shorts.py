@@ -34,8 +34,11 @@ import httpx
 _DATA_DIR = Path(os.environ.get("SIGNALS_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
 _DIR = _DATA_DIR / "shorts"
 _UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-# SEC fair-access policy asks for an identifying UA.
-_SEC_UA = {"User-Agent": "StockTracker-Signals personal use (github.com/Pr0zak/stocktracker-signals)"}
+# SEC fair-access policy asks for an identifying UA; Akamai 403s requests without an Accept header.
+_SEC_UA = {
+    "User-Agent": "StockTracker-Signals personal use (github.com/Pr0zak/stocktracker-signals)",
+    "Accept": "*/*",
+}
 
 _SI_TTL = 12 * 3600         # FINRA SI cache per symbol
 _LOCK = asyncio.Lock()      # serialize file-cache writes
