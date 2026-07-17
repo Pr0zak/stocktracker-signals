@@ -420,7 +420,7 @@ def compact(sp: dict | None) -> dict | None:
     """The slim version embedded in analyst snapshots (keeps prompt tokens sane)."""
     if not sp:
         return None
-    return {
+    out = {
         "state": sp["state"],
         "days_to_cover": sp["days_to_cover"],
         "si_change_pct": sp["si_change_pct"],
@@ -428,3 +428,21 @@ def compact(sp: dict | None) -> dict | None:
         "ftd_trend": sp["ftd_trend"],
         "reasons": sp["reasons"][:4],
     }
+    # This symbol's own after-FTD-spike record — stops the model assuming spikes are bullish.
+    es = sp.get("event_study")
+    if es:
+        out["ftd_spike_history"] = {
+            "past_spikes": es["events"],
+            "median_fwd10_pct": es.get("fwd10_median_pct"),
+            "fwd10_hit_rate": es.get("fwd10_hit_rate"),
+        }
+    # Near-term key dates only (14 days) — catalyst timing, not the whole calendar.
+    horizon = (date.today() + timedelta(days=14)).isoformat()
+    near = [
+        {"date": u["date"], "kind": u["kind"]}
+        for u in sp.get("upcoming", [])
+        if u["date"] <= horizon
+    ]
+    if near:
+        out["upcoming_within_14d"] = near[:3]
+    return out

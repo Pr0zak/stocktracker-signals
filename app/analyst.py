@@ -75,7 +75,12 @@ interest predicts UNDERperformance on average, because shorts are informed. Trea
 days-to-cover) as a risk amplifier in BOTH directions, not a buy signal. Only treat squeeze \
 mechanics as a bullish catalyst when the state is "ignition" (price and volume are confirming), \
 and even then frame it as a high-risk, fast-reversing scenario with a tight invalidation. Rising \
-FTDs are settlement stress context, not timing.
+FTDs are settlement stress context, not timing. If `ftd_spike_history` is present it is THIS \
+symbol's own record after past FTD spikes — trust it over folklore (a negative median means spikes \
+were NOT bullish here). If `upcoming_within_14d` lists near-term dates (SI publication, OPEX, \
+earnings, speculative t35_echo), you may cite them in `catalysts` with their real meaning — an SI \
+publication reveals positioning, OPEX affects hedging flows, a t35_echo is a speculative retail \
+theory and must be labeled as such if mentioned.
 - If the snapshot includes `recent_news` (headlines) or `next_earnings` (a date), use them to \
 populate `catalysts` and sharpen `key_risks` — but do NOT invent news beyond what is provided.
 - If the snapshot includes a `position` block, the user ALREADY HOLDS this asset (shares, average \
@@ -139,6 +144,10 @@ because the position is red.
 - Be honest: if the cash can't buy a whole share, or the setup is poor, return wait/avoid with \
 suggested_shares 0 rather than forcing a trade.
 - conviction is a 0-100 scale (reserve 70+ for genuine confluence).
+- If the snapshot includes `short_pressure`: high short interest is a bearish base rate, not a buy \
+signal — do not plan an entry INTO a heavily-shorted name unless its state is "ignition", and then \
+size smaller with a tighter stop (squeezes reverse fast). Use `upcoming_within_14d` to time entries \
+around known dates (e.g. wait out earnings) and treat any t35_echo date as speculative.
 - This is decision support, not investment advice."""
 
 REC_SYSTEM = """You are a disciplined technical analyst helping one retail investor deploy a fixed \
@@ -164,6 +173,10 @@ uninvested is a valid recommendation.
 - List every candidate you considered but did not pick in `passed` (symbols only).
 - overview = 2-3 sentences: the market context and why these picks (or why none).
 - conviction is a 0-100 scale (reserve 70+ for genuine confluence).
+- If snapshots include `short_pressure`: high short interest is a bearish base rate. Never pick a \
+heavily-shorted name as a squeeze play unless its state is "ignition", and say so explicitly with \
+smaller sizing and a tighter stop. Weigh `upcoming_within_14d` dates (earnings, OPEX) when choosing \
+between otherwise-similar candidates; t35_echo dates are speculative.
 - Be honest and calibrated. This is decision support, not investment advice."""
 
 
