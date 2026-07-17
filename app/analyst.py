@@ -125,6 +125,7 @@ well-in-profit position needs a clearly stronger setup, and never recommend aver
 because the position is red.
 - Be honest: if the cash can't buy a whole share, or the setup is poor, return wait/avoid with \
 suggested_shares 0 rather than forcing a trade.
+- conviction is a 0-100 scale (reserve 70+ for genuine confluence).
 - This is decision support, not investment advice."""
 
 REC_SYSTEM = """You are a disciplined technical analyst helping one retail investor deploy a fixed \
@@ -146,6 +147,7 @@ unless its setup is clearly the best available.
 uninvested is a valid recommendation.
 - List every candidate you considered but did not pick in `passed` (symbols only).
 - overview = 2-3 sentences: the market context and why these picks (or why none).
+- conviction is a 0-100 scale (reserve 70+ for genuine confluence).
 - Be honest and calibrated. This is decision support, not investment advice."""
 
 
