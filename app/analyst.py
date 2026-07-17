@@ -63,6 +63,12 @@ trend. A strongly extended move is a reason for caution, not for chasing.
 When the picture is mixed or weak, return "hold" with lower conviction rather than forcing a call. \
 Reserve high conviction for genuine confluence.
 - Always give a concrete invalidation (a price level or condition that would flip your view).
+- thesis is the bottom line in AT MOST two short sentences (under 40 words). Put supporting detail \
+in `rationale` (3-5 bullets, each under 15 words), risks in `key_risks` (2-3 short bullets). Never \
+restate all the numbers in the thesis — the user sees the indicator values already.
+- If the snapshot includes `rule_score`, it is the app's mechanical composite read of these SAME \
+indicators on a 0-100 directional scale (50 neutral, higher bullish). If your verdict materially \
+disagrees with it, add ONE rationale bullet starting "Vs rule score:" explaining the difference.
 - If the snapshot includes `recent_news` (headlines) or `next_earnings` (a date), use them to \
 populate `catalysts` and sharpen `key_risks` — but do NOT invent news beyond what is provided.
 - If the snapshot includes a `position` block, the user ALREADY HOLDS this asset (shares, average \

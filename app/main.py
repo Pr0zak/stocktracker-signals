@@ -386,11 +386,12 @@ async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | No
 async def _build_signal(
     symbol: str, *, deep: bool, crypto: bool,
     shares: float | None = None, avg_cost: float | None = None,
+    rule_score: int | None = None,
 ) -> dict:
     cfg = settings_store.get()
     # Position is part of the cache identity: a different holding must yield a fresh, re-personalized
     # verdict rather than a stale one keyed only on the symbol.
-    key = (symbol.upper(), crypto, deep, shares, avg_cost)
+    key = (symbol.upper(), crypto, deep, shares, avg_cost, rule_score)
     now = time.time()
     hit = _cache.get(key)
     if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
@@ -401,6 +402,8 @@ async def _build_signal(
     pos = _position_block(summary, shares, avg_cost)
     if pos:
         summary["position"] = pos
+    if rule_score is not None:  # the app's mechanical composite — the analyst reconciles with it
+        summary["rule_score"] = max(0, min(100, rule_score))
     try:
         verdict, usage = await analyze(summary, deep=deep)
     except Exception as e:  # noqa: BLE001
@@ -424,11 +427,15 @@ async def _build_signal(
 async def signal(
     symbol: str, deep: bool = False, crypto: bool = False,
     shares: float | None = None, avg_cost: float | None = None,
+    rule_score: int | None = None,
 ) -> dict:
     """One asset's analyst verdict. `deep=true` uses the deep model; crypto symbols use Yahoo's
     `BTC-USD` form with `crypto=true` (skips the S&P benchmark). Optional `shares` + `avg_cost`
-    personalize the verdict as an add/hold/trim call on an existing position."""
-    return await _build_signal(symbol, deep=deep, crypto=crypto, shares=shares, avg_cost=avg_cost)
+    personalize the verdict as an add/hold/trim call on an existing position; optional `rule_score`
+    (the app's mechanical 0-100 composite) makes the analyst reconcile a diverging read."""
+    return await _build_signal(
+        symbol, deep=deep, crypto=crypto, shares=shares, avg_cost=avg_cost, rule_score=rule_score,
+    )
 
 
 @app.get("/plan/{symbol}")
