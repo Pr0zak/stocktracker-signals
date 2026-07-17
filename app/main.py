@@ -82,6 +82,14 @@ _PAGE = """<!doctype html>
 <h1>StockTracker Signals</h1>
 <p class="sub">Tier-2 Claude analyst — configuration</p>
 
+<div class="card">
+  <h2>AI usage</h2>
+  <div id="usage-totals" class="usage-totals">loading…</div>
+  <div id="usage-chart"></div>
+  <div class="hint">Daily tokens over the last 30 days (hover a bar for the day's detail).</div>
+  <div id="usage-models" class="hint"></div>
+</div>
+
 <form id="f">
   <div class="card">
     <h2>Connection &amp; models</h2>
@@ -114,14 +122,6 @@ _PAGE = """<!doctype html>
   <button class="save" type="submit">Save settings</button>
   <div id="status"></div>
 </form>
-
-<div class="card">
-  <h2>AI usage</h2>
-  <div id="usage-totals" class="usage-totals">loading…</div>
-  <div id="usage-chart"></div>
-  <div class="hint">Daily tokens over the last 30 days (hover a bar for the day's detail).</div>
-  <div id="usage-models" class="hint"></div>
-</div>
 
 <div class="card">
   <h2>Service</h2>
