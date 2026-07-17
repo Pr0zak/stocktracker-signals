@@ -210,7 +210,10 @@ async def ftd(client: httpx.AsyncClient, symbol: str, periods: int = 12) -> dict
     qtys = [q for _, q, _ in series]
     med = statistics.median(qtys) if qtys else 0
     recent = series[-6:]
-    spikes = [d for d, q, _ in series if med > 0 and q > 3 * med and q > 10000]
+    # Spike = top-decile AND >3x median AND absolute floor. A 3-year mining pass over the real
+    # watchlist showed 3x-median alone flags up to ~38% of rows on low-FTD symbols (noise).
+    p90 = sorted(qtys)[int(len(qtys) * 0.9)] if len(qtys) >= 10 else (3 * med)
+    spikes = [d for d, q, _ in series if med > 0 and q > 3 * med and q >= p90 and q > 10000]
     trend = "quiet"
     if len(series) >= 4:
         older = statistics.median(qtys[:-4]) if qtys[:-4] else 0
