@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
 _DATA_DIR = Path(os.environ.get("SIGNALS_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
@@ -31,6 +32,9 @@ def _defaults() -> dict:
         "verdict_ttl_seconds": int(os.environ.get("VERDICT_TTL_SECONDS", "14400")),
         "watchlist": _split(os.environ.get("WATCHLIST", "")),
         "crypto_watchlist": _split(os.environ.get("CRYPTO_WATCHLIST", "")),
+        # Epoch seconds of the last watchlist push from the app (None until the app first syncs).
+        # Doubles as an "app is connected" heartbeat since the app re-syncs every ~15 min.
+        "watchlist_synced_at": None,
     }
 
 
@@ -63,10 +67,16 @@ def update(patch: dict) -> dict:
         ttl = patch.get("verdict_ttl_seconds")
         if ttl is not None:
             _current["verdict_ttl_seconds"] = max(0, int(ttl))
+        synced = False
         for k in ("watchlist", "crypto_watchlist"):
             v = patch.get(k)
             if v is not None:
                 _current[k] = _split(v) if isinstance(v, str) else [str(s).strip().upper() for s in v]
+                synced = True
+        # A patch carrying watchlist fields is an app sync (the UI's settings-save omits them) — stamp
+        # the heartbeat so the UI can show when the app last checked in.
+        if synced:
+            _current["watchlist_synced_at"] = time.time()
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
         _FILE.write_text(json.dumps(_current, indent=2))
         os.chmod(_FILE, 0o600)

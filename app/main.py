@@ -64,6 +64,9 @@ _PAGE = """<!doctype html>
   .chip { display: inline-flex; align-items: center; background: rgba(37,99,235,.15);
           border-radius: 1rem; padding: .22rem .7rem; margin: .15rem .25rem .15rem 0; font-size: .85rem; }
   .empty { color: var(--muted); font-size: .82rem; }
+  .synced { font-size: .85rem; margin: .1rem 0 .5rem; color: var(--muted); }
+  .synced.fresh { color: var(--ok); }
+  .synced.stale { color: #d97706; }
   .save { margin-top: .4rem; }
   #status, #upstatus { font-size: .88rem; min-height: 1.1rem; margin-top: .6rem; }
   .ok-t { color: var(--ok); } .err-t { color: var(--err); }
@@ -92,6 +95,7 @@ _PAGE = """<!doctype html>
 
   <div class="card">
     <h2>Nightly watchlist <span class="hint">— synced from the app</span></h2>
+    <div id="synced" class="synced">checking sync…</div>
     <label>Stocks</label>
     <div class="chips" id="watch-chips"></div>
     <label style="margin-top:.7rem">Crypto</label>
@@ -137,10 +141,33 @@ Decision support only — not investment advice.</p>
     });
   }
 
+  function agoText(sec) {
+    const d = Math.max(0, Date.now() / 1000 - sec);
+    if (d < 90) return "just now";
+    if (d < 3600) return Math.round(d / 60) + " min ago";
+    if (d < 86400) return Math.round(d / 3600) + " hr ago";
+    const days = Math.round(d / 86400); return days + " day" + (days > 1 ? "s" : "") + " ago";
+  }
+  function renderSynced(ts) {
+    const el = $("synced");
+    if (!ts) {
+      el.textContent = "Last synced: never — set this service's URL in the app's Settings to connect.";
+      el.className = "synced stale"; return;
+    }
+    const fresh = (Date.now() / 1000 - ts) < 1800; // the app re-syncs every ~15 min
+    el.textContent = (fresh ? "● " : "○ ") + "Last synced from the app: " + agoText(ts);
+    el.className = "synced " + (fresh ? "fresh" : "stale");
+  }
+  // Refresh just the heartbeat line (never the form inputs — the user may be mid-edit).
+  async function refreshSynced() {
+    try { renderSynced((await (await fetch("/api/settings")).json()).watchlist_synced_at); } catch (e) {}
+  }
+
   async function load() {
     const s = await (await fetch("/api/settings")).json();
     $("deep").value = s.deep_model; $("scan").value = s.scan_model; $("ttl").value = s.verdict_ttl_seconds;
     renderChips("watch", s.watchlist || []); renderChips("cwatch", s.crypto_watchlist || []);
+    renderSynced(s.watchlist_synced_at);
     $("keyhint").textContent = s.anthropic_api_key_set
       ? "Key is set (" + s.anthropic_api_key_hint + "). Leave blank to keep it."
       : "No key set — the analyst can't run until you add one.";
@@ -178,6 +205,7 @@ Decision support only — not investment advice.</p>
   };
 
   load(); checkVersion();
+  setInterval(refreshSynced, 60000); // keep the heartbeat live while the page is open
 </script>
 </body></html>"""
 
@@ -200,6 +228,7 @@ async def get_settings() -> dict:
         "verdict_ttl_seconds": cfg["verdict_ttl_seconds"],
         "watchlist": cfg.get("watchlist", []),
         "crypto_watchlist": cfg.get("crypto_watchlist", []),
+        "watchlist_synced_at": cfg.get("watchlist_synced_at"),
     }
 
 
