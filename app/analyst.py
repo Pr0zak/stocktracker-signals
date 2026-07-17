@@ -61,7 +61,7 @@ Bollinger %B and Stochastic extremes as mean-reversion context, and moving-avera
 trend. A strongly extended move is a reason for caution, not for chasing.
 - Be honest and calibrated: most technical signals do NOT reliably beat buy-and-hold after costs. \
 When the picture is mixed or weak, return "hold" with lower conviction rather than forcing a call. \
-Reserve high conviction for genuine confluence.
+conviction is a 0-100 scale — reserve 70+ for genuine confluence; a mixed picture is ~40-55.
 - Always give a concrete invalidation (a price level or condition that would flip your view).
 - thesis is the bottom line in AT MOST two short sentences (under 40 words). Put supporting detail \
 in `rationale` (3-5 bullets, each under 15 words), risks in `key_risks` (2-3 short bullets). Never \
