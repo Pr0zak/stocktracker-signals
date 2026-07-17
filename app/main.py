@@ -477,13 +477,15 @@ async def shorts_endpoint(symbol: str) -> dict:
 
 @app.get("/calendar")
 async def calendar_endpoint(symbol: str | None = None) -> dict:
-    """Catalyst calendar: SI settlements/publications, OPEX, earnings, and clearly-labeled
-    speculative T+35 FTD-echo windows. Whole watchlist by default; `symbol` narrows to one stock
-    (works for non-watchlist symbols too — echoes and earnings are fetched on demand). Cached 1h."""
+    """Catalyst calendar: SI settlements/publications, OPEX, earnings, clearly-labeled speculative
+    T+35 FTD-echo windows, and the next BTC halving. Whole watchlist by default; `symbol` narrows to
+    one asset (a crypto symbol gets only crypto-relevant events — equity SI/OPEX dates are noise
+    there). Cached 1h."""
     cfg = settings_store.get()
-    syms = [symbol.upper()] if symbol else cfg.get("watchlist", [])
+    is_crypto_symbol = bool(symbol and symbol.upper().endswith("-USD"))
+    syms = [] if is_crypto_symbol else ([symbol.upper()] if symbol else cfg.get("watchlist", []))
     # Symbol set is part of the cache identity so a just-synced add/remove refreshes immediately.
-    key = ("calendar", tuple(sorted(syms)))
+    key = ("calendar", symbol.upper() if symbol else None, tuple(sorted(syms)))
     now = time.time()
     hit = _cache.get(key)
     if hit and now - hit[0] < 3600:
@@ -497,9 +499,14 @@ async def calendar_endpoint(symbol: str | None = None) -> dict:
                 earnings[s] = ctx["next_earnings"]
         except Exception:  # noqa: BLE001
             continue
-    events = await shorts.calendar(_http, syms, earnings)
-    # Next Bitcoin halving (estimated) — shown whenever the watchlist has BTC exposure.
-    if symbol is None and any("BTC" in c.upper() for c in cfg.get("crypto_watchlist", [])):
+    events = await shorts.calendar(_http, syms, earnings) if syms else []
+    # Next Bitcoin halving (estimated): on the watchlist-wide view with BTC exposure, and on any
+    # BTC-* symbol's own calendar.
+    show_halving = (
+        (symbol is None and any("BTC" in c.upper() for c in cfg.get("crypto_watchlist", [])))
+        or (symbol is not None and "BTC" in symbol.upper())
+    )
+    if show_halving:
         events.append({
             "date": cycle.NEXT_HALVING_EST.isoformat(), "symbol": "BTC-USD",
             "label": "Bitcoin halving (~estimated from block schedule)", "kind": "btc_halving",
@@ -508,6 +515,26 @@ async def calendar_endpoint(symbol: str | None = None) -> dict:
     payload = {"as_of": now, "symbol": symbol.upper() if symbol else None, "events": events, "cached": False}
     _cache[key] = (now, payload)
     return payload
+
+
+@app.get("/cycle/{symbol}")
+async def cycle_endpoint(symbol: str) -> dict:
+    """Crypto long-term context for the app's cycle card: halving-cycle position (BTC), multi-year
+    trend metrics, and past halving dates for chart markers. Free — no LLM."""
+    assert _http is not None
+    try:
+        series = await fetch_series(_http, symbol)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
+    ctx = await cycle.crypto_context(_http, series.symbol, series.closes)
+    if not ctx:
+        raise HTTPException(status_code=404, detail="no long-term data for this symbol")
+    return {
+        "symbol": series.symbol,
+        **ctx,
+        "halving_dates": [h.isoformat() for h in cycle.HALVINGS],
+        "next_halving_est": cycle.NEXT_HALVING_EST.isoformat(),
+    }
 
 
 @app.get("/plan/{symbol}")
