@@ -16,7 +16,7 @@ from pathlib import Path
 
 import httpx
 
-from . import settings_store, usage_store
+from . import settings_store, shorts, usage_store
 from .analyst import analyze
 from .market import fetch_series, summarize
 from .news import fetch_context
@@ -29,8 +29,18 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
     if len(series.closes) < 30:
         raise ValueError("not enough history")
     summary = summarize(series, None if crypto else bench_closes)
+    squeeze = None
     if not crypto:
         summary.update(await fetch_context(client, series.symbol))
+        try:  # short-pressure enrichment — best-effort, cached across the whole scan
+            sp = await shorts.short_pressure(
+                client, series.symbol, dates=series.dates, closes=series.closes, volumes=series.volumes,
+            )
+            if sp:
+                summary["short_pressure"] = shorts.compact(sp)
+                squeeze = sp["state"]
+        except Exception:  # noqa: BLE001
+            pass
     verdict, usage = await analyze(summary, deep=False)
     usage_store.record(usage, symbol=series.symbol, kind="scan")
     return {
@@ -38,15 +48,20 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
         "signal": verdict.signal.value,
         "conviction": verdict.conviction,
         "thesis": verdict.thesis,
+        "squeeze": squeeze,
         "cost_usd": usage["cost_usd"],
     }
 
 
-def _prev_signals() -> dict[str, str]:
+def _prev_state() -> dict[str, dict]:
     if not LATEST.exists():
         return {}
     try:
-        return {r["symbol"]: r.get("signal") for r in json.loads(LATEST.read_text()).get("results", []) if "signal" in r}
+        return {
+            r["symbol"]: {"signal": r.get("signal"), "squeeze": r.get("squeeze")}
+            for r in json.loads(LATEST.read_text()).get("results", [])
+            if "signal" in r
+        }
     except Exception:  # noqa: BLE001
         return {}
 
@@ -55,7 +70,7 @@ async def run_scan() -> dict:
     cfg = settings_store.get()
     stocks = cfg.get("watchlist", [])
     cryptos = cfg.get("crypto_watchlist", [])
-    prev = _prev_signals()
+    prev = _prev_state()
 
     async with httpx.AsyncClient() as client:
         bench: list[float] | None = None
@@ -70,8 +85,16 @@ async def run_scan() -> dict:
                 r = await _score(client, sym, crypto, bench)
             except Exception as e:  # noqa: BLE001
                 return {"symbol": sym.upper(), "error": str(e)}
-            r["prev_signal"] = prev.get(r["symbol"])
+            p = prev.get(r["symbol"], {})
+            r["prev_signal"] = p.get("signal")
             r["flipped"] = r["prev_signal"] is not None and r["prev_signal"] != r["signal"]
+            # Squeeze-state transitions (quiet→fuel→ignition) are notification-worthy events too.
+            r["prev_squeeze"] = p.get("squeeze")
+            r["squeeze_changed"] = (
+                r.get("squeeze") is not None
+                and r["prev_squeeze"] is not None
+                and r["squeeze"] != r["prev_squeeze"]
+            )
             return r
 
         results = list(await asyncio.gather(

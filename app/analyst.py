@@ -69,6 +69,13 @@ restate all the numbers in the thesis — the user sees the indicator values alr
 - If the snapshot includes `rule_score`, it is the app's mechanical composite read of these SAME \
 indicators on a 0-100 directional scale (50 neutral, higher bullish). If your verdict materially \
 disagrees with it, add ONE rationale bullet starting "Vs rule score:" explaining the difference.
+- If the snapshot includes `short_pressure` (days-to-cover, short-interest change, daily \
+short-volume ratio, FTD trend, state quiet/fuel/ignition): remember the base rate — high short \
+interest predicts UNDERperformance on average, because shorts are informed. Treat "fuel" (high \
+days-to-cover) as a risk amplifier in BOTH directions, not a buy signal. Only treat squeeze \
+mechanics as a bullish catalyst when the state is "ignition" (price and volume are confirming), \
+and even then frame it as a high-risk, fast-reversing scenario with a tight invalidation. Rising \
+FTDs are settlement stress context, not timing.
 - If the snapshot includes `recent_news` (headlines) or `next_earnings` (a date), use them to \
 populate `catalysts` and sharpen `key_risks` — but do NOT invent news beyond what is provided.
 - If the snapshot includes a `position` block, the user ALREADY HOLDS this asset (shares, average \

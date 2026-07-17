@@ -8,6 +8,7 @@ engine uses. This mirrors ChartMath.kt so the LLM sees the same numbers the phon
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -21,6 +22,7 @@ class Series:
     symbol: str
     closes: list[float]
     volumes: list[float | None]
+    dates: list[str]  # YYYYMMDD per bar — lets shorts.py align SEC/FINRA data to prices
     fifty_two_high: float | None
     fifty_two_low: float | None
     currency: str
@@ -53,6 +55,7 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str) -> Series:
     raw_vols = quote.get("volume") or []
     closes: list[float] = []
     vols: list[float | None] = []
+    dates: list[str] = []
     for i in range(len(ts)):
         c = raw_closes[i] if i < len(raw_closes) else None
         if c is None:  # Yahoo pads gaps with null
@@ -60,10 +63,12 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str) -> Series:
         closes.append(float(c))
         v = raw_vols[i] if i < len(raw_vols) else None
         vols.append(float(v) if v is not None else None)
+        dates.append(time.strftime("%Y%m%d", time.gmtime(ts[i])))
     return Series(
         symbol=symbol.upper(),
         closes=closes,
         volumes=vols,
+        dates=dates,
         fifty_two_high=meta.get("fiftyTwoWeekHigh"),
         fifty_two_low=meta.get("fiftyTwoWeekLow"),
         currency=meta.get("currency", "USD"),

@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import selfupdate, settings_store, usage_store
+from . import shorts
 from .analyst import analyze, plan_entry, recommend
 from .discover import discover
 from .market import fetch_series, summarize
@@ -380,6 +381,16 @@ async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | No
     summary = summarize(series, None if crypto else bench_closes)
     if not crypto:  # optional news/earnings context (Finnhub, stocks only)
         summary.update(await fetch_context(_http, series.symbol))
+        # Short-pressure context (FINRA SI + daily short volume + SEC FTDs) — best-effort; the
+        # sources cache aggressively so a watchlist sweep costs one download per file, not per symbol.
+        try:
+            sp = await shorts.short_pressure(
+                _http, series.symbol, dates=series.dates, closes=series.closes, volumes=series.volumes,
+            )
+            if sp:
+                summary["short_pressure"] = shorts.compact(sp)
+        except Exception:  # noqa: BLE001 — shorts data is enrichment, never a blocker
+            pass
     return summary
 
 
@@ -436,6 +447,30 @@ async def signal(
     return await _build_signal(
         symbol, deep=deep, crypto=crypto, shares=shares, avg_cost=avg_cost, rule_score=rule_score,
     )
+
+
+@app.get("/shorts/{symbol}")
+async def shorts_endpoint(symbol: str) -> dict:
+    """Full short-pressure read for one stock (no LLM, free): state, days-to-cover, short-volume
+    ratio, FTD series/trend, per-symbol event study after past FTD spikes, and upcoming key dates."""
+    key = ("shorts", symbol.upper())
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < 900:  # 15 min — underlying sources cache far longer anyway
+        return {**hit[1], "cached": True}
+    assert _http is not None
+    try:
+        series = await fetch_series(_http, symbol)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
+    sp = await shorts.short_pressure(
+        _http, series.symbol, dates=series.dates, closes=series.closes, volumes=series.volumes,
+    )
+    if sp is None:
+        raise HTTPException(status_code=404, detail="no short data available for this symbol")
+    payload = {"symbol": series.symbol, "as_of": now, **sp, "cached": False}
+    _cache[key] = (now, payload)
+    return payload
 
 
 @app.get("/plan/{symbol}")
