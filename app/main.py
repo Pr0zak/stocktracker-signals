@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import selfupdate, settings_store, usage_store
-from . import cycle, shorts, webull
+from . import cycle, insider, shorts, webull
 from .analyst import analyze, plan_entry, recommend
 from .discover import discover
 from .market import fetch_series, summarize
@@ -393,6 +393,12 @@ async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | No
                 summary["short_pressure"] = shorts.compact(sp)
         except Exception:  # noqa: BLE001 — shorts data is enrichment, never a blocker
             pass
+        try:  # insider buying (Finnhub Form 4) — the bullish informed-money mirror of short_pressure
+            ins = insider.compact(await insider.insider_buying(_http, series.symbol))
+            if ins:
+                summary["insider"] = ins
+        except Exception:  # noqa: BLE001 — enrichment, never a blocker
+            pass
     return summary
 
 
@@ -587,6 +593,17 @@ async def touches(symbol: str) -> dict:
     if study is None:
         raise HTTPException(status_code=404, detail="not enough weekly history for a 200-week touch study")
     return {"symbol": symbol.upper(), **study}
+
+
+@app.get("/insider/{symbol}")
+async def insider_endpoint(symbol: str) -> dict:
+    """Open-market insider PURCHASES (SEC Form 4 via Finnhub) over the last 12 months — the bullish
+    informed-money read. Free; needs a Finnhub key configured. 404 without a key."""
+    assert _http is not None
+    data = await insider.insider_buying(_http, symbol.upper())
+    if data is None:
+        raise HTTPException(status_code=404, detail="no insider data (set a Finnhub key in settings)")
+    return {"symbol": symbol.upper(), **data}
 
 
 @app.get("/plan/{symbol}")
