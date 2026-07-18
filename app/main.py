@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import selfupdate, settings_store, usage_store
-from . import cycle, insider, shorts, webull
+from . import cycle, fundamentals, insider, shorts, webull
 from .analyst import analyze, plan_entry, recommend
 from .discover import discover
 from .market import fetch_series, summarize
@@ -399,6 +399,12 @@ async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | No
                 summary["insider"] = ins
         except Exception:  # noqa: BLE001 — enrichment, never a blocker
             pass
+        try:  # quality tags (Finnhub basic-financials) — stance-neutral business descriptors
+            q = fundamentals.compact(await fundamentals.fetch_quality(_http, series.symbol))
+            if q:
+                summary["quality"] = q
+        except Exception:  # noqa: BLE001 — enrichment, never a blocker
+            pass
     return summary
 
 
@@ -603,6 +609,18 @@ async def insider_endpoint(symbol: str) -> dict:
     data = await insider.insider_buying(_http, symbol.upper())
     if data is None:
         raise HTTPException(status_code=404, detail="no insider data (set a Finnhub key in settings)")
+    return {"symbol": symbol.upper(), **data}
+
+
+@app.get("/quality/{symbol}")
+async def quality_endpoint(symbol: str) -> dict:
+    """Quality tags (Finnhub basic-financials): ROE / margins / debt-to-equity + buffett_quality,
+    wide_moat, dividend_aristocrat flags. Stance-neutral descriptors. Free (the aristocrat flag works
+    without a key). 404 when nothing is available."""
+    assert _http is not None
+    data = await fundamentals.fetch_quality(_http, symbol.upper())
+    if data is None:
+        raise HTTPException(status_code=404, detail="no quality data for this symbol")
     return {"symbol": symbol.upper(), **data}
 
 

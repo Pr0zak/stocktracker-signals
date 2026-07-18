@@ -95,6 +95,11 @@ conviction buy (largest >= $500k) or a cluster (3+ insiders within 30 days) — 
 base rate, since insiders sell for many reasons but mostly buy for one. Weigh it as confirming \
 context, not timing: Form 4s lag the trade by up to ~2 business days, and it never overrides what \
 price and momentum are doing. Absence of insider buying is NOT bearish.
+- If the snapshot includes `quality` (ROE, gross/net margin, a debt-to-equity RATIO, and \
+buffett_quality / wide_moat / dividend_aristocrat flags): these are stance-NEUTRAL descriptors of \
+business durability, NOT a buy or sell call. A wide-moat, low-debt, high-ROE compounder is a \
+structurally safer base to be constructive on, and a leveraged, low-margin business warrants more \
+caution — but quality does not time entries and must never override what price and momentum are doing.
 - Crypto snapshots may include `long_term_trend` (price vs 200-week SMA, Mayer Multiple, distance \
 from ATH, 3y CAGR) and, for BTC, `btc_halving_cycle` (cycle position, phase, and a past-cycle \
 analog of 12-month-forward returns from this position). Use them to frame the MULTI-YEAR regime — \
