@@ -25,6 +25,30 @@ from .news import fetch_context
 LATEST = Path(__file__).resolve().parent.parent / "data" / "scan_latest.json"
 
 
+def _dip_tier(
+    closes: list[float], pct_off_52w: float | None, below_200wma: bool | None, weekly_oversold: bool | None,
+) -> dict:
+    """How much of a 'good time to add' this is, most-severe first: mega_dip (>=20% off the 52-week
+    high) > below_line (below its 200-week line) > oversold (weekly RSI<30) > pullback_10 / pullback_5
+    (off a ~3-month high). None = no dip. A layered 'add EXTRA on weakness' cue, never 'buy signal'."""
+    price = closes[-1]
+    recent_high = max(closes[-63:]) if len(closes) >= 5 else price   # ~3 months of daily bars
+    pct_off_recent = round((price - recent_high) / recent_high * 100, 1) if recent_high else 0.0
+    if pct_off_52w is not None and pct_off_52w <= -20:
+        tier = "mega_dip"
+    elif below_200wma:
+        tier = "below_line"
+    elif weekly_oversold:
+        tier = "oversold"
+    elif pct_off_recent <= -10:
+        tier = "pullback_10"
+    elif pct_off_recent <= -5:
+        tier = "pullback_5"
+    else:
+        tier = None
+    return {"dip": tier, "pct_off_recent_high": pct_off_recent, "pct_off_52w_high": pct_off_52w}
+
+
 async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_closes: list[float] | None) -> dict:
     series = await fetch_series(client, symbol)
     if len(series.closes) < 30:
@@ -32,10 +56,13 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
     summary = summarize(series, None if crypto else bench_closes)
     squeeze = None
     below_200wma = None
+    weekly_oversold = None
     if crypto:
         try:
             summary.update(await cycle.crypto_context(client, series.symbol, series.closes))
-            below_200wma = summary.get("long_term_trend", {}).get("below_line")
+            lt = summary.get("long_term_trend", {})
+            below_200wma = lt.get("below_line")
+            weekly_oversold = lt.get("weekly_oversold")
         except Exception:  # noqa: BLE001
             pass
     if not crypto:
@@ -52,10 +79,12 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
         try:  # 200-week-line state for cross-below alerts — a neutral event flag, NOT fed to the analyst
             lt = (await cycle.crypto_context(client, series.symbol, series.closes)).get("long_term_trend")
             below_200wma = lt.get("below_line") if lt else None
+            weekly_oversold = lt.get("weekly_oversold") if lt else None
         except Exception:  # noqa: BLE001
             pass
     verdict, usage = await analyze(summary, deep=False)
     usage_store.record(usage, symbol=series.symbol, kind="scan")
+    dip = _dip_tier(series.closes, summary.get("pct_off_52w_high"), below_200wma, weekly_oversold)
     return {
         "symbol": series.symbol,
         "signal": verdict.signal.value,
@@ -63,6 +92,7 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
         "thesis": verdict.thesis,
         "squeeze": squeeze,
         "below_200wma": below_200wma,
+        **dip,  # dip tier + pct_off_recent_high + pct_off_52w_high — the "good time to add" read
         "cost_usd": usage["cost_usd"],
     }
 
@@ -73,7 +103,7 @@ def _prev_state() -> dict[str, dict]:
     try:
         return {
             r["symbol"]: {"signal": r.get("signal"), "squeeze": r.get("squeeze"),
-                          "below_200wma": r.get("below_200wma")}
+                          "below_200wma": r.get("below_200wma"), "dip": r.get("dip")}
             for r in json.loads(LATEST.read_text()).get("results", [])
             if "signal" in r
         }
@@ -114,6 +144,9 @@ async def run_scan() -> dict:
             # neutral "heads up" event (a mirror of the flipped diff; first scan has prev=None → no alert).
             r["prev_below_200wma"] = p.get("below_200wma")
             r["crossed_below_200wma"] = r.get("below_200wma") is True and p.get("below_200wma") is False
+            # Newly entered (or escalated to) a dip tier — the "good time to add" event.
+            r["prev_dip"] = p.get("dip")
+            r["dip_new"] = r.get("dip") is not None and p.get("dip") != r.get("dip")
             return r
 
         results = list(await asyncio.gather(
@@ -141,6 +174,11 @@ async def run_scan() -> dict:
         "results": results,
         "flips": [r["symbol"] for r in results if r.get("flipped")],
         "crossed_below_200wma": [r["symbol"] for r in results if r.get("crossed_below_200wma")],
+        "dip_alerts": [
+            {"symbol": r["symbol"], "dip": r["dip"],
+             "pct_off_recent_high": r.get("pct_off_recent_high"), "pct_off_52w_high": r.get("pct_off_52w_high")}
+            for r in results if r.get("dip_new")
+        ],
         "date_alerts": date_alerts,
         "total_cost_usd": round(sum(r.get("cost_usd", 0.0) for r in results), 6),
     }
