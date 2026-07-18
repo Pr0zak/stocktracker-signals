@@ -52,20 +52,23 @@ def halving_cycle(today: date | None = None) -> dict:
     }
 
 
-async def _weekly_max(client: httpx.AsyncClient, symbol: str) -> tuple[list[str], list[float]]:
+async def _weekly_max(client: httpx.AsyncClient, symbol: str) -> tuple[list[str], list[float], list[float]]:
     # Explicit 10y beats "max": Yahoo's max+1wk combo truncates to ~3y for some crypto symbols.
     data = await _fetch_chart(client, symbol, rng="10y", interval="1wk")
     result = data["chart"]["result"][0]
     ts = result.get("timestamp") or []
     adj = _adjusted_closes(result)  # splits/dividends adjusted — critical over a 10y 200WMA window
-    dates, closes = [], []
+    vols_raw = (result.get("indicators", {}).get("quote") or [{}])[0].get("volume") or []
+    dates, closes, vols = [], [], []
     for i in range(len(ts)):
         c = adj[i] if i < len(adj) else None
         if c is None:
             continue
         dates.append(time.strftime("%Y-%m-%d", time.gmtime(ts[i])))
         closes.append(float(c))
-    return dates, closes
+        v = vols_raw[i] if i < len(vols_raw) else None
+        vols.append(float(v) if v is not None else 0.0)
+    return dates, closes, vols
 
 
 def _cycle_analog(dates: list[str], closes: list[float], cycle_pct: float | None) -> dict | None:
@@ -105,7 +108,44 @@ def _zone(pct_from_wma: float) -> str:
     return "above"
 
 
-def long_term_trend(weekly: list[float], daily_closes: list[float]) -> dict | None:
+def _volume_signal(closes: list[float], volumes: list[float]) -> dict | None:
+    """mungbeans' weekly volume read: relative volume + an up/down-week accumulation ratio →
+    quiet_accumulation / capitulation / breakout_volume / distribution / accumulation / neutral."""
+    n = len(volumes)
+    if n < 15 or len(closes) < 15:
+        return None
+    avg = sum(volumes[-14:]) / 14
+    if avg <= 0:
+        return None
+    rvol = volumes[-1] / avg
+    up_v: list[float] = []
+    down_v: list[float] = []
+    for i in range(n - 14, n):
+        if i <= 0:
+            continue
+        (up_v if closes[i] >= closes[i - 1] else down_v).append(volumes[i])
+    up_avg = sum(up_v) / len(up_v) if up_v else 0.0
+    down_avg = sum(down_v) / len(down_v) if down_v else 0.0
+    accum = up_avg / down_avg if down_avg > 0 else (2.0 if up_avg > 0 else 1.0)
+    last_up = closes[-1] >= closes[-2]
+    if rvol < 0.5 and accum > 1.2:
+        sig = "quiet_accumulation"
+    elif rvol > 2.0 and not last_up:
+        sig = "capitulation"
+    elif rvol > 2.0 and last_up:
+        sig = "breakout_volume"
+    elif accum < 0.7:
+        sig = "distribution"
+    elif accum > 1.5:
+        sig = "accumulation"
+    else:
+        sig = "neutral"
+    return {"volume_signal": sig, "rvol_14": round(rvol, 2), "accumulation_ratio": round(accum, 2)}
+
+
+def long_term_trend(
+    weekly: list[float], daily_closes: list[float], weekly_volumes: list[float] | None = None,
+) -> dict | None:
     """Multi-year trend block for ANY symbol (stocks + crypto), computed from max-range weekly bars.
 
     200-week SMA and where price sits relative to it — the below-the-line zone and week-over-week
@@ -144,6 +184,10 @@ def long_term_trend(weekly: list[float], daily_closes: list[float]) -> dict | No
         lt["cagr_3y_pct"] = round(((price / p0) ** (1 / 3) - 1) * 100, 1)
     if len(daily_closes) >= 200:  # Mayer Multiple from the daily series we already have
         lt["mayer_multiple"] = round(daily_closes[-1] / (sum(daily_closes[-200:]) / 200), 2)
+    if weekly_volumes is not None:  # weekly accumulation/distribution read
+        vsig = _volume_signal(weekly, weekly_volumes)
+        if vsig:
+            lt.update(vsig)
     return lt
 
 
@@ -256,9 +300,9 @@ async def spy_weekly(client: httpx.AsyncClient) -> tuple[list[str], list[float]]
     global _spy_cache
     if _spy_cache and time.time() - _spy_cache[0] < _TTL:
         return _spy_cache[1]
-    dw = await _weekly_max(client, "^GSPC")
-    _spy_cache = (time.time(), dw)
-    return dw
+    dates, closes, _ = await _weekly_max(client, "^GSPC")
+    _spy_cache = (time.time(), (dates, closes))
+    return _spy_cache[1]
 
 
 async def crypto_context(client: httpx.AsyncClient, symbol: str, daily_closes: list[float]) -> dict:
@@ -271,8 +315,8 @@ async def crypto_context(client: httpx.AsyncClient, symbol: str, daily_closes: l
         return hit[1]
     out: dict = {}
     try:
-        dates, weekly = await _weekly_max(client, sym)
-        lt = long_term_trend(weekly, daily_closes)
+        dates, weekly, weekly_vol = await _weekly_max(client, sym)
+        lt = long_term_trend(weekly, daily_closes, weekly_vol)
         if lt:
             out["long_term_trend"] = lt
             if sym.startswith("BTC"):

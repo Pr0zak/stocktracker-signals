@@ -591,7 +591,7 @@ async def touches(symbol: str) -> dict:
     404 for names with under ~4 years of weekly history."""
     assert _http is not None
     try:
-        dates, weekly = await cycle._weekly_max(_http, symbol.upper())
+        dates, weekly, _ = await cycle._weekly_max(_http, symbol.upper())
         spy_dates, spy_weekly = await cycle.spy_weekly(_http)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
