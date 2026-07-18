@@ -26,6 +26,7 @@ class Series:
     fifty_two_high: float | None
     fifty_two_low: float | None
     currency: str
+    source: str = "yahoo"  # "webull" when Yahoo had no data and the fallback supplied bars
 
 
 async def _fetch_chart(client: httpx.AsyncClient, symbol: str, rng: str = "1y", interval: str = "1d") -> dict:
@@ -45,8 +46,28 @@ async def _fetch_chart(client: httpx.AsyncClient, symbol: str, rng: str = "1y", 
     raise RuntimeError(f"Yahoo chart fetch failed for {symbol}: {last_err}")
 
 
+async def _webull_series(client: httpx.AsyncClient, symbol: str) -> Series:
+    """Build a Series from Webull daily bars — the fallback for warrants/OTC Yahoo doesn't carry.
+    Raises if Webull has nothing either, so callers see a normal 'no data' failure."""
+    from . import webull  # local import: webull has no market dependency, keeps import order clean
+    bars = await webull.history(client, symbol)
+    if not bars:
+        raise RuntimeError(f"no data for {symbol} (Yahoo + Webull)")
+    closes = [b["c"] for b in bars]
+    vols: list[float | None] = [b.get("v") for b in bars]
+    dates = [time.strftime("%Y%m%d", time.gmtime(b["t"] / 1000)) for b in bars]
+    recent = closes[-252:]
+    return Series(
+        symbol=symbol.upper(), closes=closes, volumes=vols, dates=dates,
+        fifty_two_high=max(recent), fifty_two_low=min(recent), currency="USD", source="webull",
+    )
+
+
 async def fetch_series(client: httpx.AsyncClient, symbol: str) -> Series:
-    data = await _fetch_chart(client, symbol)
+    try:
+        data = await _fetch_chart(client, symbol)
+    except Exception:  # noqa: BLE001 — Yahoo has nothing; try the Webull fallback (warrants/OTC)
+        return await _webull_series(client, symbol)
     result = data["chart"]["result"][0]
     meta = result.get("meta", {})
     ts = result.get("timestamp") or []

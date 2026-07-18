@@ -452,26 +452,19 @@ async def signal(
 
 
 @app.get("/history/{symbol}")
-async def history_endpoint(symbol: str, count: int = 800) -> dict:
-    """Daily OHLCV bars for a symbol. Yahoo primary; Webull fallback for symbols Yahoo doesn't carry
-    (warrants, OTC). The app calls this only when its own on-device Yahoo fetch came back empty."""
+async def history_endpoint(symbol: str) -> dict:
+    """Daily close+volume bars for a symbol. fetch_series is Yahoo-primary with a Webull fallback
+    (warrants/OTC), so this reports whichever source actually supplied the data."""
     assert _http is not None
-    # Yahoo first (close+volume by day — the app already has this on-device, but keep the endpoint
-    # general-purpose).
     try:
         s = await fetch_series(_http, symbol)
-        if s.closes and s.dates:
-            bars = [
-                {"t": int(time.mktime(time.strptime(d, "%Y%m%d"))) * 1000, "c": c, "v": v or 0.0}
-                for d, c, v in zip(s.dates, s.closes, s.volumes)
-            ]
-            return {"symbol": s.symbol, "source": "yahoo", "bars": bars}
-    except Exception:  # noqa: BLE001 — fall through to Webull
-        pass
-    bars = await webull.history(_http, symbol, count=count)
-    if not bars:
+    except Exception:  # noqa: BLE001
         raise HTTPException(status_code=404, detail="no historical data for this symbol")
-    return {"symbol": symbol.upper(), "source": "webull", "bars": bars}
+    bars = [
+        {"t": int(time.mktime(time.strptime(d, "%Y%m%d"))) * 1000, "c": c, "v": v or 0.0}
+        for d, c, v in zip(s.dates, s.closes, s.volumes)
+    ]
+    return {"symbol": s.symbol, "source": s.source, "bars": bars}
 
 
 @app.get("/shorts/{symbol}")
