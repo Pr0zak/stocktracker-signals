@@ -31,9 +31,11 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
         raise ValueError("not enough history")
     summary = summarize(series, None if crypto else bench_closes)
     squeeze = None
+    below_200wma = None
     if crypto:
         try:
             summary.update(await cycle.crypto_context(client, series.symbol, series.closes))
+            below_200wma = summary.get("long_term_trend", {}).get("below_line")
         except Exception:  # noqa: BLE001
             pass
     if not crypto:
@@ -47,6 +49,11 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
                 squeeze = sp["state"]
         except Exception:  # noqa: BLE001
             pass
+        try:  # 200-week-line state for cross-below alerts — a neutral event flag, NOT fed to the analyst
+            lt = (await cycle.crypto_context(client, series.symbol, series.closes)).get("long_term_trend")
+            below_200wma = lt.get("below_line") if lt else None
+        except Exception:  # noqa: BLE001
+            pass
     verdict, usage = await analyze(summary, deep=False)
     usage_store.record(usage, symbol=series.symbol, kind="scan")
     return {
@@ -55,6 +62,7 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
         "conviction": verdict.conviction,
         "thesis": verdict.thesis,
         "squeeze": squeeze,
+        "below_200wma": below_200wma,
         "cost_usd": usage["cost_usd"],
     }
 
@@ -64,7 +72,8 @@ def _prev_state() -> dict[str, dict]:
         return {}
     try:
         return {
-            r["symbol"]: {"signal": r.get("signal"), "squeeze": r.get("squeeze")}
+            r["symbol"]: {"signal": r.get("signal"), "squeeze": r.get("squeeze"),
+                          "below_200wma": r.get("below_200wma")}
             for r in json.loads(LATEST.read_text()).get("results", [])
             if "signal" in r
         }
@@ -101,6 +110,10 @@ async def run_scan() -> dict:
                 and r["prev_squeeze"] is not None
                 and r["squeeze"] != r["prev_squeeze"]
             )
+            # Newly below the 200-week line this run — mungbeans' weekly signal, surfaced as a
+            # neutral "heads up" event (a mirror of the flipped diff; first scan has prev=None → no alert).
+            r["prev_below_200wma"] = p.get("below_200wma")
+            r["crossed_below_200wma"] = r.get("below_200wma") is True and p.get("below_200wma") is False
             return r
 
         results = list(await asyncio.gather(
@@ -127,6 +140,7 @@ async def run_scan() -> dict:
         "generated_at": time.time(),
         "results": results,
         "flips": [r["symbol"] for r in results if r.get("flipped")],
+        "crossed_below_200wma": [r["symbol"] for r in results if r.get("crossed_below_200wma")],
         "date_alerts": date_alerts,
         "total_cost_usd": round(sum(r.get("cost_usd", 0.0) for r in results), 6),
     }

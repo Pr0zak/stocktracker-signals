@@ -553,6 +553,42 @@ async def cycle_endpoint(symbol: str) -> dict:
     }
 
 
+@app.get("/trend/{symbol}")
+async def trend(symbol: str) -> dict:
+    """Below-the-200-week-line context for a STOCK (or any symbol) — the equity mirror of /cycle.
+    200-week SMA, where price sits vs the line (below_line, 7-band zone, week-over-week
+    recovering/deepening direction), a 14-week RSI oversold read, Mayer, ATH distance, 3y CAGR.
+    Free — no LLM. 404 for names with under ~4 years of weekly history (no 200-week value)."""
+    assert _http is not None
+    try:
+        series = await fetch_series(_http, symbol)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
+    ctx = await cycle.crypto_context(_http, series.symbol, series.closes)
+    lt = ctx.get("long_term_trend")
+    if not lt or "sma_200w" not in lt:
+        raise HTTPException(status_code=404, detail="not enough weekly history for a 200-week trend")
+    return {"symbol": series.symbol, "close": round(series.closes[-1], 4), **lt}
+
+
+@app.get("/touches/{symbol}")
+async def touches(symbol: str) -> dict:
+    """Historical 200-week-line touch study: what happened the last N times this name traded below
+    its 200-week line — median/avg forward 12- and 24-month return, % that resolved higher, and the
+    S&P 500's average over the same windows. Evidence context, not a buy signal. Free — no LLM.
+    404 for names with under ~4 years of weekly history."""
+    assert _http is not None
+    try:
+        dates, weekly = await cycle._weekly_max(_http, symbol.upper())
+        spy_dates, spy_weekly = await cycle.spy_weekly(_http)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
+    study = cycle.wma_touch_study(dates, weekly, spy_dates, spy_weekly)
+    if study is None:
+        raise HTTPException(status_code=404, detail="not enough weekly history for a 200-week touch study")
+    return {"symbol": symbol.upper(), **study}
+
+
 @app.get("/plan/{symbol}")
 async def plan(
     symbol: str, cash: float, crypto: bool = False, deep: bool = False,

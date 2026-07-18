@@ -31,7 +31,7 @@ class Series:
 
 async def _fetch_chart(client: httpx.AsyncClient, symbol: str, rng: str = "1y", interval: str = "1d") -> dict:
     enc = symbol.upper().replace("^", "%5E")
-    path = f"v8/finance/chart/{enc}?range={rng}&interval={interval}"
+    path = f"v8/finance/chart/{enc}?range={rng}&interval={interval}&includeAdjustedClose=true"
     last_err: Exception | None = None
     for host in _HOSTS:
         try:
@@ -44,6 +44,28 @@ async def _fetch_chart(client: httpx.AsyncClient, symbol: str, rng: str = "1y", 
         except Exception as e:  # noqa: BLE001 — fail over to the next host
             last_err = e
     raise RuntimeError(f"Yahoo chart fetch failed for {symbol}: {last_err}")
+
+
+def _adjusted_closes(result: dict) -> list[float | None]:
+    """Split/dividend-adjusted close per bar, falling back to raw close where Yahoo omits adjclose.
+
+    Adjusted close is the correct series for any moving-average / RSI / return math: without it a
+    split (e.g. NVDA 10:1) drops the raw close ~90% in one bar and corrupts the 200-week SMA, the
+    forward-return studies, and below-line / cross detection. Indices and crypto carry no adjclose
+    array (no splits/dividends) — for them raw close already equals adjusted, so we fall back per bar.
+    """
+    ind = result.get("indicators", {})
+    raw = (ind.get("quote") or [{}])[0].get("close") or []
+    adj_holder = ind.get("adjclose") or []
+    adj = (adj_holder[0].get("adjclose") if adj_holder else None) or []
+    n = len(result.get("timestamp") or [])
+    out: list[float | None] = []
+    for i in range(n):
+        a = adj[i] if i < len(adj) else None
+        if a is None:  # bar missing from adjclose (or no adjclose at all) — use raw close
+            a = raw[i] if i < len(raw) else None
+        out.append(float(a) if a is not None else None)
+    return out
 
 
 async def _webull_series(client: httpx.AsyncClient, symbol: str) -> Series:
@@ -72,13 +94,13 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str) -> Series:
     meta = result.get("meta", {})
     ts = result.get("timestamp") or []
     quote = (result.get("indicators", {}).get("quote") or [{}])[0]
-    raw_closes = quote.get("close") or []
+    adj_closes = _adjusted_closes(result)
     raw_vols = quote.get("volume") or []
     closes: list[float] = []
     vols: list[float | None] = []
     dates: list[str] = []
     for i in range(len(ts)):
-        c = raw_closes[i] if i < len(raw_closes) else None
+        c = adj_closes[i] if i < len(adj_closes) else None
         if c is None:  # Yahoo pads gaps with null
             continue
         closes.append(float(c))
