@@ -18,6 +18,7 @@ from . import settings_store
 
 _BASE = "https://finnhub.io/api/v1"
 _cache: dict[str, tuple[float, dict | None]] = {}
+_fin_cache: dict[str, tuple[float, dict | None]] = {}
 _TTL = 12 * 3600
 
 # S&P 500 Dividend Aristocrats (25+ years of consecutive dividend increases). Static reference data;
@@ -87,6 +88,75 @@ def compact(data: dict | None) -> dict | None:
     if not data:
         return None
     keep = ("roe", "gross_margin", "net_margin", "debt_to_equity",
-            "high_roe", "low_debt", "wide_moat", "buffett_quality", "dividend_aristocrat")
+            "high_roe", "low_debt", "wide_moat", "buffett_quality", "dividend_aristocrat",
+            "fcf_trend", "fcf_positive_years", "fcf_years", "shares_change_pct")
     slim = {k: data[k] for k in keep if data.get(k) is not None}
     return slim or None
+
+
+def _pick(items: list, needle: str) -> float | None:
+    """First numeric value whose XBRL concept ends with `needle` (Finnhub prefixes vary)."""
+    for it in items or []:
+        c = str(it.get("concept", ""))
+        if c == needle or c.endswith(needle):
+            v = it.get("value")
+            if isinstance(v, (int, float)):
+                return float(v)
+    return None
+
+
+async def fetch_financials(client: httpx.AsyncClient, symbol: str) -> dict | None:
+    """FCF-trend (operating cash flow − capex) + share-count-trend from Finnhub's as-reported SEC
+    financials (`/stock/financials-reported`, annual 10-Ks). Best-effort; None without a key, for
+    crypto, or when the statements don't line up. Cached 12h. (MB-13 / MB-14.)"""
+    sym = symbol.upper()
+    hit = _fin_cache.get(sym)
+    if hit and time.time() - hit[0] < _TTL:
+        return hit[1]
+    key = settings_store.get().get("finnhub_api_key", "")
+    out: dict | None = None
+    if key:
+        try:
+            r = await client.get(
+                f"{_BASE}/stock/financials-reported",
+                params={"symbol": sym, "freq": "annual", "token": key}, timeout=20,
+            )
+            r.raise_for_status()
+            reports = (r.json() or {}).get("data", []) or []
+            by_year: dict[int, tuple[float | None, float | None, float | None]] = {}
+            for rep in reports:
+                if rep.get("form") not in ("10-K", "10-K/A"):
+                    continue
+                yr = rep.get("year")
+                rpt = rep.get("report") or {}
+                cf, ic = rpt.get("cf") or [], rpt.get("ic") or []
+                ocf = _pick(cf, "NetCashProvidedByUsedInOperatingActivities")
+                capex = _pick(cf, "PaymentsToAcquirePropertyPlantAndEquipment")
+                sh = (_pick(ic, "WeightedAverageNumberOfDilutedSharesOutstanding")
+                      or _pick(ic, "WeightedAverageNumberOfSharesOutstandingBasic"))
+                if yr is not None:
+                    by_year[yr] = (ocf, capex, sh)
+            years = sorted(by_year)
+            fcf = [(y, by_year[y][0] - by_year[y][1]) for y in years
+                   if by_year[y][0] is not None and by_year[y][1] is not None][-5:]
+            shares = [(y, by_year[y][2]) for y in years if by_year[y][2]][-5:]
+            block: dict = {}
+            if len(fcf) >= 2:
+                latest = fcf[-1][1]
+                earlier = [v for _, v in fcf[:-1]]
+                mean_earlier = sum(earlier) / len(earlier)
+                block["fcf_latest"] = round(latest)
+                block["fcf_trend"] = (
+                    "rising" if latest > mean_earlier * 1.05
+                    else "falling" if latest < mean_earlier * 0.95 else "flat"
+                )
+                block["fcf_positive_years"] = sum(1 for _, v in fcf if v > 0)
+                block["fcf_years"] = len(fcf)
+            if len(shares) >= 2 and shares[0][1] > 0:
+                block["shares_change_pct"] = round((shares[-1][1] / shares[0][1] - 1) * 100, 1)
+                block["shares_years"] = len(shares)
+            out = block or None
+        except Exception:  # noqa: BLE001 — fundamentals are enrichment, never a blocker
+            out = None
+    _fin_cache[sym] = (time.time(), out)
+    return out
