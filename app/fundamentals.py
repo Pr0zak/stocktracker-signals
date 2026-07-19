@@ -10,14 +10,11 @@ with a positive net margin (positive earnings); it's a descriptor, not a screen.
 """
 from __future__ import annotations
 
-import logging
 import time
 
 import httpx
 
 from . import settings_store
-
-log = logging.getLogger("uvicorn.error")
 
 _BASE = "https://finnhub.io/api/v1"
 _cache: dict[str, tuple[float, dict | None]] = {}
@@ -124,18 +121,8 @@ async def fetch_financials(client: httpx.AsyncClient, symbol: str) -> dict | Non
                 f"{_BASE}/stock/financials-reported",
                 params={"symbol": sym, "freq": "annual", "token": key}, timeout=20,
             )
-            reports = (r.json() or {}).get("data", []) or []
-            if reports:  # one-shot diagnostic: exact OCF/capex/share concepts + values
-                cf0 = (reports[0].get("report") or {}).get("cf") or []
-                ic0 = (reports[0].get("report") or {}).get("ic") or []
-                rel = [(str(x.get("concept")), x.get("value")) for x in cf0
-                       if any(k in str(x.get("concept")) for k in
-                              ("OperatingActivities", "PropertyPlantAndEquipment", "CapitalExpend", "PurchaseOfProperty"))]
-                sh = [(str(x.get("concept")), x.get("value")) for x in ic0
-                      if "SharesOutstanding" in str(x.get("concept"))]
-                log.info("financials %s http=%s reports=%s year0=%s cf_rel=%s sh=%s",
-                         sym, r.status_code, len(reports), reports[0].get("year"), rel[:6], sh[:4])
             r.raise_for_status()
+            reports = (r.json() or {}).get("data", []) or []
             by_year: dict[int, tuple[float | None, float | None, float | None]] = {}
             for rep in reports:
                 if rep.get("form") not in ("10-K", "10-K/A"):
