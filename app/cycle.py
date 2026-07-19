@@ -179,6 +179,19 @@ def long_term_trend(
             lt["weekly_oversold"] = rsi_w < 30
     ath = max(weekly)
     lt["pct_off_all_time_high"] = round((price - ath) / ath * 100, 1)
+    # Dislocation z-score: how statistically unusual today's drawdown-from-running-peak is vs this
+    # symbol's OWN weekly history. Very negative = an unusually deep drawdown (mungbeans' "how cheap,
+    # normalized"); near 0/positive = trading around or above its typical drawdown (near highs).
+    if len(weekly) >= 52:
+        run_max = weekly[0]
+        dd: list[float] = []
+        for p in weekly:
+            run_max = max(run_max, p)
+            dd.append(p / run_max - 1.0)  # <= 0
+        mean = sum(dd) / len(dd)
+        std = (sum((d - mean) ** 2 for d in dd) / len(dd)) ** 0.5
+        if std > 1e-9:
+            lt["drawdown_z"] = round((dd[-1] - mean) / std, 2)
     if len(weekly) >= 156:  # 3-year CAGR
         p0 = weekly[-156]
         lt["cagr_3y_pct"] = round(((price / p0) ** (1 / 3) - 1) * 100, 1)
