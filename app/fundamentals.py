@@ -10,11 +10,14 @@ with a positive net margin (positive earnings); it's a descriptor, not a screen.
 """
 from __future__ import annotations
 
+import logging
 import time
 
 import httpx
 
 from . import settings_store
+
+log = logging.getLogger("uvicorn.error")
 
 _BASE = "https://finnhub.io/api/v1"
 _cache: dict[str, tuple[float, dict | None]] = {}
@@ -121,8 +124,15 @@ async def fetch_financials(client: httpx.AsyncClient, symbol: str) -> dict | Non
                 f"{_BASE}/stock/financials-reported",
                 params={"symbol": sym, "freq": "annual", "token": key}, timeout=20,
             )
-            r.raise_for_status()
             reports = (r.json() or {}).get("data", []) or []
+            log.info(  # one-shot diagnostic: what does Finnhub actually return here?
+                "financials %s http=%s reports=%s form0=%s cf0=%s",
+                sym, r.status_code, len(reports),
+                (reports[0].get("form") if reports else None),
+                ([str(x.get("concept")) for x in ((reports[0].get("report") or {}).get("cf") or [])[:8]]
+                 if reports else []),
+            )
+            r.raise_for_status()
             by_year: dict[int, tuple[float | None, float | None, float | None]] = {}
             for rep in reports:
                 if rep.get("form") not in ("10-K", "10-K/A"):
