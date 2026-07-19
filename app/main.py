@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import selfupdate, settings_store, usage_store
-from . import cycle, fundamentals, insider, shorts, webull
+from . import cycle, fundamentals, insider, sec_xbrl, shorts, webull
 from .analyst import analyze, plan_entry, recommend
 from .discover import discover
 from .market import fetch_series, summarize
@@ -618,10 +618,17 @@ async def quality_endpoint(symbol: str) -> dict:
     wide_moat, dividend_aristocrat flags. Stance-neutral descriptors. Free (the aristocrat flag works
     without a key). 404 when nothing is available."""
     assert _http is not None
-    data = await fundamentals.fetch_quality(_http, symbol.upper())
-    if data is None:
+    sym = symbol.upper()
+    data = await fundamentals.fetch_quality(_http, sym)
+    # SEC XBRL FCF-trend + share-count-trend (MB-13/14) — best-effort, US filers only, merged in.
+    funda = None
+    try:
+        funda = await sec_xbrl.fetch_fundamentals(_http, sym)
+    except Exception:  # noqa: BLE001
+        funda = None
+    if data is None and funda is None:
         raise HTTPException(status_code=404, detail="no quality data for this symbol")
-    return {"symbol": symbol.upper(), **data}
+    return {"symbol": sym, **(data or {}), **(funda or {})}
 
 
 @app.get("/plan/{symbol}")
