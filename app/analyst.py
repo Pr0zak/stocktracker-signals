@@ -7,12 +7,15 @@ Verdict schema. Adaptive thinking on the deep (Opus) model; the cheap scan model
 from __future__ import annotations
 
 import json
+import logging
 from enum import Enum
 
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel
 
 from . import settings_store
+
+log = logging.getLogger("uvicorn.error")
 
 _client: AsyncAnthropic | None = None
 _client_key: str | None = None
@@ -233,6 +236,7 @@ def _usage(model: str, u) -> dict:
         "input_tokens": u.input_tokens,
         "output_tokens": u.output_tokens,
         "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
         "cost_usd": round(cost, 6),
     }
 
@@ -252,7 +256,12 @@ async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tok
     kwargs: dict = dict(
         model=model,
         max_tokens=max_tokens,
-        system=system,
+        # Cache the (large, static) analyst system prompt: the many same-prefix scan calls then read
+        # it at ~10% of input price instead of re-billing ~1.3k tokens every time. The structured-output
+        # schema sits in the cached prefix too (tools precede system). 5-min TTL — fine for a scan that
+        # fires all symbols within a minute. NOTE: caching only engages above the model's minimum
+        # cacheable prefix (higher for Haiku), so watch cache_read below to confirm it takes on the scan.
+        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": prompt}],
         output_format=output_format,
     )
@@ -261,6 +270,13 @@ async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tok
         kwargs["thinking"] = {"type": "adaptive"}
 
     resp = await _get_client().messages.parse(**kwargs)
+    u0 = resp.usage
+    log.info(
+        "analyst %s in=%s out=%s cache_write=%s cache_read=%s",
+        model, u0.input_tokens, u0.output_tokens,
+        getattr(u0, "cache_creation_input_tokens", 0) or 0,
+        getattr(u0, "cache_read_input_tokens", 0) or 0,
+    )
     if resp.stop_reason == "max_tokens":
         # Truncated JSON parses as garbage — fail with a clear cause instead of a pydantic stack.
         raise RuntimeError(f"analyst output hit the {max_tokens}-token cap and was truncated — retry")
