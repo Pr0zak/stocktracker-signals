@@ -256,12 +256,15 @@ async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tok
     kwargs: dict = dict(
         model=model,
         max_tokens=max_tokens,
-        # Cache the (large, static) analyst system prompt: the many same-prefix scan calls then read
-        # it at ~10% of input price instead of re-billing ~1.3k tokens every time. The structured-output
-        # schema sits in the cached prefix too (tools precede system). 5-min TTL — fine for a scan that
-        # fires all symbols within a minute. NOTE: caching only engages above the model's minimum
-        # cacheable prefix (higher for Haiku), so watch cache_read below to confirm it takes on the scan.
-        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        # Prompt caching was measured here and REMOVED — it doesn't help this workload:
+        #  • Haiku scan (the bulk of the cost): on the output_format path the cacheable prefix is the
+        #    system prompt only (~1.3k tokens; the schema isn't a cached tool there), under Haiku's ~2k
+        #    minimum — so cache_control was a silent no-op (cache_write=0 across a 24-symbol scan).
+        #  • Opus deep: it DID cache (~2.8k prefix) but deep calls are usually one-off, so the +25%
+        #    cache-write premium never gets recouped by a within-TTL read.
+        # The Batch API (~50% off input AND output) is the real scan lever — see scan_job.py.
+        # The per-call in/out/cache token log below stays, for ongoing cost visibility.
+        system=system,
         messages=[{"role": "user", "content": prompt}],
         output_format=output_format,
     )
