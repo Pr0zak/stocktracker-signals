@@ -125,13 +125,16 @@ async def fetch_financials(client: httpx.AsyncClient, symbol: str) -> dict | Non
                 params={"symbol": sym, "freq": "annual", "token": key}, timeout=20,
             )
             reports = (r.json() or {}).get("data", []) or []
-            log.info(  # one-shot diagnostic: what does Finnhub actually return here?
-                "financials %s http=%s reports=%s form0=%s cf0=%s",
-                sym, r.status_code, len(reports),
-                (reports[0].get("form") if reports else None),
-                ([str(x.get("concept")) for x in ((reports[0].get("report") or {}).get("cf") or [])[:8]]
-                 if reports else []),
-            )
+            if reports:  # one-shot diagnostic: exact OCF/capex/share concepts + values
+                cf0 = (reports[0].get("report") or {}).get("cf") or []
+                ic0 = (reports[0].get("report") or {}).get("ic") or []
+                rel = [(str(x.get("concept")), x.get("value")) for x in cf0
+                       if any(k in str(x.get("concept")) for k in
+                              ("OperatingActivities", "PropertyPlantAndEquipment", "CapitalExpend", "PurchaseOfProperty"))]
+                sh = [(str(x.get("concept")), x.get("value")) for x in ic0
+                      if "SharesOutstanding" in str(x.get("concept"))]
+                log.info("financials %s http=%s reports=%s year0=%s cf_rel=%s sh=%s",
+                         sym, r.status_code, len(reports), reports[0].get("year"), rel[:6], sh[:4])
             r.raise_for_status()
             by_year: dict[int, tuple[float | None, float | None, float | None]] = {}
             for rep in reports:
