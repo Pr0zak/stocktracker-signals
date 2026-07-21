@@ -508,8 +508,8 @@ async def shorts_endpoint(symbol: str) -> dict:
 
 @app.get("/calendar")
 async def calendar_endpoint(symbol: str | None = None) -> dict:
-    """Catalyst calendar: SI settlements/publications, OPEX, earnings, and the next BTC halving.
-    Whole watchlist by default; `symbol` narrows to
+    """Catalyst calendar: SI settlements/publications, OPEX, earnings, clearly-labeled speculative
+    T+35 FTD-echo windows, and the next BTC halving. Whole watchlist by default; `symbol` narrows to
     one asset (a crypto symbol gets only crypto-relevant events — equity SI/OPEX dates are noise
     there). Cached 1h."""
     cfg = settings_store.get()
