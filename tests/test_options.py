@@ -186,5 +186,9 @@ def test_live_chain_smoke():
         assert all(-1.0 <= d <= 0.0 for d in put_deltas), "put deltas must be in [-1,0]"
     # a deep-ITM call (low strike) should have delta near 1; a far-OTM call near 0
     assert max(call_deltas) > 0.6, "deep-ITM call should have a high delta"
-    # a mid/spread and breakeven got attached to at least one contract
-    assert any(c.mid is not None and c.breakeven is not None for c in expiry.calls)
+    # breakeven attaches to a contract (from mid, or the last-price fallback when the market is closed)
+    assert any(c.breakeven is not None for c in expiry.calls), "breakeven should attach"
+    # a real mid only exists with both-sided quotes (bid>0 and ask>0) — assert it only during
+    # regular hours, since a closed-market 0-bid correctly yields mid=None (not a fabricated half-price)
+    if chain.market_state == "REGULAR":
+        assert any(c.mid is not None for c in expiry.calls), "a mid should attach during market hours"
