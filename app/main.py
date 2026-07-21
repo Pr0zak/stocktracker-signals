@@ -720,6 +720,79 @@ async def options_endpoint(
         raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
 
 
+@app.get("/option_quote/{symbol}")
+async def option_quote(
+    symbol: str,
+    expiry_ts: int,
+    strike: float,
+    type: str = "call",
+) -> dict:
+    """Re-price ONE specific option contract (OC-3 call-position tracker): given the exact expiry +
+    strike the user already bought, return its live bid/ask/mid/limit + greeks so the app can show
+    running P/L. No LLM, pure data. `expiry_ts` is a unix ts from an earlier `/options` (or chain)
+    call; `strike` is the contract's strike; `type` is call|put (default call). Options aren't
+    available for crypto — that's a 400, not a 500. A strike that isn't in the chain is a 404.
+    Decision support only, not investment advice."""
+    assert _http is not None
+    if symbol.upper().endswith("-USD"):
+        raise HTTPException(status_code=400, detail="options aren't available for crypto symbols")
+    kind = "put" if str(type).lower() == "put" else "call"
+    now = time.time()
+
+    # 1) The chain for this exact expiry (spot + the expiry's calls/puts).
+    try:
+        chain = await options.fetch_chain(_http, symbol, expiry_ts)
+    except Exception as e:  # noqa: BLE001 — no chain (crypto/ETN/illiquid/unknown) is a 400, never a 500.
+        # httpx errors embed the request URL (which carries the Yahoo crumb) — never leak that; keep
+        # the client detail generic and log the real exception server-side.
+        _log.warning("option_quote fetch_chain failed for %s: %s", symbol.upper(), e)
+        raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if chain.expiry is None or not chain.spot or chain.spot <= 0:
+        raise HTTPException(status_code=400, detail=f"no option chain available for {symbol.upper()}")
+
+    # 2) Annotate (mid / spread% / greeks) — malformed chain data degrades to 400, never a 500.
+    try:
+        options.annotate_expiry(chain, now_ts=now)
+    except Exception as e:  # noqa: BLE001
+        _log.warning("option_quote annotate failed for %s: %s", chain.symbol, e)
+        raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+
+    # 3) Find the one contract at this strike (small tolerance for float noise). Missing -> 404.
+    pool = chain.expiry.puts if kind == "put" else chain.expiry.calls
+    match = next((c for c in pool if abs(strike - c.strike) < 0.01), None)
+    if match is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no {kind} at strike {strike} for {chain.symbol} {chain.expiry.expiration_iso}",
+        )
+
+    _m = lambda v: round(v, 2) if v is not None else None  # noqa: E731 — money to 2dp, nullable
+    return {
+        "symbol": chain.symbol,
+        "spot": _m(chain.spot),
+        "as_of": now,
+        "quote_delayed": chain.quote_delayed,
+        "dte": chain.expiry.dte_days,
+        "contract": {
+            "contract_symbol": match.contract_symbol,
+            "type": match.type,
+            "strike": match.strike,
+            "expiration": match.expiration,
+            "bid": _m(match.bid),
+            "ask": _m(match.ask),
+            "last_price": _m(match.last_price),
+            "mid": _m(options.mid_price(match.bid, match.ask)),
+            "limit_price": _m(options._limit_price(match)),  # re-price: mid, else last trade
+            "implied_volatility": round(match.implied_volatility, 4) if match.implied_volatility is not None else None,
+            "delta": match.delta,   # already 4dp from annotate_expiry
+            "theta": match.theta,   # already 4dp from annotate_expiry
+            "open_interest": match.open_interest,
+            "in_the_money": match.in_the_money,
+            "spread_pct": match.spread_pct,
+        },
+    }
+
+
 @app.get("/plan/{symbol}")
 async def plan(
     symbol: str, cash: float, crypto: bool = False, deep: bool = False,
