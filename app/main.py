@@ -506,6 +506,35 @@ async def shorts_endpoint(symbol: str) -> dict:
     return payload
 
 
+@app.get("/movers")
+async def movers_endpoint(count: int = 6) -> dict:
+    """Market-wide top movers on the day — Yahoo's `day_gainers` / `day_losers` predefined screeners.
+    Feeds the app's market-close summary when it's set to 'whole market' instead of the watchlist.
+    Best-effort: returns empty lists rather than erroring."""
+    assert _http is not None
+    from .discover import _raw, _screen  # reuse the screener fetch + raw-field unwrap
+
+    async def side(scr: str) -> list[dict]:
+        try:
+            rows = await _screen(_http, scr, count)
+        except Exception as e:  # noqa: BLE001
+            _log.warning("movers %s failed: %s", scr, e)
+            return []
+        out: list[dict] = []
+        for q in rows:
+            sym = q.get("symbol")
+            if not sym:
+                continue
+            out.append({
+                "symbol": sym,
+                "change_percent": round(_raw(q.get("regularMarketChangePercent")), 2),
+                "price": round(_raw(q.get("regularMarketPrice")), 2),
+            })
+        return out[:count]
+
+    return {"gainers": await side("day_gainers"), "losers": await side("day_losers")}
+
+
 @app.get("/calendar")
 async def calendar_endpoint(symbol: str | None = None) -> dict:
     """Catalyst calendar: SI settlements/publications, OPEX, earnings, clearly-labeled speculative
