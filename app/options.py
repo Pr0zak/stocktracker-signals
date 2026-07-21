@@ -857,7 +857,9 @@ def _debit_spread(
     short_mid = _limit_price(short_c)
     if long_mid is None or short_mid is None:
         return None
-    net_debit = long_mid - short_mid  # per share; long (lower strike) costs more than short
+    # Round to the penny FIRST (options quote in pennies) so every figure below reconciles with the
+    # displayed net_debit — i.e. cost == net_debit*100 exactly (the OC-1 internal-consistency rule).
+    net_debit = round(long_mid - short_mid, 2)  # per share; long (lower strike) costs more than short
     if net_debit <= 0:  # degenerate quotes — a debit spread must cost something
         return None
     width = short_c.strike - long_c.strike
@@ -865,7 +867,7 @@ def _debit_spread(
         "structure": "debit_call_spread",
         "long_strike": long_c.strike,
         "short_strike": short_c.strike,
-        "net_debit": round(net_debit, 2),
+        "net_debit": net_debit,
         "cost": round(net_debit * 100.0, 2),
         "max_profit": round((width - net_debit) * 100.0, 2),
         "max_loss": round(net_debit * 100.0, 2),
