@@ -1,0 +1,6 @@
+# Dev/test-only deps (not needed at runtime). Install into the venv:
+#   .venv/bin/pip install -r requirements-dev.txt
+# Run the suite from the repo root:
+#   .venv/bin/python -m pytest tests/ -v            # all tests (incl. the live smoke test)
+#   .venv/bin/python -m pytest tests/ -v -m "not live"   # offline only
+pytest>=8.0
