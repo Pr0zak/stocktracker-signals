@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import math
 import time
 from contextlib import asynccontextmanager
 
@@ -12,7 +14,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import selfupdate, settings_store, usage_store
-from . import cycle, fundamentals, insider, shorts, webull
+from . import cycle, fundamentals, insider, options, shorts, webull
 from .analyst import analyze, plan_entry, recommend
 from .discover import discover
 from .market import fetch_series, summarize
@@ -21,6 +23,7 @@ from .scan_job import LATEST, run_scan
 
 _http: httpx.AsyncClient | None = None
 _cache: dict[tuple[str, bool], tuple[float, dict]] = {}
+_log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -629,6 +632,92 @@ async def quality_endpoint(symbol: str) -> dict:
     if data is None and funda is None:
         raise HTTPException(status_code=404, detail="no quality data for this symbol")
     return {"symbol": sym, **(data or {}), **(funda or {})}
+
+
+@app.get("/options/{symbol}")
+async def options_endpoint(
+    symbol: str,
+    budget: float | None = None,
+    style: str = "balanced",
+    target_date: str | None = None,
+    crypto: bool = False,
+) -> dict:
+    """No-LLM long-CALL suggester (OC-1): a go/no-go light + up to 3 delta-picked call contracts, each
+    with cost/max-loss/breakeven/greeks and a copy-pasteable order ticket. Pure math + the existing
+    directional technicals — no analyst call (a `deep=` paragraph is OC-7). `budget` sizes the contract
+    count (max loss you'll accept); `style` is safer|balanced|cheaper (the delta bucket surfaced first);
+    `target_date` (YYYY-MM-DD) forces an expiry at/after your timeframe. Options aren't available for
+    crypto — that returns a 400, not a 500. Decision support only, not investment advice."""
+    # 0) Validate budget FIRST — before any network call — so inf/nan/negatives can't reach
+    #    math.floor() and blow up as a 500. A non-positive or non-finite budget is a client error.
+    if budget is not None and (not math.isfinite(budget) or budget <= 0):
+        raise HTTPException(status_code=422, detail="budget must be a positive number")
+    assert _http is not None
+    if crypto or symbol.upper().endswith("-USD"):
+        raise HTTPException(status_code=400, detail="options aren't available for crypto symbols")
+
+    # 1) The chain (spot + all expirations + the default expiry's contracts).
+    try:
+        chain = await options.fetch_chain(_http, symbol)
+    except Exception as e:  # noqa: BLE001 — no chain (crypto/ETN/illiquid/unknown) is a 400, never a 500
+        # Keep the client-facing detail generic: httpx errors embed the request URL (which carries
+        # the Yahoo crumb) — never leak that. Log the real exception server-side.
+        _log.warning("options fetch_chain failed for %s: %s", symbol.upper(), e)
+        raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if not chain.expirations or not chain.spot or chain.spot <= 0:
+        raise HTTPException(status_code=400, detail=f"no option chain available for {symbol.upper()}")
+
+    # 2) Directional read + next earnings — REUSE market.summarize (the ChartMath the Signals card /
+    #    /signal use) and news.fetch_context (Finnhub earnings). Best-effort: if the history fetch
+    #    fails we still return contracts, but the light defaults to caution.
+    summary: dict = {}
+    earnings_date: str | None = None
+    warnings: list[str] = []
+    try:
+        series = await fetch_series(_http, symbol)
+        try:
+            bench = (await fetch_series(_http, "^GSPC")).closes
+        except Exception:  # noqa: BLE001 — relative strength just gets skipped
+            bench = None
+        summary = summarize(series, bench)
+        earnings_date = (await fetch_context(_http, series.symbol)).get("next_earnings")
+    except Exception:  # noqa: BLE001
+        warnings.append("directional data unavailable — the go/no-go light defaults to caution")
+
+    # 3) Pick the expiry (45-90 DTE, clears target_date, skips earnings straddles, ~60 DTE).
+    try:
+        chosen, exp_warnings = options.select_expiry(
+            chain, target_date=target_date, earnings_date=earnings_date,
+        )
+    except Exception as e:  # noqa: BLE001 — malformed expiration data degrades to 400, not 500
+        _log.warning("options select_expiry failed for %s: %s", chain.symbol, e)
+        raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if chosen is None:
+        raise HTTPException(status_code=400, detail=f"no suitable expiration for {chain.symbol}")
+    warnings.extend(exp_warnings)
+
+    # 4) Load the chosen expiry's contracts (reuse the first fetch if it already loaded it) + annotate.
+    if not (chain.expiry and chain.expiry.expiration == chosen["ts"]):
+        try:
+            chain = await options.fetch_chain(_http, symbol, chosen["ts"])
+        except Exception as e:  # noqa: BLE001 — generic 400 (the httpx error embeds the crumb'd URL)
+            _log.warning("options expiry reload failed for %s: %s", chain.symbol, e)
+            raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if chain.expiry is None:
+        raise HTTPException(status_code=400, detail=f"no contracts for the chosen expiry of {chain.symbol}")
+
+    # 5) Annotate + assemble. Malformed chain data here degrades to 400 (matching the fetch above),
+    #    never a 500.
+    try:
+        options.annotate_expiry(chain)
+        return options.assemble_suggestion(
+            chain, chain.expiry, summary,
+            chosen=chosen, style=style, budget=budget, earnings_date=earnings_date,
+            extra_warnings=warnings,
+        )
+    except Exception as e:  # noqa: BLE001
+        _log.warning("options assembly failed for %s: %s", chain.symbol, e)
+        raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
 
 
 @app.get("/plan/{symbol}")

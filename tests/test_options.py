@@ -117,6 +117,17 @@ def test_mid_and_spread():
     assert spread_pct(None, 10.0) is None
 
 
+def test_mid_price_requires_both_sides_positive():
+    """F2: a one-sided quote (0 bid, common outside regular hours) must NOT be averaged — doing so
+    halves the true premium. Both sides must be > 0; otherwise mid is None (callers fall to last)."""
+    assert mid_price(0.0, 6.0) is None    # 0 bid would have wrongly yielded 3.0
+    assert mid_price(6.0, 0.0) is None
+    assert mid_price(None, 6.0) is None
+    assert mid_price(6.0, None) is None
+    # both sides genuinely quoted -> still averages
+    assert mid_price(5.8, 6.2) == pytest.approx(6.0)
+
+
 def test_breakeven():
     assert breakeven(420.0, 6.70, is_call=True) == pytest.approx(426.70)
     assert breakeven(420.0, 6.70, is_call=False) == pytest.approx(413.30)

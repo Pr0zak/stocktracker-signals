@@ -22,6 +22,7 @@ Not investment advice.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import math
 import time
 from dataclasses import dataclass, field
@@ -140,10 +141,21 @@ async def _authenticate(client: httpx.AsyncClient) -> str:
     return crumb
 
 
-async def _ensure_auth(client: httpx.AsyncClient, *, force: bool = False) -> str:
+async def _ensure_auth(
+    client: httpx.AsyncClient, *, force: bool = False, stale: str | None = None
+) -> str:
     """Return a valid crumb, (re)authenticating if needed. Seeds cached cookies onto `client` so a
-    freshly-created client works on its first request instead of taking a 401 detour."""
+    freshly-created client works on its first request instead of taking a 401 detour.
+
+    On a forced refresh after a 401, pass the crumb that just failed as `stale`: if another task
+    already swapped in a newer crumb while we were waiting on the lock, we adopt that one instead of
+    running the handshake a second time (compare-and-swap under the existing lock)."""
     async with _auth_lock:
+        if force and stale is not None and _crumb and _crumb != stale:
+            # A concurrent task already refreshed the crumb — use theirs, don't re-handshake.
+            if _cookies:
+                client.cookies.update(_cookies)
+            return _crumb
         if force or not _crumb:
             return await _authenticate(client)
         if _cookies:
@@ -155,12 +167,16 @@ async def _get_options(client: httpx.AsyncClient, symbol: str, crumb: str, expir
     """GET the options JSON with query1→query2 failover (network errors), returning the raw Response
     so the caller can react to a 401 by re-authenticating."""
     enc = symbol.upper().replace("^", "%5E")
-    qs = f"?crumb={crumb}" + (f"&date={int(expiry_ts)}" if expiry_ts else "")
-    path = f"v7/finance/options/{enc}{qs}"
+    path = f"v7/finance/options/{enc}"
+    # Let httpx URL-encode the query — a crumb can contain +, &, / which naive string-building
+    # would corrupt (producing a bogus/invalid-crumb request).
+    params: dict[str, object] = {"crumb": crumb}
+    if expiry_ts:
+        params["date"] = int(expiry_ts)
     last_err: Exception | None = None
     for host in _HOSTS:
         try:
-            return await client.get(f"https://{host}/{path}", headers=_headers(), timeout=20)
+            return await client.get(f"https://{host}/{path}", params=params, headers=_headers(), timeout=20)
         except Exception as e:  # noqa: BLE001 — try the next host on a transport error
             last_err = e
     raise RuntimeError(f"Yahoo options fetch failed for {symbol}: {last_err}")
@@ -209,7 +225,7 @@ async def fetch_chain(
     crumb = await _ensure_auth(client)
     resp = await _get_options(client, symbol, crumb, expiry_ts)
     if resp.status_code == 401:  # crumb/cookie expired — re-auth once and retry
-        crumb = await _ensure_auth(client, force=True)
+        crumb = await _ensure_auth(client, force=True, stale=crumb)
         resp = await _get_options(client, symbol, crumb, expiry_ts)
     resp.raise_for_status()
     data = resp.json()
@@ -340,8 +356,10 @@ def black_scholes_greeks(
 # ======================================================================================
 
 def mid_price(bid: float | None, ask: float | None) -> float | None:
-    """Mid = (bid+ask)/2. Falls back to whichever side exists (0 bid outside hours is common)."""
-    if bid is not None and ask is not None and (bid > 0 or ask > 0):
+    """Mid = (bid+ask)/2, but ONLY when both sides are genuinely quoted (> 0). A 0 bid (common
+    outside regular hours) would otherwise halve the true premium, so we return None instead and let
+    callers fall back to last_price via `_limit_price`."""
+    if bid is not None and ask is not None and bid > 0 and ask > 0:
         return (bid + ask) / 2.0
     return None
 
@@ -421,3 +439,410 @@ def annotate_expiry(
             c.theta = _round(g["theta"], 4)
             c.vega = _round(g["vega"], 4)
     return expiry
+
+
+# ======================================================================================
+# OC-1 — no-LLM call suggester (green/yellow/red light + delta-picked contracts)
+#
+# This is a deterministic structuring layer on top of the data layer above. It does NOT call an LLM
+# (the analyst paragraph is OC-7). The "direction" input is a mechanical read of the SAME ChartMath
+# indicators market.summarize() computes — the ones that feed the app's Signals card and /signal —
+# so on this free path we stand in for the LLM verdict without calling it. See docs/options-roadmap.md
+# Parts 2, 3, 5, 9. Not investment advice.
+# ======================================================================================
+
+# Expiry window (calendar days to expiration).
+PREFERRED_DTE_LOW = 45
+PREFERRED_DTE_HIGH = 90
+TARGET_DTE = 60
+MIN_DTE = 30
+TARGET_DATE_BUFFER_DAYS = 3  # a chosen expiry must clear the user's target date by at least this
+
+# Strike selection by delta, per risk profile.
+TARGET_DELTAS = {"safer": 0.70, "balanced": 0.50, "cheaper": 0.32}
+PROFILE_ORDER = ("safer", "balanced", "cheaper")
+
+# Liquidity / caution thresholds (Part 2).
+OI_FLOOR = 250
+WIDE_SPREAD = 0.10  # bid/ask spread as a fraction of mid
+BULLISH_SCORE = 55  # directional score at/above this reads bullish (roadmap "conviction >= ~55")
+
+
+def directional_read(summary: dict) -> dict:
+    """A deterministic bullish/neutral/bearish read + 0-100 score from a `market.summarize()` dict.
+
+    This is the no-LLM stand-in for the app's Signals-card direction on the options path. It combines
+    the SAME indicators the LLM analyst is shown (MA structure, MACD, relative strength, RSI, distance
+    from the 52-week high) into one directional score centred on 50 (neutral). It is intentionally
+    simple and transparent — it is a go/no-go gate for suggesting a call, not a price forecast.
+    """
+    score = 50.0
+    reasons: list[str] = []
+
+    gc = summary.get("golden_cross")
+    if gc is True:
+        score += 8
+        reasons.append("SMA20 above SMA50")
+    elif gc is False:
+        score -= 8
+        reasons.append("SMA20 below SMA50")
+
+    for key, label in (("pct_vs_sma20", "20-day"), ("pct_vs_sma50", "50-day")):
+        v = summary.get(key)
+        if v is None:
+            continue
+        if v > 0:
+            score += 6
+        elif v < 0:
+            score -= 6
+            reasons.append(f"price under its {label} average")
+
+    mh = summary.get("macd_hist")
+    if mh is not None:
+        if mh > 0:
+            score += 8
+            reasons.append("MACD positive")
+        elif mh < 0:
+            score -= 8
+            reasons.append("MACD negative")
+
+    rs = summary.get("rel_strength_3mo_vs_benchmark")
+    if rs is not None:
+        if rs > 0:
+            score += 8
+            reasons.append("outperforming the market")
+        elif rs < 0:
+            score -= 8
+            reasons.append("lagging the market")
+
+    rsi = summary.get("rsi14")
+    if rsi is not None:
+        score += 3 if rsi >= 50 else -3
+        if rsi > 75:
+            score -= 3
+            reasons.append("RSI overbought")
+        elif rsi < 25:
+            score += 2
+            reasons.append("RSI oversold")
+
+    off = summary.get("pct_off_52w_high")
+    if off is not None:
+        if off > -5:
+            score += 4
+            reasons.append("near its 52-week high")
+        elif off < -25:
+            score -= 3
+
+    score = max(0.0, min(100.0, score))
+    if score >= BULLISH_SCORE:
+        signal = "bullish"
+    elif score <= 45:
+        signal = "bearish"
+    else:
+        signal = "neutral"
+    return {"signal": signal, "score": int(round(score)), "bullish": signal == "bullish", "reasons": reasons}
+
+
+# --- small formatting/parse helpers ---
+
+def _utc_date(ts: float) -> dt.date:
+    """The UTC calendar date of a unix timestamp (matches the chain's gmtime-based iso strings)."""
+    return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).date()
+
+
+def _parse_iso_date(s: str | None) -> dt.date | None:
+    if not s:
+        return None
+    try:
+        return dt.date.fromisoformat(str(s)[:10])
+    except ValueError:
+        return None
+
+
+def _fmt_strike(strike: float) -> str:
+    return str(int(strike)) if float(strike).is_integer() else f"{strike:g}"
+
+
+def _mmddyy(ts: int) -> str:
+    return time.strftime("%m/%d/%y", time.gmtime(int(ts)))
+
+
+def _limit_price(c: OptionContract) -> float | None:
+    """The limit to quote: contract mid, falling back to last trade when bid/ask are stale/closed."""
+    if c.mid is not None and c.mid > 0:
+        return c.mid
+    if c.last_price is not None and c.last_price > 0:
+        return c.last_price
+    return None
+
+
+# --- expiry selection ---
+
+def select_expiry(
+    chain: OptionChain,
+    *,
+    now: float | None = None,
+    target_date: str | None = None,
+    earnings_date: str | None = None,
+) -> tuple[dict | None, list[str]]:
+    """Pick the best expiration from `chain.expirations`. Returns ({"ts","iso","dte"} | None, warnings).
+
+    Preference order: an expiry 45-90 DTE, clearing any `target_date` (+buffer) and NOT straddling a
+    known earnings date (IV-crush), closest to ~60 DTE. If earnings exclusion empties the window we
+    relax it. If nothing lands 45-90 DTE we fall back to the nearest > 30 DTE (with a warning), and
+    failing that the longest-dated expiry available.
+    """
+    warnings: list[str] = []
+    now = now if now is not None else time.time()
+    tgt = _parse_iso_date(target_date)
+    earn = _parse_iso_date(earnings_date)
+
+    cands: list[dict] = []
+    for e in chain.expirations:
+        ts = int(e["ts"])
+        dte = (ts - now) / _SECONDS_PER_DAY
+        if dte <= 0:
+            continue
+        exp_date = _utc_date(ts)
+        if tgt is not None and exp_date < tgt + dt.timedelta(days=TARGET_DATE_BUFFER_DAYS):
+            continue  # can't express the user's timeframe — the option would expire too early
+        # Round DTE ONCE, up front, and classify off the SAME integer we later display, so a 44.6-DTE
+        # expiry (shown as 45) can't be flagged out-of-window while its rationale calls it in-window.
+        cands.append({"ts": ts, "iso": e["iso"], "dte": dte, "dte_int": int(round(dte)), "date": exp_date})
+    if not cands:
+        return None, warnings
+
+    def straddles_earnings(c: dict) -> bool:
+        return earn is not None and _utc_date(now) < earn <= c["date"]
+
+    in_window = [c for c in cands if PREFERRED_DTE_LOW <= c["dte_int"] <= PREFERRED_DTE_HIGH]
+    pool = in_window or None
+    if pool:
+        clear = [c for c in pool if not straddles_earnings(c)]
+        if clear:  # only drop earnings-straddlers when doing so leaves something
+            pool = clear
+        elif earn is not None:
+            warnings.append("all 45-90 day expiries straddle the next earnings date — IV-crush risk")
+        chosen = min(pool, key=lambda c: abs(c["dte"] - TARGET_DTE))
+    else:
+        longer = [c for c in cands if c["dte_int"] > MIN_DTE]
+        chosen = (
+            min(longer, key=lambda c: abs(c["dte"] - TARGET_DTE)) if longer
+            else max(cands, key=lambda c: c["dte"])
+        )
+        warnings.append(
+            f"no expiry in the 45-90 day window — using the closest available (~{chosen['dte_int']} DTE)"
+        )
+    return {"ts": chosen["ts"], "iso": chosen["iso"], "dte": chosen["dte_int"]}, warnings
+
+
+# --- strike selection ---
+
+def _pick_by_delta(calls: list[OptionContract], target: float, *, prefer_oi: bool = False) -> OptionContract | None:
+    """The call whose delta is nearest `target`. When `prefer_oi`, favour a liquid (OI>=250) strike
+    among those within 0.12 delta of target before falling back to the outright nearest."""
+    valid = [c for c in calls if c.delta is not None and 0.0 < c.delta < 1.0]
+    if not valid:
+        return None
+    if prefer_oi:
+        liquid = [c for c in valid if (c.open_interest or 0) >= OI_FLOOR and abs(c.delta - target) <= 0.12]
+        if liquid:
+            return min(liquid, key=lambda c: abs(c.delta - target))
+    return min(valid, key=lambda c: abs(c.delta - target))
+
+
+def _ordered_profiles(style: str) -> list[str]:
+    """Profiles with the requested `style` first, then the remaining two in canonical order."""
+    style = style if style in TARGET_DELTAS else "balanced"
+    return [style] + [p for p in PROFILE_ORDER if p != style]
+
+
+def _candidate(c: OptionContract, profile: str, *, symbol: str, spot: float, budget: float | None) -> dict:
+    limit = _limit_price(c)
+    cost = round(limit * 100.0, 2) if limit is not None else None
+    # How many whole contracts the budget buys (None when no budget or no cost to size against).
+    affordable = (
+        int(math.floor(budget / cost)) if (budget and budget > 0 and cost and cost > 0) else None
+    )
+    # The quantity we actually suggest / put on the order ticket. It is whatever you can afford, else
+    # the 1-contract minimum — NEVER 0, since a BUY-0 ticket is meaningless and would let max_loss
+    # read 0 while the ticket still risks a full premium.
+    n = affordable if (affordable and affordable > 0) else 1
+    # The `contracts` field the app renders: the affordable count when a budget was given (1 when the
+    # budget can't cover even one contract — we still show the 1-contract minimum), else None so the
+    # user sizes it themselves.
+    if budget and budget > 0:
+        contracts: int | None = affordable if (affordable and affordable >= 1) else 1
+    else:
+        contracts = None
+    # INVARIANT: max_loss == cost × the ticket quantity (never 0 while a BUY-n ticket exists).
+    max_loss = round(cost * n, 2) if cost is not None else None
+    be = c.breakeven
+    be_pct = round((be - spot) / spot * 100.0, 2) if (be is not None and spot) else None
+    ticket = (
+        f"BUY {n} {symbol} {_mmddyy(c.expiration)} {_fmt_strike(c.strike)} C "
+        f"@ {limit:.2f} LMT" if limit is not None else ""
+    )
+    return {
+        "profile": profile,
+        "contract_symbol": c.contract_symbol,
+        "strike": c.strike,
+        "limit_price": round(limit, 2) if limit is not None else None,
+        "cost": cost,
+        "max_loss": max_loss,
+        "contracts": contracts,
+        "breakeven": round(be, 2) if be is not None else None,
+        "breakeven_pct": be_pct,
+        "delta": c.delta,
+        "theta": c.theta,
+        "iv": c.implied_volatility,
+        "spread_pct": c.spread_pct,
+        "open_interest": c.open_interest,
+        "expected_move": round(c.expected_move, 2) if c.expected_move is not None else None,
+        "order_ticket": ticket,
+    }
+
+
+def build_candidates(
+    expiry: ExpiryChain, *, symbol: str, spot: float, style: str, budget: float | None,
+) -> list[dict]:
+    """Up to three delta-picked call candidates (safer/balanced/cheaper), the requested `style` first,
+    de-duped when two profiles collapse onto the same contract."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for profile in _ordered_profiles(style):
+        pick = _pick_by_delta(expiry.calls, TARGET_DELTAS[profile], prefer_oi=(profile == "balanced"))
+        if pick is None or pick.contract_symbol in seen:
+            continue
+        cand = _candidate(pick, profile, symbol=symbol, spot=spot, budget=budget)
+        if cand["limit_price"] is None:  # unquotable (no mid, no last) — skip
+            continue
+        seen.add(pick.contract_symbol)
+        out.append(cand)
+    return out
+
+
+# --- assembly (the full response body) ---
+
+def assemble_suggestion(
+    chain: OptionChain,
+    expiry: ExpiryChain,
+    summary: dict,
+    *,
+    chosen: dict,
+    style: str = "balanced",
+    budget: float | None = None,
+    earnings_date: str | None = None,
+    now: float | None = None,
+    extra_warnings: list[str] | None = None,
+) -> dict:
+    """Build the OC-1 `/options/{symbol}` response body from an already-fetched + annotated chain.
+
+    Pure/deterministic: `chain` must already carry `expiry` annotated via `annotate_expiry`. `summary`
+    is a `market.summarize()` dict (for the directional read); `earnings_date` is a YYYY-MM-DD string
+    (or None). The route layer handles fetching and passes everything in.
+    """
+    now = now if now is not None else time.time()
+    symbol = chain.symbol
+    spot = chain.spot or 0.0
+    warnings: list[str] = list(extra_warnings or [])
+
+    direction = directional_read(summary)
+    candidates = build_candidates(expiry, symbol=symbol, spot=spot, style=style, budget=budget)
+
+    # Style-first guarantee (Part 9): if the requested style's strike was unquotable and got dropped,
+    # the app still leads with candidates[0] — say so instead of silently showing a different profile.
+    want = style if style in TARGET_DELTAS else "balanced"
+    if candidates and not any(c["profile"] == want for c in candidates):
+        warnings.append(f"the {want} strike wasn't quotable — showing {candidates[0]['profile']} instead")
+
+    # Earnings-in-window: does a known earnings date fall between now and the chosen expiry?
+    earn = _parse_iso_date(earnings_date)
+    exp_date = _utc_date(int(chosen["ts"]))
+    earnings_in_window = bool(earn and _utc_date(now) < earn <= exp_date)
+    earnings_block = (
+        {"date": earn.isoformat(), "in_window": earnings_in_window} if earn else None
+    )
+
+    # The balanced pick drives the liquidity gate (or the first candidate if it de-duped away).
+    ref = next((c for c in candidates if c["profile"] == "balanced"), candidates[0] if candidates else None)
+
+    # --- warnings (Part 2) ---
+    if earnings_in_window:
+        warnings.append(f"earnings on {earn.isoformat()} is before expiry — expect an IV drop (crush) after")
+    dte = chosen["dte"]
+    if dte < PREFERRED_DTE_LOW or dte > PREFERRED_DTE_HIGH:
+        warnings.append(f"chosen expiry is {dte} DTE, outside the preferred 45-90 day window")
+    for c in candidates:
+        tag = c["profile"]
+        if c["spread_pct"] is not None and c["spread_pct"] > WIDE_SPREAD:
+            warnings.append(f"{tag} strike has a wide bid/ask spread ({c['spread_pct']*100:.0f}%) — use a limit order")
+        if (c["open_interest"] or 0) < OI_FLOOR:
+            warnings.append(f"{tag} strike has thin open interest ({c['open_interest'] or 0}) — may be hard to fill")
+        if budget and c["cost"] and c["cost"] > budget:
+            warnings.append(f"a single {tag} contract is ${c['cost']:.0f} — above your ${budget:.0f} budget")
+    if chain.quote_delayed:
+        warnings.append("quotes are delayed / market closed — bid-ask liquidity can't be confirmed right now")
+
+    # --- traffic light (Part 2) ---
+    ref_wide = bool(ref and ref["spread_pct"] is not None and ref["spread_pct"] > WIDE_SPREAD)
+    ref_thin = bool(ref and (ref["open_interest"] or 0) < OI_FLOOR)
+    ref_unconfirmed = bool(ref and ref["spread_pct"] is None)  # market closed → can't verify spread
+    outside_window = dte < PREFERRED_DTE_LOW or dte > PREFERRED_DTE_HIGH
+    cautions: list[str] = []
+    if earnings_in_window:
+        cautions.append("earnings before expiry (IV-crush risk)")
+    if ref_wide:
+        cautions.append("wide bid/ask spread on the suggested contract")
+    if ref_thin:
+        cautions.append("thin open interest on the suggested contract")
+    if ref_unconfirmed:
+        cautions.append("market closed — contract liquidity can't be confirmed")
+    if outside_window:
+        cautions.append("expiry sits outside the 45-90 day window")
+
+    if ref is None:
+        light = "red"
+        light_reason = "no quotable contracts for the chosen expiry"
+    elif not direction["bullish"]:
+        light = "red"
+        light_reason = "directional signal says wait/sell — options amplify direction"
+    elif not cautions:
+        light = "green"
+        light_reason = (
+            f"direction reads bullish (score {direction['score']}) and the suggested contract is liquid "
+            "with no earnings before expiry"
+        )
+    else:
+        light = "yellow"
+        light_reason = f"direction reads bullish (score {direction['score']}), but {cautions[0]}"
+
+    atm_iv = expiry.atm_iv
+    structure_note = (
+        (f"Plain long call (OC-1). ATM IV ~{atm_iv*100:.0f}% shown for context; " if atm_iv else "Plain long call (OC-1). ")
+        + "IV-rank gating and debit-spread alternatives are deferred to OC-6."
+    )
+
+    # expiry rationale — one sentence explaining the pick.
+    if outside_window:
+        rationale = f"{dte} days out — no expiry landed in the 45-90 day sweet spot, so this is the closest usable one."
+    elif earnings_in_window:
+        rationale = f"{dte} days out (in the 45-90 day sweet spot); note earnings falls before it."
+    else:
+        rationale = f"{dte} days out — in the 45-90 day sweet spot and clear of the next earnings date."
+
+    return {
+        "symbol": symbol,
+        "spot": round(spot, 4) if spot else None,
+        "as_of": now,
+        "quote_delayed": chain.quote_delayed,
+        "light": light,
+        "light_reason": light_reason,
+        "expiry": {"ts": int(chosen["ts"]), "iso": chosen["iso"], "dte": dte, "rationale": rationale},
+        "expected_move": round(expiry.expected_move, 2) if expiry.expected_move is not None else None,
+        "structure": "long_call",
+        "structure_note": structure_note,
+        "candidates": candidates,
+        "warnings": list(dict.fromkeys(warnings)),  # de-dup, keep order
+        "earnings": earnings_block,
+    }
