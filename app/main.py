@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import selfupdate, settings_store, usage_store
 from . import cycle, fundamentals, insider, options, shorts, webull
-from .analyst import analyze, plan_entry, recommend
+from .analyst import analyze, options_note, plan_entry, recommend
 from .discover import discover
 from .market import fetch_series, summarize
 from .news import fetch_context
@@ -641,13 +641,16 @@ async def options_endpoint(
     style: str = "balanced",
     target_date: str | None = None,
     crypto: bool = False,
+    deep: bool = False,
 ) -> dict:
     """No-LLM long-CALL suggester (OC-1): a go/no-go light + up to 3 delta-picked call contracts, each
     with cost/max-loss/breakeven/greeks and a copy-pasteable order ticket. Pure math + the existing
-    directional technicals — no analyst call (a `deep=` paragraph is OC-7). `budget` sizes the contract
-    count (max loss you'll accept); `style` is safer|balanced|cheaper (the delta bucket surfaced first);
-    `target_date` (YYYY-MM-DD) forces an expiry at/after your timeframe. Options aren't available for
-    crypto — that returns a 400, not a 500. Decision support only, not investment advice."""
+    directional technicals. `budget` sizes the contract count (max loss you'll accept); `style` is
+    safer|balanced|cheaper (the delta bucket surfaced first); `target_date` (YYYY-MM-DD) forces an
+    expiry at/after your timeframe. Additive fields: `iv_rank` (from nightly ATM-IV logging, null while
+    building), a nullable `alternative` debit-call-spread block + `recommend_alternative` bool (OC-6),
+    and — when `deep=true` — a one-paragraph Opus `analyst` explanation (OC-7; null by default / on any
+    failure, never a 500). Options aren't available for crypto — a 400, not a 500. Not investment advice."""
     # 0) Validate budget FIRST — before any network call — so inf/nan/negatives can't reach
     #    math.floor() and blow up as a 500. A non-positive or non-finite budget is a client error.
     if budget is not None and (not math.isfinite(budget) or budget <= 0):
@@ -707,17 +710,40 @@ async def options_endpoint(
         raise HTTPException(status_code=400, detail=f"no contracts for the chosen expiry of {chain.symbol}")
 
     # 5) Annotate + assemble. Malformed chain data here degrades to 400 (matching the fetch above),
-    #    never a 500.
+    #    never a 500. IV rank (OC-6a) is computed from data/iv_history.jsonl and passed in — the
+    #    assembler stays pure; a missing/short history yields a null rank (noted as "building").
     try:
         options.annotate_expiry(chain)
-        return options.assemble_suggestion(
+        iv_rank = options.iv_rank(options.load_iv_history(chain.symbol), current=chain.expiry.atm_iv)
+        body = options.assemble_suggestion(
             chain, chain.expiry, summary,
             chosen=chosen, style=style, budget=budget, earnings_date=earnings_date,
-            extra_warnings=warnings,
+            extra_warnings=warnings, iv_rank=iv_rank,
         )
     except Exception as e:  # noqa: BLE001
         _log.warning("options assembly failed for %s: %s", chain.symbol, e)
         raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+
+    # 6) OC-7 — optional Opus analyst paragraph. deep=false leaves `analyst` null with no LLM call
+    #    (the free path is unchanged). On any failure the paragraph stays null — never a 500.
+    if deep:
+        try:
+            ctx = {
+                "symbol": body["symbol"], "spot": body["spot"],
+                "light": body["light"], "light_reason": body["light_reason"],
+                "expiry": body["expiry"], "structure": body["structure"],
+                "suggested_contract": body["candidates"][0] if body["candidates"] else None,
+                "expected_move": body["expected_move"], "iv_rank": body["iv_rank"],
+                "earnings": body["earnings"], "alternative": body["alternative"],
+                "recommend_alternative": body["recommend_alternative"],
+                "directional": options.directional_read(summary) if summary else None,
+            }
+            paragraph, usage = await options_note(ctx, deep=True)
+            body["analyst"] = paragraph
+            usage_store.record(usage, symbol=body["symbol"], kind="options")
+        except Exception as e:  # noqa: BLE001 — the paragraph is enrichment; never 500
+            _log.warning("options analyst paragraph failed for %s: %s", chain.symbol, e)
+    return body
 
 
 @app.get("/option_quote/{symbol}")

@@ -320,3 +320,61 @@ async def recommend(summaries: list[dict], *, cash: float, deep: bool = False) -
     for p in recs.picks:
         p.conviction = max(0, min(100, p.conviction))
     return recs, usage
+
+
+# ======================================================================================
+# OC-7 — one plain-language paragraph explaining a suggested options contract (deep=Opus path).
+# Plain text (not structured) — reuses the same client/key handling as the verdict path above.
+# ======================================================================================
+
+OPTIONS_NOTE_SYSTEM = """You are a friendly options coach explaining ONE specific suggested options \
+trade to a BEGINNER retail investor in plain language. You receive a JSON context: the symbol and \
+its price, a go/no-go "light" (green/yellow/red) with its reason, the suggested long-CALL contract \
+(strike, expiry, cost, breakeven, delta), the mechanical directional read, any earnings-before-expiry \
+flag, an IV-rank read, and possibly a cheaper debit-spread alternative.
+
+Write ONE short paragraph (3-5 sentences, under ~90 words) that ties THIS contract to the directional \
+thesis, for a beginner:
+- Say what the trade is betting on and by when (ground it ONLY in the numbers given — never invent \
+news, prices, or fundamentals).
+- Mention the light and the single most important caution (earnings / high IV / thin liquidity) if \
+there is one.
+- If IV rank is high and a debit-spread alternative is offered, note the spread is the cheaper, \
+lower-risk way to express the same view.
+- Plain words, no jargon dumps, no bullet points or headers — just one paragraph.
+- End by reminding this is decision support, not investment advice."""
+
+
+async def options_note(context: dict, *, deep: bool = True) -> tuple[str, dict]:
+    """One plain-language paragraph explaining a suggested options contract for a beginner (OC-7).
+    Returns (paragraph, usage). Uses the deep (Opus) model by default — this is the on-demand
+    "explain it to me" path, mirroring how /plan calls the analyst. Raises on API/empty output so the
+    route can swallow it and leave `analyst` null (never a 500)."""
+    cfg = settings_store.get()
+    model = cfg["deep_model"] if deep else cfg["scan_model"]
+    prompt = (
+        "Explain this suggested options trade to a beginner:\n"
+        + json.dumps(context, indent=2, default=str)
+        + "\n\nReturn ONE short plain-language paragraph."
+    )
+    kwargs: dict = dict(
+        model=model,
+        max_tokens=2048,
+        system=OPTIONS_NOTE_SYSTEM,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    # Adaptive thinking is a 4.6+ feature; only enable it for the deep-tier models (matches _parse).
+    if any(m in model for m in ("opus-4", "sonnet-5", "fable")):
+        kwargs["thinking"] = {"type": "adaptive"}
+
+    resp = await _get_client().messages.create(**kwargs)
+    u0 = resp.usage
+    log.info("analyst-options %s in=%s out=%s", model, u0.input_tokens, u0.output_tokens)
+    if resp.stop_reason == "max_tokens":
+        raise RuntimeError(f"options paragraph hit the 2048-token cap and was truncated (stop_reason={resp.stop_reason})")
+    text = "".join(
+        getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text"
+    ).strip()
+    if not text:
+        raise RuntimeError(f"analyst returned no text (stop_reason={resp.stop_reason})")
+    return text, _usage(model, resp.usage)

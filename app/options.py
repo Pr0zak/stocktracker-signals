@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 
@@ -442,6 +445,90 @@ def annotate_expiry(
 
 
 # ======================================================================================
+# OC-6a — ATM-IV history logging + IV rank
+#
+# The nightly scan (scan_job.py) appends one ATM-IV point per stock per day to
+# data/iv_history.jsonl. `iv_rank` reads that history so the /options suggester can say whether
+# today's implied vol is cheap or rich relative to the last ~year — the gate that decides whether a
+# debit spread (OC-6b) is the smarter structure. All file access is best-effort: a missing/short/
+# corrupt file yields [] (and a null rank), never an exception. See docs/options-roadmap.md.
+# ======================================================================================
+
+_DATA_DIR = Path(os.environ.get("SIGNALS_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
+IV_HISTORY = _DATA_DIR / "iv_history.jsonl"
+
+IV_HISTORY_WINDOW = 252   # ~one trading year of daily ATM-IV points
+IV_RANK_MIN_POINTS = 20   # below this the rank is "still building" -> null
+HIGH_IV_RANK = 50.0       # at/above this, IV is "rich" -> prefer the debit spread (OC-6b)
+
+
+def _iter_iv_rows():
+    """Yield each parsed row of data/iv_history.jsonl. Tolerates a missing/unreadable file and skips
+    corrupt/partial lines — never raises."""
+    if not IV_HISTORY.exists():
+        return
+    try:
+        lines = IV_HISTORY.read_text().splitlines()
+    except Exception:  # noqa: BLE001 — unreadable file behaves like an empty one
+        return
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except Exception:  # noqa: BLE001 — skip a corrupt/partial line
+            continue
+
+
+def append_iv_history(symbol: str, atm_iv: float | None, *, date_str: str | None = None) -> bool:
+    """Best-effort append of one ATM-IV point to data/iv_history.jsonl as {"symbol","date","atm_iv"}.
+    One line per symbol per day (a same-day duplicate is skipped). Returns True if a line was written.
+    NEVER raises — the nightly scan must not break on IV logging."""
+    if atm_iv is None or atm_iv <= 0:
+        return False
+    sym = (symbol or "").upper()
+    day = date_str or dt.date.today().isoformat()
+    try:
+        for row in _iter_iv_rows():  # de-dupe: one line/symbol/day
+            if row.get("symbol") == sym and row.get("date") == day:
+                return False
+        IV_HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        with IV_HISTORY.open("a") as f:
+            f.write(json.dumps({"symbol": sym, "date": day, "atm_iv": round(float(atm_iv), 6)}) + "\n")
+        return True
+    except Exception:  # noqa: BLE001 — logging is best-effort
+        return False
+
+
+def load_iv_history(symbol: str, *, window: int = IV_HISTORY_WINDOW) -> list[float]:
+    """The last `window` ATM-IV points for `symbol` (oldest→newest) from data/iv_history.jsonl.
+    Tolerates a missing/short/corrupt file (returns [])."""
+    sym = (symbol or "").upper()
+    vals = [
+        float(r["atm_iv"]) for r in _iter_iv_rows()
+        if r.get("symbol") == sym and isinstance(r.get("atm_iv"), (int, float)) and r["atm_iv"] > 0
+    ]
+    return vals[-window:]
+
+
+def iv_rank(values: list[float], current: float | None = None, *, min_points: int = IV_RANK_MIN_POINTS) -> float | None:
+    """IV rank = (current - min) / (max - min) * 100 over the historical `values` window, clamped to
+    [0, 100]. `current` defaults to the most recent point in `values` (pass the live ATM IV to rank
+    today against history). Returns None when there are fewer than `min_points` usable points (rank is
+    "still building") or the window is flat (max == min)."""
+    vals = [v for v in values if v is not None and v > 0]
+    if len(vals) < min_points:
+        return None
+    cur = current if (current is not None and current > 0) else vals[-1]
+    lo, hi = min(vals), max(vals)
+    if hi <= lo:
+        return None
+    rank = (cur - lo) / (hi - lo) * 100.0
+    return round(max(0.0, min(100.0, rank)), 1)
+
+
+# ======================================================================================
 # OC-1 — no-LLM call suggester (green/yellow/red light + delta-picked contracts)
 #
 # This is a deterministic structuring layer on top of the data layer above. It does NOT call an LLM
@@ -461,6 +548,10 @@ TARGET_DATE_BUFFER_DAYS = 3  # a chosen expiry must clear the user's target date
 # Strike selection by delta, per risk profile.
 TARGET_DELTAS = {"safer": 0.70, "balanced": 0.50, "cheaper": 0.32}
 PROFILE_ORDER = ("safer", "balanced", "cheaper")
+
+# OC-6b — the debit-spread short leg: near an entry-plan price target if one is derivable, else the
+# ~0.30-delta OTM call (must be a HIGHER strike than the long leg).
+SPREAD_SHORT_DELTA = 0.30
 
 # Liquidity / caution thresholds (Part 2).
 OI_FLOOR = 250
@@ -722,6 +813,72 @@ def build_candidates(
     return out
 
 
+# --- OC-6b debit-spread helpers ---
+
+def _find_call(expiry: ExpiryChain, contract_symbol: str) -> OptionContract | None:
+    """The loaded call contract matching `contract_symbol` (the long leg is picked as a candidate dict,
+    but the spread math needs the underlying contract for its mid)."""
+    return next((c for c in expiry.calls if c.contract_symbol == contract_symbol), None)
+
+
+def _spread_short_leg(
+    calls: list[OptionContract], *, long_strike: float, target_price: float | None = None,
+) -> OptionContract | None:
+    """Pick the SELL leg of a debit call spread: a quotable call at a HIGHER strike than the long leg.
+    If a price `target_price` is derivable, take the nearest strike at/above it; else the call nearest
+    ~0.30 delta. Returns None when no higher quotable strike exists."""
+    higher = [c for c in calls if c.strike > long_strike and _limit_price(c) is not None]
+    if not higher:
+        return None
+    if target_price is not None:
+        at_or_above = [c for c in higher if c.strike >= target_price]
+        if at_or_above:
+            return min(at_or_above, key=lambda c: c.strike)
+    with_delta = [c for c in higher if c.delta is not None and 0.0 < c.delta < 1.0]
+    pool = with_delta or higher
+    return min(pool, key=lambda c: abs((c.delta if c.delta is not None else 0.0) - SPREAD_SHORT_DELTA))
+
+
+def _debit_spread(
+    expiry: ExpiryChain, ref: dict | None, *, target_price: float | None,
+) -> dict | None:
+    """Build the OC-6b debit-call-spread alternative from the leading (balanced) candidate `ref`:
+    BUY that call, SELL a higher call. Returns the alternative block, or None when it can't be formed
+    (no ref, no higher strike, or non-positive net debit)."""
+    if ref is None:
+        return None
+    long_c = _find_call(expiry, ref["contract_symbol"])
+    if long_c is None:
+        return None
+    short_c = _spread_short_leg(expiry.calls, long_strike=long_c.strike, target_price=target_price)
+    if short_c is None or short_c.strike <= long_c.strike:
+        return None
+    long_mid = _limit_price(long_c)
+    short_mid = _limit_price(short_c)
+    if long_mid is None or short_mid is None:
+        return None
+    net_debit = long_mid - short_mid  # per share; long (lower strike) costs more than short
+    if net_debit <= 0:  # degenerate quotes — a debit spread must cost something
+        return None
+    width = short_c.strike - long_c.strike
+    return {
+        "structure": "debit_call_spread",
+        "long_strike": long_c.strike,
+        "short_strike": short_c.strike,
+        "net_debit": round(net_debit, 2),
+        "cost": round(net_debit * 100.0, 2),
+        "max_profit": round((width - net_debit) * 100.0, 2),
+        "max_loss": round(net_debit * 100.0, 2),
+        "breakeven": round(long_c.strike + net_debit, 2),
+        "note": (
+            f"Debit call spread: buy the {_fmt_strike(long_c.strike)} call and sell the "
+            f"{_fmt_strike(short_c.strike)} call. Caps your gain at the short strike but cuts the cost "
+            "(and the max loss) vs the plain long call — the smarter structure when IV is rich. Not "
+            "investment advice."
+        ),
+    }
+
+
 # --- assembly (the full response body) ---
 
 def assemble_suggestion(
@@ -735,6 +892,8 @@ def assemble_suggestion(
     earnings_date: str | None = None,
     now: float | None = None,
     extra_warnings: list[str] | None = None,
+    iv_rank: float | None = None,
+    target_price: float | None = None,
 ) -> dict:
     """Build the OC-1 `/options/{symbol}` response body from an already-fetched + annotated chain.
 
@@ -817,11 +976,30 @@ def assemble_suggestion(
         light = "yellow"
         light_reason = f"direction reads bullish (score {direction['score']}), but {cautions[0]}"
 
+    # --- OC-6b: debit-spread alternative + IV-rank gating ---
+    alternative = _debit_spread(expiry, ref, target_price=target_price)
+    # Recommend the spread when IV is rich (rank >= ~50) AND a spread is actually available.
+    recommend_alternative = bool(iv_rank is not None and iv_rank >= HIGH_IV_RANK and alternative is not None)
+
     atm_iv = expiry.atm_iv
-    structure_note = (
-        (f"Plain long call (OC-1). ATM IV ~{atm_iv*100:.0f}% shown for context; " if atm_iv else "Plain long call (OC-1). ")
-        + "IV-rank gating and debit-spread alternatives are deferred to OC-6."
-    )
+    ctx_bits: list[str] = []
+    if atm_iv:
+        ctx_bits.append(f"ATM IV ~{atm_iv*100:.0f}%")
+    if iv_rank is not None:
+        ctx_bits.append(f"IV rank ~{iv_rank:.0f}")
+    else:
+        ctx_bits.append("IV rank still building (need ~20 days of history)")
+    ctx = (" (" + ", ".join(ctx_bits) + ")") if ctx_bits else ""
+    if alternative is not None and recommend_alternative:
+        spread_bit = (
+            " A debit call spread alternative is available and PREFERRED here — IV rank is high, so "
+            "selling a higher call to offset the rich premium is the smarter structure."
+        )
+    elif alternative is not None:
+        spread_bit = " A debit call spread alternative is available (caps upside but costs less) if you'd rather spend less."
+    else:
+        spread_bit = ""
+    structure_note = f"Plain long call{ctx}.{spread_bit}"
 
     # expiry rationale — one sentence explaining the pick.
     if outside_window:
@@ -845,6 +1023,11 @@ def assemble_suggestion(
         "candidates": candidates,
         "warnings": list(dict.fromkeys(warnings)),  # de-dup, keep order
         "earnings": earnings_block,
+        # --- OC-6/OC-7 additive fields (nullable; existing keys above are unchanged) ---
+        "iv_rank": iv_rank,
+        "alternative": alternative,
+        "recommend_alternative": recommend_alternative,
+        "analyst": None,  # OC-7: filled by the /options route when deep=true; null otherwise
     }
 
 

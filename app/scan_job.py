@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 
-from . import cycle, settings_store, shorts, usage_store
+from . import cycle, options, settings_store, shorts, usage_store
 from .analyst import analyze
 from .market import fetch_series, summarize
 from .news import fetch_context
@@ -47,6 +47,33 @@ def _dip_tier(
     else:
         tier = None
     return {"dip": tier, "pct_off_recent_high": pct_off_recent, "pct_off_52w_high": pct_off_52w}
+
+
+# ATM-IV logging window (OC-6a): a ~30-45 DTE expiry — cheaper/shorter-dated than the OC-1 45-90 band.
+_IV_LOG_DTE_LOW, _IV_LOG_DTE_HIGH, _IV_LOG_DTE_TARGET = 30, 45, 37
+
+
+async def _log_atm_iv(client: httpx.AsyncClient, symbol: str) -> None:
+    """Best-effort (OC-6a): fetch this stock's option chain, pick a ~30-45 DTE expiry, annotate it, and
+    append the ATM IV to data/iv_history.jsonl (one line/symbol/day). Skips crypto/no-chain symbols and
+    swallows EVERY error — the nightly scan must never break on IV logging."""
+    try:
+        chain = await options.fetch_chain(client, symbol)
+        if not chain.expirations or not chain.spot or chain.spot <= 0:
+            return
+        chosen, _ = options.select_wheel_expiry(
+            chain, low=_IV_LOG_DTE_LOW, high=_IV_LOG_DTE_HIGH, target=_IV_LOG_DTE_TARGET,
+        )
+        if chosen is None:
+            return
+        if not (chain.expiry and chain.expiry.expiration == chosen["ts"]):
+            chain = await options.fetch_chain(client, symbol, chosen["ts"])
+        if chain.expiry is None:
+            return
+        options.annotate_expiry(chain)
+        options.append_iv_history(chain.symbol, chain.expiry.atm_iv)
+    except Exception:  # noqa: BLE001 — IV logging is best-effort; never break the scan
+        pass
 
 
 async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_closes: list[float] | None) -> dict:
@@ -84,6 +111,8 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
             pass
     verdict, usage = await analyze(summary, deep=False)
     usage_store.record(usage, symbol=series.symbol, kind="scan")
+    if not crypto:  # OC-6a: log this stock's ~30-45 DTE ATM IV for the /options IV-rank read
+        await _log_atm_iv(client, series.symbol)
     dip = _dip_tier(series.closes, summary.get("pct_off_52w_high"), below_200wma, weekly_oversold)
     return {
         "symbol": series.symbol,
