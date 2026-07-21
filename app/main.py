@@ -793,6 +793,162 @@ async def option_quote(
     }
 
 
+@app.get("/puts/{symbol}")
+async def puts_endpoint(
+    symbol: str,
+    cash: float,
+    style: str = "balanced",
+    crypto: bool = False,
+) -> dict:
+    """No-LLM cash-secured-PUT suggester (OC-8, the wheel's entry leg): sell a put to acquire shares
+    BELOW today's price / get paid to wait. Returns up to 3 delta-picked put strikes (aggressive ~0.45
+    |Δ| near-money → high assignment chance, balanced ~0.30, conservative ~0.20 deep-OTM), each with
+    net cost/share, discount vs. spot, cash-to-reserve, static + annualized yield, assignment
+    probability and a copy-pasteable order ticket. `cash` (required) is the reserve you can set aside
+    and sizes the contract count; `style` is surfaced first. Short-dated (~25-50 DTE, target ~35) —
+    theta favours the seller. Options aren't available for crypto — a 400, not a 500. Only sell puts
+    on names you'd happily own at the strike. Decision support only, not investment advice."""
+    # 0) Validate cash FIRST — before any network call — so inf/nan/negatives can't reach math.floor()
+    #    and blow up as a 500. A non-positive or non-finite reserve is a client error.
+    if not math.isfinite(cash) or cash <= 0:
+        raise HTTPException(status_code=422, detail="cash must be a positive number")
+    assert _http is not None
+    if crypto or symbol.upper().endswith("-USD"):
+        raise HTTPException(status_code=400, detail="options aren't available for crypto symbols")
+    now = time.time()
+
+    # 1) The chain (spot + all expirations + the default expiry's contracts).
+    try:
+        chain = await options.fetch_chain(_http, symbol)
+    except Exception as e:  # noqa: BLE001 — no chain (crypto/ETN/illiquid/unknown) is a 400, never a 500.
+        _log.warning("puts fetch_chain failed for %s: %s", symbol.upper(), e)
+        raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if not chain.expirations or not chain.spot or chain.spot <= 0:
+        raise HTTPException(status_code=400, detail=f"no option chain available for {symbol.upper()}")
+
+    # 2) Next earnings (best-effort Finnhub) — used to skip straddling expiries + warn. No LLM here.
+    earnings_date: str | None = None
+    warnings: list[str] = []
+    try:
+        earnings_date = (await fetch_context(_http, symbol)).get("next_earnings")
+    except Exception:  # noqa: BLE001 — decorative context; never fail the suggestion on it
+        pass
+
+    # 3) Pick the expiry (~25-50 DTE, target ~35, skip earnings straddles).
+    try:
+        chosen, exp_warnings = options.select_wheel_expiry(
+            chain, low=options.PUT_DTE_LOW, high=options.PUT_DTE_HIGH, target=options.PUT_DTE_TARGET,
+            now=now, earnings_date=earnings_date,
+        )
+    except Exception as e:  # noqa: BLE001 — malformed expiration data degrades to 400, not 500
+        _log.warning("puts select_wheel_expiry failed for %s: %s", chain.symbol, e)
+        raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if chosen is None:
+        raise HTTPException(status_code=400, detail=f"no suitable expiration for {chain.symbol}")
+    warnings.extend(exp_warnings)
+
+    # 4) Load the chosen expiry's contracts (reuse the first fetch if it already loaded it) + annotate.
+    if not (chain.expiry and chain.expiry.expiration == chosen["ts"]):
+        try:
+            chain = await options.fetch_chain(_http, symbol, chosen["ts"])
+        except Exception as e:  # noqa: BLE001 — generic 400 (the httpx error embeds the crumb'd URL)
+            _log.warning("puts expiry reload failed for %s: %s", chain.symbol, e)
+            raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if chain.expiry is None:
+        raise HTTPException(status_code=400, detail=f"no contracts for the chosen expiry of {chain.symbol}")
+
+    # 5) Annotate + assemble. Malformed chain data degrades to 400, never a 500.
+    try:
+        options.annotate_expiry(chain, now_ts=now)
+        body = options.assemble_put_suggestion(
+            chain, chain.expiry, chosen=chosen, cash=cash, style=style,
+            earnings_date=earnings_date, now=now, extra_warnings=warnings,
+        )
+    except Exception as e:  # noqa: BLE001
+        _log.warning("puts assembly failed for %s: %s", chain.symbol, e)
+        raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if not body["candidates"]:
+        raise HTTPException(status_code=400, detail=f"no quotable put contracts for the chosen expiry of {chain.symbol}")
+    return body
+
+
+@app.get("/covered_call/{symbol}")
+async def covered_call_endpoint(
+    symbol: str,
+    shares: int,
+    target: float | None = None,
+    crypto: bool = False,
+) -> dict:
+    """No-LLM COVERED-CALL suggester (OC-8, the wheel's income/exit leg): sell a call on shares you
+    already hold for income, capping upside at the strike. Requires `shares >= 100`; sizes
+    `contracts = shares // 100`. Picks ONE call — the nearest strike AT/ABOVE `target` if given, else
+    ~0.30 delta OTM — and reports premium income, premium + annualized yield, assignment probability,
+    the called-away gain from today's price, greeks and an order ticket. Short-dated (~25-45 DTE).
+    Options aren't available for crypto — a 400, not a 500. Decision support only, not investment advice."""
+    assert _http is not None
+    if crypto or symbol.upper().endswith("-USD"):
+        raise HTTPException(status_code=400, detail="options aren't available for crypto symbols")
+    if shares < 100:
+        raise HTTPException(status_code=400, detail="covered calls need at least 100 shares")
+    if target is not None and (not math.isfinite(target) or target <= 0):
+        raise HTTPException(status_code=422, detail="target must be a positive number")
+    now = time.time()
+
+    # 1) The chain (spot + all expirations + the default expiry's contracts).
+    try:
+        chain = await options.fetch_chain(_http, symbol)
+    except Exception as e:  # noqa: BLE001 — no chain (crypto/ETN/illiquid/unknown) is a 400, never a 500.
+        _log.warning("covered_call fetch_chain failed for %s: %s", symbol.upper(), e)
+        raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if not chain.expirations or not chain.spot or chain.spot <= 0:
+        raise HTTPException(status_code=400, detail=f"no option chain available for {symbol.upper()}")
+
+    # 2) Next earnings (best-effort Finnhub) — used to skip straddling expiries. No LLM here.
+    earnings_date: str | None = None
+    warnings: list[str] = []
+    try:
+        earnings_date = (await fetch_context(_http, symbol)).get("next_earnings")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3) Pick the expiry (~25-45 DTE, target ~35, skip earnings straddles).
+    try:
+        chosen, exp_warnings = options.select_wheel_expiry(
+            chain, low=options.CALL_DTE_LOW, high=options.CALL_DTE_HIGH, target=options.CALL_DTE_TARGET,
+            now=now, earnings_date=earnings_date,
+        )
+    except Exception as e:  # noqa: BLE001
+        _log.warning("covered_call select_wheel_expiry failed for %s: %s", chain.symbol, e)
+        raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if chosen is None:
+        raise HTTPException(status_code=400, detail=f"no suitable expiration for {chain.symbol}")
+    warnings.extend(exp_warnings)
+
+    # 4) Load the chosen expiry's contracts (reuse the first fetch if it already loaded it) + annotate.
+    if not (chain.expiry and chain.expiry.expiration == chosen["ts"]):
+        try:
+            chain = await options.fetch_chain(_http, symbol, chosen["ts"])
+        except Exception as e:  # noqa: BLE001
+            _log.warning("covered_call expiry reload failed for %s: %s", chain.symbol, e)
+            raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if chain.expiry is None:
+        raise HTTPException(status_code=400, detail=f"no contracts for the chosen expiry of {chain.symbol}")
+
+    # 5) Annotate + assemble. Malformed chain data degrades to 400, never a 500.
+    try:
+        options.annotate_expiry(chain, now_ts=now)
+        body = options.assemble_covered_call(
+            chain, chain.expiry, shares=shares, chosen=chosen, target=target,
+            now=now, extra_warnings=warnings,
+        )
+    except Exception as e:  # noqa: BLE001
+        _log.warning("covered_call assembly failed for %s: %s", chain.symbol, e)
+        raise HTTPException(status_code=400, detail=f"options aren't available for {symbol.upper()}")
+    if body is None:
+        raise HTTPException(status_code=400, detail=f"no quotable call contracts for the chosen expiry of {chain.symbol}")
+    return body
+
+
 @app.get("/plan/{symbol}")
 async def plan(
     symbol: str, cash: float, crypto: bool = False, deep: bool = False,

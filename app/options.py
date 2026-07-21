@@ -846,3 +846,351 @@ def assemble_suggestion(
         "warnings": list(dict.fromkeys(warnings)),  # de-dup, keep order
         "earnings": earnings_block,
     }
+
+
+# ======================================================================================
+# OC-8 — the wheel (no-LLM cash-secured-put + covered-call suggesters)
+#
+# Two sibling income/accumulation tools, both premium-COLLECTING and IRA-eligible at Fidelity
+# (cash-secured / covered — never naked). See docs/options-roadmap.md Part 10.
+#
+#   • Cash-secured put  — sell a put at a strike you'd happily own at; reserve strike×100 in cash.
+#                         Keep the premium if it stays up; get assigned 100 shares/contract at the
+#                         strike (net cost = strike − premium, BELOW today) if it dips.
+#   • Covered call      — on ≥100 shares already held, sell a call at/above a target for income;
+#                         keep the premium, or get called away (capped upside) at the strike.
+#
+# Theta favours the seller, so the wheel leans SHORTER-dated than the OC-1 debit-call window — the
+# put side ~25-50 DTE (target ~35), the call side ~25-45 DTE. This is decision support, NOT advice:
+# a CSP and a covered call at the same strike are the SAME mildly-bullish bet with FULL downside
+# below the strike — the guardrail is "only sell puts on names you'd happily own at that strike."
+# ======================================================================================
+
+# Short-dated income windows (calendar days to expiration). Shorter than OC-1's 45-90.
+PUT_DTE_LOW, PUT_DTE_HIGH, PUT_DTE_TARGET = 25, 50, 35
+CALL_DTE_LOW, CALL_DTE_HIGH, CALL_DTE_TARGET = 25, 45, 35
+WHEEL_MIN_DTE = 14  # the shortest we'll fall back to when nothing lands in-window
+
+# Cash-secured-put strikes by assignment likelihood (|put delta|). Aggressive = near the money (high
+# chance you get the shares); conservative = deep OTM (low chance, you mostly just bank the premium).
+PUT_TARGET_DELTAS = {"aggressive": 0.45, "balanced": 0.30, "conservative": 0.20}
+PUT_PROFILE_ORDER = ("aggressive", "balanced", "conservative")  # descending assignment probability
+
+# Covered-call default strike when no explicit target is given: ~0.30 delta OTM.
+COVERED_CALL_TARGET_DELTA = 0.30
+
+HIGH_IV = 0.80  # a candidate IV at/above this gets a "premiums are rich, but so is the priced move" note
+
+PUT_NOTE = (
+    "Cash-secured put: you set aside strike x 100 in cash and get paid the premium now. If the stock "
+    "stays up you keep the premium; if it dips you're assigned 100 shares/contract at the strike "
+    "(net cost = strike - premium, shown). Only sell puts on names you'd happily own at that strike "
+    "- you carry the full downside below it. Not investment advice."
+)
+COVERED_CALL_NOTE = (
+    "Covered call: income on shares you already own. If the stock rises past the strike your shares "
+    "are called away (sold) at the strike - capped upside - but you keep the premium. "
+    "Not investment advice."
+)
+
+
+# --- shared short-dated expiry picker (used by both wheel legs) ---
+
+def select_wheel_expiry(
+    chain: OptionChain,
+    *,
+    low: int,
+    high: int,
+    target: int,
+    min_dte: int = WHEEL_MIN_DTE,
+    now: float | None = None,
+    earnings_date: str | None = None,
+) -> tuple[dict | None, list[str]]:
+    """Pick a short-dated income expiry from `chain.expirations`. Returns ({"ts","iso","dte"}|None, warns).
+
+    Prefers an expiry `low`-`high` DTE, NOT straddling a known earnings date (assignment/gap risk),
+    closest to ~`target`. If the earnings filter empties the window we relax it (with a warning). If
+    nothing lands in-window we fall back to the nearest >= `min_dte`, and failing that the longest
+    available. Mirrors `select_expiry` but with the wheel's shorter windows and no target-date input.
+    """
+    warnings: list[str] = []
+    now = now if now is not None else time.time()
+    earn = _parse_iso_date(earnings_date)
+
+    cands: list[dict] = []
+    for e in chain.expirations:
+        ts = int(e["ts"])
+        dte = (ts - now) / _SECONDS_PER_DAY
+        if dte <= 0:
+            continue
+        # Round DTE once and classify off the SAME integer we later display (matches select_expiry).
+        cands.append({"ts": ts, "iso": e["iso"], "dte": dte, "dte_int": int(round(dte)), "date": _utc_date(ts)})
+    if not cands:
+        return None, warnings
+
+    def straddles_earnings(c: dict) -> bool:
+        return earn is not None and _utc_date(now) < earn <= c["date"]
+
+    in_window = [c for c in cands if low <= c["dte_int"] <= high]
+    pool = in_window or None
+    if pool:
+        clear = [c for c in pool if not straddles_earnings(c)]
+        if clear:
+            pool = clear
+        elif earn is not None:
+            warnings.append(f"all {low}-{high} day expiries straddle the next earnings date — assignment/gap risk")
+        chosen = min(pool, key=lambda c: abs(c["dte"] - target))
+    else:
+        longer = [c for c in cands if c["dte_int"] >= min_dte]
+        chosen = (
+            min(longer, key=lambda c: abs(c["dte"] - target)) if longer
+            else max(cands, key=lambda c: c["dte"])
+        )
+        warnings.append(
+            f"no expiry in the {low}-{high} day window — using the closest available (~{chosen['dte_int']} DTE)"
+        )
+    return {"ts": chosen["ts"], "iso": chosen["iso"], "dte": chosen["dte_int"]}, warnings
+
+
+def _wheel_rationale(dte: int, low: int, high: int, *, earnings_in_window: bool) -> str:
+    if dte < low or dte > high:
+        return f"{dte} days out — no expiry landed in the {low}-{high} day window, so this is the closest usable one."
+    if earnings_in_window:
+        return f"{dte} days out (short-dated so theta works for the seller); note earnings falls before it."
+    return f"{dte} days out — short-dated, so time decay (theta) works in your favour as the seller, and clear of the next earnings date."
+
+
+# --- cash-secured put suggester ---
+
+def _pick_put_by_abs_delta(
+    puts: list[OptionContract], target_abs: float, *, prefer_oi: bool = False
+) -> OptionContract | None:
+    """The put whose |delta| is nearest `target_abs`. Put delta is negative, so we compare on abs().
+    When `prefer_oi`, favour a liquid (OI>=250) strike within 0.12 of target before the outright nearest."""
+    valid = [p for p in puts if p.delta is not None and -1.0 < p.delta < 0.0]
+    if not valid:
+        return None
+    if prefer_oi:
+        liquid = [p for p in valid if (p.open_interest or 0) >= OI_FLOOR and abs(abs(p.delta) - target_abs) <= 0.12]
+        if liquid:
+            return min(liquid, key=lambda p: abs(abs(p.delta) - target_abs))
+    return min(valid, key=lambda p: abs(abs(p.delta) - target_abs))
+
+
+def _ordered_put_profiles(style: str) -> list[str]:
+    """Profiles with the requested `style` first, then the rest in canonical (assignment-prob) order."""
+    style = style if style in PUT_TARGET_DELTAS else "balanced"
+    return [style] + [p for p in PUT_PROFILE_ORDER if p != style]
+
+
+def _put_candidate(
+    p: OptionContract, profile: str, *, symbol: str, spot: float, cash: float, dte: int
+) -> dict | None:
+    """One cash-secured-put candidate, sized off the ticket quantity n (never a $0 figure on a live
+    ticket). Returns None if the contract has no quotable premium (no mid, no last)."""
+    limit = _limit_price(p)  # the premium per share we'd quote (mid, else last trade)
+    if limit is None:
+        return None
+    reserve_per = p.strike * 100.0  # cash-secured: strike × 100 set aside per contract
+    # How many whole contracts the cash secures; n is the ticket quantity — never 0 (min 1) so no
+    # figure reads $0 while a SELL-n ticket exists (the OC-1 sizing invariant).
+    affordable = int(math.floor(cash / reserve_per)) if (cash > 0 and reserve_per > 0) else 0
+    n = affordable if affordable > 0 else 1
+
+    net_cost = p.strike - limit  # your effective purchase price per share if assigned
+    return {
+        "profile": profile,
+        "contract_symbol": p.contract_symbol,
+        "strike": p.strike,
+        "limit_price": round(limit, 2),
+        "premium_income": round(limit * 100.0 * n, 2),
+        "net_cost_per_share": round(net_cost, 2),
+        "discount_vs_spot_pct": round((net_cost - spot) / spot * 100.0, 2) if spot else None,
+        "cash_to_reserve": round(reserve_per * n, 2),
+        "contracts": n,
+        "static_yield_pct": round(limit / p.strike * 100.0, 2) if p.strike else None,
+        "annualized_yield_pct": round(limit / p.strike * 100.0 * _DAYS_PER_YEAR / dte, 2) if (p.strike and dte > 0) else None,
+        "assignment_prob_pct": round(abs(p.delta) * 100.0),
+        "breakeven": round(net_cost, 2),  # strike − premium (same as net cost per share)
+        "delta": p.delta,
+        "theta": p.theta,
+        "iv": p.implied_volatility,
+        "open_interest": p.open_interest,
+        "spread_pct": p.spread_pct,
+        "order_ticket": f"SELL {n} {symbol} {_mmddyy(p.expiration)} {_fmt_strike(p.strike)} P @ {limit:.2f} LMT",
+    }
+
+
+def assemble_put_suggestion(
+    chain: OptionChain,
+    expiry: ExpiryChain,
+    *,
+    chosen: dict,
+    cash: float,
+    style: str = "balanced",
+    earnings_date: str | None = None,
+    now: float | None = None,
+    extra_warnings: list[str] | None = None,
+) -> dict:
+    """Build the OC-8 `/puts/{symbol}` response body from an already-fetched + annotated chain.
+
+    Pure/deterministic: `chain.expiry` must already be annotated via `annotate_expiry`. `cash` is the
+    reserve the user can set aside (sizes the contract count); `style` (aggressive|balanced|conservative)
+    is surfaced first. Up to three delta-picked put candidates, de-duped when two collapse onto the
+    same strike.
+    """
+    now = now if now is not None else time.time()
+    symbol = chain.symbol
+    spot = chain.spot or 0.0
+    dte = int(chosen["dte"])
+    warnings: list[str] = list(extra_warnings or [])
+
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    for profile in _ordered_put_profiles(style):
+        pick = _pick_put_by_abs_delta(expiry.puts, PUT_TARGET_DELTAS[profile], prefer_oi=(profile == "balanced"))
+        if pick is None or pick.contract_symbol in seen:
+            continue
+        cand = _put_candidate(pick, profile, symbol=symbol, spot=spot, cash=cash, dte=dte)
+        if cand is None:  # unquotable (no mid, no last) — skip
+            continue
+        seen.add(pick.contract_symbol)
+        candidates.append(cand)
+
+    # Earnings-in-window: does a known earnings date fall between now and the chosen expiry?
+    earn = _parse_iso_date(earnings_date)
+    exp_date = _utc_date(int(chosen["ts"]))
+    earnings_in_window = bool(earn and _utc_date(now) < earn <= exp_date)
+    earnings_block = {"date": earn.isoformat(), "in_window": earnings_in_window} if earn else None
+
+    # --- warnings ---
+    if earnings_in_window:
+        warnings.append(f"earnings on {earn.isoformat()} is before expiry — a gap-down could leave you assigned at a loss")
+    if dte < PUT_DTE_LOW or dte > PUT_DTE_HIGH:
+        warnings.append(f"chosen expiry is {dte} DTE, outside the preferred {PUT_DTE_LOW}-{PUT_DTE_HIGH} day window")
+    for c in candidates:
+        tag = c["profile"]
+        if c["spread_pct"] is not None and c["spread_pct"] > WIDE_SPREAD:
+            warnings.append(f"{tag} strike has a wide bid/ask spread ({c['spread_pct']*100:.0f}%) — use a limit order")
+        if (c["open_interest"] or 0) < OI_FLOOR:
+            warnings.append(f"{tag} strike has thin open interest ({c['open_interest'] or 0}) — may be hard to fill")
+        if c["iv"] is not None and c["iv"] >= HIGH_IV:
+            warnings.append(f"{tag} strike IV is elevated (~{c['iv']*100:.0f}%) — premium is rich but the market is pricing a big move")
+        if cash < c["strike"] * 100.0:  # can't fully cash-secure even one contract at this strike
+            warnings.append(
+                f"${cash:.0f} cash is below the {tag} strike's ${c['strike']*100:.0f} reserve (strike x 100) — "
+                "showing a 1-contract minimum; you'd need that set aside to be fully cash-secured"
+            )
+    if chain.quote_delayed:
+        warnings.append("quotes are delayed / market closed — bid-ask liquidity can't be confirmed right now")
+
+    rationale = _wheel_rationale(dte, PUT_DTE_LOW, PUT_DTE_HIGH, earnings_in_window=earnings_in_window)
+    return {
+        "symbol": symbol,
+        "spot": round(spot, 4) if spot else None,
+        "as_of": now,
+        "quote_delayed": chain.quote_delayed,
+        "expiry": {"ts": int(chosen["ts"]), "iso": chosen["iso"], "dte": dte, "rationale": rationale},
+        "candidates": candidates,
+        "warnings": list(dict.fromkeys(warnings)),  # de-dup, keep order
+        "earnings": earnings_block,
+        "note": PUT_NOTE,
+    }
+
+
+# --- covered call suggester ---
+
+def _pick_covered_call(
+    calls: list[OptionContract], *, spot: float, target: float | None
+) -> tuple[OptionContract | None, bool]:
+    """Pick ONE quotable call: the nearest strike AT/ABOVE `target` if given, else ~0.30 delta (OTM).
+    Returns (contract|None, target_fallback) — target_fallback is True when a `target` was given but
+    sits above every available strike, so we fell back to the delta pick."""
+    quotable = [c for c in calls if c.delta is not None and 0.0 < c.delta < 1.0 and _limit_price(c) is not None]
+    if not quotable:
+        return None, False
+    if target is not None:
+        at_or_above = [c for c in quotable if c.strike >= target]
+        if at_or_above:
+            return min(at_or_above, key=lambda c: (c.strike, abs(c.strike - target))), False
+        # target above every strike — fall back to the delta pick and flag it
+        return min(quotable, key=lambda c: abs(c.delta - COVERED_CALL_TARGET_DELTA)), True
+    return min(quotable, key=lambda c: abs(c.delta - COVERED_CALL_TARGET_DELTA)), False
+
+
+def assemble_covered_call(
+    chain: OptionChain,
+    expiry: ExpiryChain,
+    *,
+    shares: int,
+    chosen: dict,
+    target: float | None = None,
+    now: float | None = None,
+    extra_warnings: list[str] | None = None,
+) -> dict | None:
+    """Build the OC-8 `/covered_call/{symbol}` response body. Returns None when no call is quotable
+    (the route turns that into a 400). `shares` (>=100, validated by the route) sizes `contracts`."""
+    now = now if now is not None else time.time()
+    symbol = chain.symbol
+    spot = chain.spot or 0.0
+    dte = int(chosen["dte"])
+    contracts = shares // 100
+    warnings: list[str] = list(extra_warnings or [])
+
+    pick, target_fallback = _pick_covered_call(expiry.calls, spot=spot, target=target)
+    if pick is None:
+        return None
+
+    limit = _limit_price(pick) or 0.0
+    premium_income = round(limit * 100.0 * contracts, 2)
+    candidate = {
+        "contract_symbol": pick.contract_symbol,
+        "strike": pick.strike,
+        "limit_price": round(limit, 2),
+        "premium_income": premium_income,
+        "premium_yield_pct": round(limit / spot * 100.0, 2) if spot else None,
+        "annualized_yield_pct": round(limit / spot * 100.0 * _DAYS_PER_YEAR / dte, 2) if (spot and dte > 0) else None,
+        "assignment_prob_pct": round((pick.delta or 0.0) * 100.0),
+        # Upside to the strike (can be negative if the strike is below spot) + the premium, from today.
+        "called_away_gain_from_here": round(((pick.strike - spot) * 100.0 * contracts) + premium_income, 2),
+        "delta": pick.delta,
+        "theta": pick.theta,
+        "iv": pick.implied_volatility,
+        "open_interest": pick.open_interest,
+        "spread_pct": pick.spread_pct,
+        "order_ticket": f"SELL {contracts} {symbol} {_mmddyy(pick.expiration)} {_fmt_strike(pick.strike)} C @ {limit:.2f} LMT",
+    }
+
+    # --- warnings ---
+    if target is not None and target_fallback:
+        warnings.append(
+            f"your ${target:g} target is above every listed strike — showing the ~{int(COVERED_CALL_TARGET_DELTA*100)}-delta call instead"
+        )
+    if pick.strike < spot:
+        warnings.append(
+            f"the strike (${_fmt_strike(pick.strike)}) is below the current price (${spot:.2f}) — "
+            "if called away you'd sell below today's price; consider a higher strike"
+        )
+    if candidate["spread_pct"] is not None and candidate["spread_pct"] > WIDE_SPREAD:
+        warnings.append(f"the call has a wide bid/ask spread ({candidate['spread_pct']*100:.0f}%) — use a limit order")
+    if (candidate["open_interest"] or 0) < OI_FLOOR:
+        warnings.append(f"the call has thin open interest ({candidate['open_interest'] or 0}) — may be hard to fill")
+    if chain.quote_delayed:
+        warnings.append("quotes are delayed / market closed — bid-ask liquidity can't be confirmed right now")
+    # NOTE: ex-dividend early-assignment (deep-ITM calls exercised for the dividend) is intentionally
+    # not emitted — this service has no ex-dividend DATE source, and the spec says skip rather than
+    # fabricate one. Wire it in here if a dividend-calendar feed is added later.
+
+    rationale = _wheel_rationale(dte, CALL_DTE_LOW, CALL_DTE_HIGH, earnings_in_window=False)
+    return {
+        "symbol": symbol,
+        "spot": round(spot, 4) if spot else None,
+        "as_of": now,
+        "quote_delayed": chain.quote_delayed,
+        "shares": shares,
+        "contracts": contracts,
+        "expiry": {"ts": int(chosen["ts"]), "iso": chosen["iso"], "dte": dte, "rationale": rationale},
+        "candidate": candidate,
+        "warnings": list(dict.fromkeys(warnings)),  # de-dup, keep order
+        "note": COVERED_CALL_NOTE,
+    }
