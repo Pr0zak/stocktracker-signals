@@ -183,7 +183,7 @@ async def run_scan() -> dict:
             *[one(s, True) for s in cryptos],
         ))
 
-    # Day-of / day-before key-date alerts (SI publication, OPEX, earnings, speculative T+35 echoes)
+    # Day-of / day-before key-date alerts (SI publication, OPEX, earnings)
     # so the app can warn BEFORE the event, not after.
     date_alerts: list[str] = []
     try:

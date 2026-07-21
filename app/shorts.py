@@ -15,8 +15,7 @@ informed (Boehmer/Jones/Zhang 2008; Asquith/Pathak/Ritter 2005; NBER w21166); th
 concentrated in small/illiquid names and weak-to-absent for large liquid stocks. The squeeze case
 is conditional and rare — "fuel" (high days-to-cover) only matters once price and volume confirm
 ("ignition"), and even the GME 2021 rally was mostly retail buying, not short covering (SEC staff
-report). FTDs are lagging/contemporaneous (they rise AFTER declines), never predictive. The
-"T+35 cycle" theory has NO empirical support; echo dates are surfaced only labeled as folklore.
+report). FTDs are lagging/contemporaneous (they rise AFTER declines), never predictive.
 
 Everything caches under data/shorts/ so watchlist-wide scans cost one download per file, not per
 symbol. All fetchers are best-effort and return None rather than raise.
@@ -30,7 +29,7 @@ import os
 import statistics
 import time
 import zipfile
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
@@ -290,22 +289,9 @@ def _add_business_days(d: date, n: int) -> date:
 
 async def calendar(client: httpx.AsyncClient, symbols: list[str], earnings: dict[str, str] | None = None) -> list[dict]:
     """Watchlist-wide catalyst calendar: global dates once (SI settlement/publication, OPEX) plus
-    per-symbol speculative T+35 echoes and known earnings dates. Sorted soonest-first."""
-    events: list[dict] = [{**e, "symbol": None} for e in upcoming_dates(None)]
-    today = date.today()
+    known per-symbol earnings dates. Sorted soonest-first."""
+    events: list[dict] = [{**e, "symbol": None} for e in upcoming_dates()]
     for sym in symbols:
-        f = await ftd(client, sym)
-        for sd in (f or {}).get("spike_dates", []):
-            try:
-                echo = datetime.strptime(sd, "%Y%m%d").date() + timedelta(days=35)
-            except ValueError:
-                continue
-            if today <= echo <= today + timedelta(days=60):
-                events.append({
-                    "date": echo.isoformat(), "symbol": sym,
-                    "label": f"T+35 echo of {sd[:4]}-{sd[4:6]}-{sd[6:]} FTD spike — folklore, no empirical support",
-                    "kind": "t35_echo",
-                })
         e = (earnings or {}).get(sym)
         if e:
             events.append({"date": e, "symbol": sym, "label": "Earnings", "kind": "earnings"})
@@ -313,7 +299,7 @@ async def calendar(client: httpx.AsyncClient, symbols: list[str], earnings: dict
     return events[:30]
 
 
-def upcoming_dates(ftd_spikes: list[str] | None = None) -> list[dict]:
+def upcoming_dates() -> list[dict]:
     """Known/estimated future dates that matter for short mechanics, soonest first."""
     today = date.today()
     out: list[dict] = []
@@ -337,18 +323,6 @@ def upcoming_dates(ftd_spikes: list[str] | None = None) -> list[dict]:
     # Monthly options expiry (3rd Friday) — gamma/covering mechanics often cluster here.
     opex = _next_third_friday(today)
     out.append({"date": opex.isoformat(), "label": "Monthly options expiry (OPEX)", "kind": "opex"})
-    # Speculative T+35 echo windows from recent FTD spikes — clearly labeled, weak evidence.
-    for sd in (ftd_spikes or []):
-        try:
-            echo = datetime.strptime(sd, "%Y%m%d").date() + timedelta(days=35)
-        except ValueError:
-            continue
-        if today <= echo <= today + timedelta(days=45):
-            out.append({
-                "date": echo.isoformat(),
-                "label": f"T+35 echo of {sd[:4]}-{sd[4:6]}-{sd[6:]} FTD spike — folklore, no empirical support",
-                "kind": "t35_echo",
-            })
     out.sort(key=lambda x: x["date"])
     return out[:8]
 
@@ -419,7 +393,7 @@ async def short_pressure(
             {"date": d, "qty": q} for d, q, _ in (f or {}).get("series", [])[-16:]
         ],
         "event_study": study,
-        "upcoming": upcoming_dates((f or {}).get("spike_dates")),
+        "upcoming": upcoming_dates(),
         "reasons": reasons,
     }
 

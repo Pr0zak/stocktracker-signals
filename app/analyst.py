@@ -88,9 +88,8 @@ AFTER declines) — context, never timing. The daily short-volume ratio has no d
 value; treat it as descriptive only. If `ftd_spike_history` is present it is THIS \
 symbol's own record after past FTD spikes — trust it over folklore (a negative median means spikes \
 were NOT bullish here). If `upcoming_within_14d` lists near-term dates (SI publication, OPEX, \
-earnings, speculative t35_echo), you may cite them in `catalysts` with their real meaning — an SI \
-publication reveals positioning, OPEX affects hedging flows, a t35_echo is a speculative retail \
-theory and must be labeled as such if mentioned.
+earnings), you may cite them in `catalysts` with their real meaning — an SI \
+publication reveals positioning and OPEX affects hedging flows.
 - If the snapshot includes `insider` (open-market Form 4 PURCHASES over the last 12 months: \
 buy_count_12m, buy_total_12m, largest_buy_value, and conviction/cluster flags): this is the BULLISH \
 informed-money mirror of short_pressure. Insiders buying with their own money — especially a \
@@ -175,7 +174,7 @@ suggested_shares 0 rather than forcing a trade.
 - If the snapshot includes `short_pressure`: high short interest is a bearish base rate, not a buy \
 signal — do not plan an entry INTO a heavily-shorted name unless its state is "ignition", and then \
 size smaller with a tighter stop (squeezes reverse fast). Use `upcoming_within_14d` to time entries \
-around known dates (e.g. wait out earnings) and treat any t35_echo date as speculative.
+around known dates (e.g. wait out earnings).
 - This is decision support, not investment advice."""
 
 REC_SYSTEM = """You are a disciplined technical analyst helping one retail investor deploy a fixed \
@@ -206,7 +205,7 @@ long — verbosity gets it truncated.
 - If snapshots include `short_pressure`: high short interest is a bearish base rate. Never pick a \
 heavily-shorted name as a squeeze play unless its state is "ignition", and say so explicitly with \
 smaller sizing and a tighter stop. Weigh `upcoming_within_14d` dates (earnings, OPEX) when choosing \
-between otherwise-similar candidates; t35_echo dates are speculative.
+between otherwise-similar candidates.
 - Be honest and calibrated. This is decision support, not investment advice."""
 
 
