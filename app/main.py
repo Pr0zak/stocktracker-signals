@@ -66,11 +66,17 @@ _PAGE = """<!doctype html>
 <style>
   :root { color-scheme: light dark; --accent:#2563eb; --ok:#16a34a; --err:#dc2626; --muted:#888; }
   * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, sans-serif; max-width: 36rem; margin: 1.5rem auto;
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 60rem; margin: 1.5rem auto;
          padding: 0 1rem; line-height: 1.5; }
+  /* dashboard layout: cards flow into responsive columns (masonry) — 2-up on desktop, 1 on mobile.
+     column width drives the breakpoint; the 60rem body cap keeps it at 2 columns max. */
+  .masonry { columns: 27rem; column-gap: 1.2rem; }
+  .masonry > * { -webkit-column-break-inside: avoid; page-break-inside: avoid; break-inside: avoid; }
+  form#f { margin-bottom: 1.1rem; }
   h1 { font-size: 1.4rem; margin: 0 0 .2rem; }
   .sub { color: var(--muted); margin: 0 0 1.4rem; }
-  .card { border: 1px solid #8883; border-radius: .9rem; padding: 1rem 1.1rem; margin-bottom: 1.1rem; }
+  .card { border: 1px solid #8883; border-radius: .9rem; padding: 1rem 1.1rem; margin-bottom: 1.1rem;
+          background: rgba(127,127,127,.045); }
   .card h2 { font-size: 1rem; margin: 0 0 .8rem; }
   label { display: block; margin: .85rem 0 .3rem; font-weight: 600; font-size: .88rem; }
   .card label:first-of-type { margin-top: 0; }
@@ -157,6 +163,7 @@ _PAGE = """<!doctype html>
 <h1>StockTracker Signals</h1>
 <p class="sub">Tier-2 Claude analyst — operations &amp; configuration</p>
 
+<div class="masonry">
 <div class="card" id="status-card">
   <h2>Status <span class="hint" id="uptime"></span></h2>
   <div class="stat-grid">
@@ -263,6 +270,7 @@ _PAGE = """<!doctype html>
   <div class="hint" id="errs-head" style="margin-top:.7rem"></div>
   <div id="errs"></div>
 </div>
+</div><!-- /masonry -->
 
 <p class="hint">API: <code>GET /signal/{symbol}</code> · <code>GET /plan/{symbol}?cash=</code> · <code>POST /recommendations</code> ·
 <code>POST /scan/run</code> · <code>GET /scan/latest</code> · <code>GET /health</code>.
