@@ -54,6 +54,12 @@ _cookies: dict[str, str] = {}
 _auth_lock = asyncio.Lock()
 
 
+def crumb_status() -> dict:
+    """Whether the Yahoo cookie+crumb handshake has been primed this process (used by the ops
+    dashboard's data-sources panel). No network — just reports the module-level cache state."""
+    return {"cached": bool(_crumb), "cookies": len(_cookies)}
+
+
 # ======================================================================================
 # Typed structures (dataclasses, matching market.Series style — dataclasses.asdict()-friendly)
 # ======================================================================================

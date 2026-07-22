@@ -9,11 +9,11 @@ import time
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from . import selfupdate, settings_store, usage_store
+from . import observability, selfupdate, settings_store, usage_store
 from . import cycle, fundamentals, insider, options, shorts, webull
 from .analyst import analyze, options_note, plan_entry, recommend
 from .discover import discover
@@ -37,6 +37,24 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="StockTracker Signals", version="0.2.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _timing_middleware(request: Request, call_next):
+    """Time every request and record it in the in-memory ring (no disk I/O, never slows the path).
+    A handler that raises is logged as a 500 before the exception propagates."""
+    t0 = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as e:  # noqa: BLE001 — record then re-raise so FastAPI still returns its 500
+        observability.record_request(
+            request.method, request.url.path, 500, (time.perf_counter() - t0) * 1000.0, error=str(e),
+        )
+        raise
+    observability.record_request(
+        request.method, request.url.path, response.status_code, (time.perf_counter() - t0) * 1000.0,
+    )
+    return response
 
 
 # --- settings UI + API ---
@@ -82,10 +100,98 @@ _PAGE = """<!doctype html>
   #status, #upstatus { font-size: .88rem; min-height: 1.1rem; margin-top: .6rem; }
   .ok-t { color: var(--ok); } .err-t { color: var(--err); }
   code { background: #8882; padding: .1rem .3rem; border-radius: .3rem; font-size: .85em; }
+  .empty { color: var(--muted); font-size: .82rem; }
+  .loading { color: var(--muted); font-size: .85rem; }
+  /* status header */
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: .8rem .9rem; }
+  .stat .k { font-size: .7rem; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
+  .stat .v { font-size: 1.05rem; font-weight: 600; margin-top: .1rem; }
+  .stat .d { font-size: .78rem; color: var(--muted); margin-top: .1rem; }
+  .countdown { font-variant-numeric: tabular-nums; }
+  .meter { height: .45rem; background: #8883; border-radius: .3rem; overflow: hidden; margin-top: .35rem; }
+  .meter > span { display: block; height: 100%; width: 0; background: var(--accent); }
+  .meter.warn > span { background: #d97706; }
+  .meter.err > span { background: var(--err); }
+  /* signal colors + change badges */
+  .sig-buy { color: var(--ok); font-weight: 600; }
+  .sig-sell { color: var(--err); font-weight: 600; }
+  .sig-hold { color: var(--muted); font-weight: 600; }
+  .badge { display: inline-block; font-size: .66rem; padding: .04rem .38rem; border-radius: .8rem;
+           margin-left: .22rem; font-weight: 700; vertical-align: middle; }
+  .badge.flip { background: rgba(217,119,6,.18); color: #d97706; }
+  .badge.dip { background: rgba(22,163,74,.16); color: var(--ok); }
+  .badge.cross { background: rgba(220,38,38,.16); color: var(--err); }
+  /* compact tables */
+  .scroll { overflow-x: auto; margin: .3rem -.2rem 0; }
+  table.tbl { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  table.tbl th, table.tbl td { text-align: left; padding: .3rem .45rem; border-bottom: 1px solid #8882;
+                               white-space: nowrap; }
+  table.tbl th { color: var(--muted); font-weight: 600; font-size: .7rem; text-transform: uppercase; }
+  table.tbl td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.tbl td.thesis { max-width: 13rem; overflow: hidden; text-overflow: ellipsis; }
+  table.tbl tr.changed td:first-child { border-left: 3px solid #d97706; padding-left: calc(.45rem - 3px); }
+  /* data sources */
+  .src { display: flex; align-items: center; gap: .5rem; padding: .3rem 0; border-bottom: 1px solid #8882; }
+  .dot { width: .6rem; height: .6rem; border-radius: 50%; flex: none; background: var(--muted); }
+  .dot.ok { background: var(--ok); } .dot.warn { background: #d97706; } .dot.down { background: var(--err); }
+  .src .nm { font-weight: 600; font-size: .85rem; }
+  .src .lat { color: var(--muted); font-size: .76rem; }
+  .src .dt { color: var(--muted); font-size: .76rem; flex: 1; text-align: right;
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ivp { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .4rem; }
+  .ivp .pill { font-size: .73rem; background: #8882; border-radius: .8rem; padding: .12rem .5rem; }
+  .ivp .pill.done { background: rgba(22,163,74,.16); color: var(--ok); }
+  /* cost */
+  .cost-head { font-size: 1rem; margin: .1rem 0 .4rem; }
+  .cost-head b { color: var(--accent); }
+  /* activity log */
+  .logrow { display: flex; gap: .5rem; font-size: .77rem; font-family: ui-monospace, SFMono-Regular, monospace;
+            padding: .13rem 0; border-bottom: 1px solid #8881; }
+  .logrow.bad { color: var(--err); }
+  .logrow .m { width: 3.2rem; color: var(--muted); }
+  .logrow .p { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .logrow .st { width: 2.4rem; text-align: right; }
+  .logrow .ms { width: 4rem; text-align: right; color: var(--muted); }
 </style></head>
 <body>
 <h1>StockTracker Signals</h1>
-<p class="sub">Tier-2 Claude analyst — configuration</p>
+<p class="sub">Tier-2 Claude analyst — operations &amp; configuration</p>
+
+<div class="card" id="status-card">
+  <h2>Status <span class="hint" id="uptime"></span></h2>
+  <div class="stat-grid">
+    <div class="stat"><div class="k">Last scan</div><div class="v" id="scan-when">…</div>
+      <div class="d" id="scan-detail"></div></div>
+    <div class="stat"><div class="k">Next scan</div><div class="v countdown" id="next-scan">…</div>
+      <div class="d">06:30 America/Chicago</div></div>
+    <div class="stat"><div class="k">Disk</div><div class="v" id="disk-v">…</div>
+      <div class="meter" id="disk-meter"><span></span></div></div>
+  </div>
+  <div class="row" style="margin-top:.8rem">
+    <button type="button" class="secondary" id="prune">Prune cache</button>
+    <span class="hint" id="prune-status" style="flex:1"></span>
+  </div>
+  <div class="hint" id="cache-detail" style="margin-top:.5rem"></div>
+</div>
+
+<div class="card">
+  <h2>Latest scan <span class="hint" id="scan-count"></span></h2>
+  <div class="scroll"><table class="tbl" id="scan-tbl">
+    <thead><tr><th>Sym</th><th>Signal</th><th>Conv</th><th>Dip</th><th>Sqz</th><th>&lt;200w</th><th>Thesis</th></tr></thead>
+    <tbody id="scan-body"><tr><td colspan="7" class="loading">loading…</td></tr></tbody>
+  </table></div>
+  <div class="hint" style="margin-top:.5rem">Changed rows are badged: <span class="badge flip">flip</span>
+  signal flipped · <span class="badge dip">dip+</span> new/deeper dip · <span class="badge cross">×200w</span>
+  crossed below the 200-week line.</div>
+</div>
+
+<div class="card">
+  <h2>Data sources <span class="hint" id="src-as-of"></span></h2>
+  <div id="sources"><div class="loading">probing…</div></div>
+  <div class="hint" style="margin-top:.8rem">IV-rank progress — days of ATM-IV logged toward the
+  <span id="iv-target">20</span>-day rank window (nightly, per stock):</div>
+  <div class="ivp" id="iv-progress"><span class="empty">no IV history yet</span></div>
+</div>
 
 <div class="card">
   <h2>AI usage</h2>
@@ -93,6 +199,16 @@ _PAGE = """<!doctype html>
   <div id="usage-chart"></div>
   <div class="hint">Daily tokens over the last 30 days (hover a bar for the day's detail).</div>
   <div id="usage-models" class="hint"></div>
+</div>
+
+<div class="card">
+  <h2>Cost breakdown</h2>
+  <div class="cost-head" id="cost-head">loading…</div>
+  <div class="scroll"><table class="tbl" id="cost-tbl">
+    <thead><tr><th>Kind</th><th class="num">Calls</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead>
+    <tbody id="cost-body"></tbody>
+  </table></div>
+  <div class="hint" id="cost-avg" style="margin-top:.6rem"></div>
 </div>
 
 <form id="f">
@@ -139,6 +255,13 @@ _PAGE = """<!doctype html>
   <div class="hint" style="margin-top:.8rem">
     <a href="https://github.com/Pr0zak/stocktracker-signals" target="_blank" rel="noopener">github.com/Pr0zak/stocktracker-signals</a>
   </div>
+</div>
+
+<div class="card">
+  <h2>Recent activity <span class="hint">— last requests, in-memory since restart</span></h2>
+  <div id="logs"><div class="loading">loading…</div></div>
+  <div class="hint" id="errs-head" style="margin-top:.7rem"></div>
+  <div id="errs"></div>
 </div>
 
 <p class="hint">API: <code>GET /signal/{symbol}</code> · <code>GET /plan/{symbol}?cash=</code> · <code>POST /recommendations</code> ·
@@ -259,8 +382,158 @@ Decision support only — not investment advice.</p>
     setTimeout(() => { $("upstatus").textContent = "Restarted. Reloading…"; location.reload(); }, 6000);
   };
 
+  // ---- ops dashboard ----
+  const pad2 = (n) => String(n).padStart(2, "0");
+  function fmtDur(s) {
+    s = Math.max(0, Math.floor(s));
+    const d = Math.floor(s / 86400); s -= d * 86400;
+    const h = Math.floor(s / 3600); s -= h * 3600;
+    const m = Math.floor(s / 60); const sec = s - m * 60;
+    if (d > 0) return d + "d " + h + "h " + m + "m";
+    if (h > 0) return h + "h " + m + "m " + pad2(sec) + "s";
+    return m + "m " + pad2(sec) + "s";
+  }
+  function fmtBytes(n) {
+    if (n == null) return "–";
+    const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; n = Number(n);
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i === 0 ? n : n.toFixed(1)) + " " + u[i];
+  }
+  const money = (n) => "$" + Number(n || 0).toFixed(4);
+  const esc = (s) => { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML.replace(/"/g, "&quot;"); };
+
+  let nextScanTs = null;
+  function tickCountdown() {
+    const el = $("next-scan"); if (!el || !nextScanTs) return;
+    const left = nextScanTs - Date.now() / 1000;
+    el.textContent = left <= 0 ? "due now" : "in " + fmtDur(left);
+  }
+  function renderIvProgress(ivp) {
+    const box = $("iv-progress"); const target = ivp.target || 20;
+    $("iv-target").textContent = target;
+    const syms = ivp.symbols || {}; const keys = Object.keys(syms);
+    if (!keys.length) { box.innerHTML = '<span class="empty">no IV history yet — the nightly scan logs one point per stock</span>'; return; }
+    box.innerHTML = keys.map((k) => {
+      const n = syms[k]; const done = n >= target;
+      return '<span class="pill' + (done ? " done" : "") + '">' + esc(k) + " " + (done ? "✓ " + n : n + "/" + target) + "</span>";
+    }).join("");
+  }
+  function renderStatus(s) {
+    $("uptime").textContent = "· up " + fmtDur(s.uptime_s);
+    const sc = s.scan || {};
+    if (sc.generated_at) {
+      $("scan-when").textContent = agoText(sc.generated_at);
+      const c = sc.counts || {};
+      let d = (c.buy || 0) + " buy · " + (c.hold || 0) + " hold · " + (c.sell || 0) + " sell";
+      if (sc.total_cost != null) d += " · " + money(sc.total_cost);
+      if (sc.changed && sc.changed.length) d += " · " + sc.changed.length + " changed";
+      $("scan-detail").textContent = d;
+    } else { $("scan-when").textContent = "never"; $("scan-detail").textContent = "no scan yet"; }
+    nextScanTs = s.next_scan_at || null; tickCountdown();
+    const dk = s.disk || {};
+    $("disk-v").textContent = dk.pct != null ? dk.pct + "% · " + fmtBytes(dk.used) + " / " + fmtBytes(dk.total) : "–";
+    const meter = $("disk-meter"); const bar = meter.firstElementChild;
+    bar.style.width = (dk.pct != null ? Math.min(100, dk.pct) : 0) + "%";
+    meter.className = "meter" + (dk.pct >= 90 ? " err" : dk.pct >= 75 ? " warn" : "");
+    const ca = s.cache || {};
+    $("cache-detail").textContent = "Cache: " + fmtBytes(ca.shorts_bytes) + " in " + (ca.shorts_files || 0) +
+      " shorts files · " + (ca.iv_history_days_total || 0) + " IV-history rows";
+    renderIvProgress(s.iv_progress || {});
+  }
+  async function loadStatus() {
+    try { renderStatus(await (await fetch("/api/status")).json()); }
+    catch (e) { $("uptime").textContent = "· status unavailable"; }
+  }
+
+  const sigClass = (sig) => (sig && sig.indexOf("buy") >= 0) ? "sig-buy" : (sig && sig.indexOf("sell") >= 0) ? "sig-sell" : "sig-hold";
+  function scanBadges(r) {
+    let b = "";
+    if (r.flipped) b += '<span class="badge flip">flip</span>';
+    if (r.dip_new) b += '<span class="badge dip">dip+</span>';
+    if (r.crossed_below_200wma) b += '<span class="badge cross">×200w</span>';
+    return b;
+  }
+  async function loadScan() {
+    let data; try { data = await (await fetch("/scan/latest")).json(); } catch (e) { $("scan-body").innerHTML = '<tr><td colspan="7" class="empty">scan unavailable</td></tr>'; return; }
+    const rows = (data.results || []).filter((r) => !r.error);
+    const errs = (data.results || []).filter((r) => r.error);
+    $("scan-count").textContent = data.generated_at
+      ? "· " + rows.length + " scored" + (errs.length ? " · " + errs.length + " err" : "") : "· none yet";
+    const body = $("scan-body");
+    if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="empty">no scan results yet — runs nightly at 06:30, or POST /scan/run</td></tr>'; return; }
+    body.innerHTML = rows.map((r) => {
+      const changed = r.flipped || r.dip_new || r.crossed_below_200wma;
+      const th = esc(r.thesis || "");
+      return '<tr class="' + (changed ? "changed" : "") + '">' +
+        "<td><b>" + esc(r.symbol) + "</b>" + scanBadges(r) + "</td>" +
+        '<td class="' + sigClass(r.signal) + '">' + esc(r.signal) + "</td>" +
+        '<td class="num">' + (r.conviction != null ? esc(r.conviction) : "–") + "</td>" +
+        "<td>" + esc(r.dip || "–") + "</td>" +
+        "<td>" + esc(r.squeeze || "–") + "</td>" +
+        "<td>" + (r.below_200wma ? "yes" : "–") + "</td>" +
+        '<td class="thesis" title="' + th + '">' + th + "</td></tr>";
+    }).join("");
+  }
+
+  async function loadSources() {
+    let data;
+    try { data = await (await fetch("/api/sources")).json(); }
+    catch (e) { $("sources").innerHTML = '<div class="empty">sources unavailable</div>'; return; }
+    $("src-as-of").textContent = "· checked " + agoText(data.as_of);
+    $("sources").innerHTML = (data.sources || []).map((s) =>
+      '<div class="src"><span class="dot ' + esc(s.status) + '"></span>' +
+      '<span class="nm">' + esc(s.name) + "</span>" +
+      '<span class="lat">' + (s.latency_ms != null ? Math.round(s.latency_ms) + " ms" : "") + "</span>" +
+      '<span class="dt" title="' + esc(s.detail) + '">' + esc(s.detail) + "</span></div>"
+    ).join("") || '<div class="empty">no sources</div>';
+  }
+
+  async function loadCost() {
+    let c; try { c = await (await fetch("/api/cost")).json(); } catch (e) { $("cost-head").textContent = "cost unavailable"; return; }
+    $("cost-head").innerHTML = "Month-to-date <b>" + money(c.month_to_date_usd) + "</b> · projected <b>" +
+      money(c.projected_month_usd) + "</b> · all-time <b>" + money(c.all_time_usd) + "</b>";
+    const kinds = Object.entries(c.by_kind || {}).sort((a, b) => b[1].usd - a[1].usd);
+    $("cost-body").innerHTML = kinds.length ? kinds.map(([k, v]) =>
+      "<tr><td>" + esc(k) + '</td><td class="num">' + fmt(v.calls) + '</td><td class="num">' +
+      fmt(v.tokens) + '</td><td class="num">' + money(v.usd) + "</td></tr>").join("")
+      : '<tr><td colspan="4" class="empty">no calls recorded yet</td></tr>';
+    const bits = [];
+    if (c.per_scan_avg_usd != null) bits.push("per scan-call " + money(c.per_scan_avg_usd));
+    if (c.per_deep_avg_usd != null) bits.push("per deep-call " + money(c.per_deep_avg_usd));
+    $("cost-avg").textContent = bits.join(" · ");
+  }
+
+  async function loadLogs() {
+    let data; try { data = await (await fetch("/api/logs?limit=30")).json(); } catch (e) { $("logs").innerHTML = '<div class="empty">logs unavailable</div>'; return; }
+    const reqs = data.requests || [];
+    $("logs").innerHTML = reqs.length ? reqs.map((r) => {
+      const bad = r.status >= 400 || r.error;
+      return '<div class="logrow' + (bad ? " bad" : "") + '"><span class="m">' + esc(r.method) +
+        '</span><span class="p" title="' + esc(r.path) + '">' + esc(r.path) + '</span><span class="st">' +
+        r.status + '</span><span class="ms">' + Math.round(r.ms) + " ms</span></div>";
+    }).join("") : '<div class="empty">no requests recorded yet</div>';
+    const errs = data.errors || [];
+    $("errs-head").textContent = errs.length ? "Recent errors (" + errs.length + "):" : "No errors since restart.";
+    $("errs").innerHTML = errs.map((r) =>
+      '<div class="logrow bad"><span class="p">' + esc(r.method) + " " + esc(r.path) +
+      '</span><span class="st">' + r.status + "</span></div>").join("");
+  }
+
+  $("prune").onclick = async () => {
+    const ps = $("prune-status"); ps.textContent = "pruning…";
+    try {
+      const r = await (await fetch("/api/prune-cache", { method: "POST" })).json();
+      ps.textContent = "freed " + fmtBytes(r.bytes_freed) + " (" + r.deleted_files + " file" + (r.deleted_files === 1 ? "" : "s") + ")";
+    } catch (e) { ps.textContent = "prune failed"; }
+    loadStatus();
+  };
+
   load(); checkVersion(); loadUsage();
-  setInterval(() => { refreshSynced(); loadUsage(); }, 60000); // keep heartbeat + usage live
+  loadStatus(); loadScan(); loadSources(); loadCost(); loadLogs();
+  setInterval(() => { refreshSynced(); loadUsage(); loadCost(); }, 60000); // heartbeat + usage/cost
+  setInterval(() => { loadStatus(); loadScan(); loadLogs(); }, 30000);     // live ops cards
+  setInterval(loadSources, 60000);                                          // source probes (heavier)
+  setInterval(tickCountdown, 1000);                                         // next-scan countdown
 </script>
 </body></html>"""
 
@@ -317,6 +590,45 @@ async def api_version() -> dict:
 @app.post("/api/update")
 async def api_update() -> dict:
     return await asyncio.to_thread(selfupdate.update)
+
+
+# --- ops + transparency dashboard API ---
+
+@app.get("/api/status")
+async def api_status() -> dict:
+    """Operations snapshot: uptime, disk, last scan (counts/cost/changed), next-scan time, cache
+    footprint, and per-symbol IV-rank progress. Cheap read-only file reads; offloaded to a thread."""
+    return await asyncio.to_thread(observability.status_snapshot)
+
+
+@app.get("/api/sources")
+async def api_sources() -> dict:
+    """Concurrent short-timeout liveness probes of every upstream data source."""
+    assert _http is not None
+    return {"as_of": time.time(), "sources": await observability.probe_sources(_http)}
+
+
+@app.get("/api/logs")
+async def api_logs(limit: int = 50) -> dict:
+    """Recent served requests + recent non-2xx errors from the in-memory ring."""
+    limit = max(1, min(200, limit))
+    return {
+        "requests": observability.recent(limit),
+        "errors": observability.recent_errors(min(limit, 50)),
+    }
+
+
+@app.get("/api/cost")
+async def api_cost() -> dict:
+    """Per-kind cost/token breakdown + month-to-date, projected month, and per-scan/per-deep averages."""
+    return await asyncio.to_thread(observability.cost_breakdown)
+
+
+@app.post("/api/prune-cache")
+async def api_prune_cache() -> dict:
+    """Delete stale whole-market shvol_/ftd_ caches under data/shorts/ (older than ~90 days) and
+    report bytes freed. Never touches settings/scan/usage/iv-history files."""
+    return await asyncio.to_thread(observability.prune_shorts_cache)
 
 
 @app.get("/health")
