@@ -182,6 +182,14 @@ _PAGE = """<!doctype html>
 </div>
 
 <div class="card">
+  <h2>AI usage</h2>
+  <div id="usage-totals" class="usage-totals">loading…</div>
+  <div id="usage-chart"></div>
+  <div class="hint">Daily tokens over the last 30 days (hover a bar for the day's detail).</div>
+  <div id="usage-models" class="hint"></div>
+</div>
+
+<div class="card">
   <h2>Latest scan <span class="hint" id="scan-count"></span></h2>
   <div class="scroll"><table class="tbl" id="scan-tbl">
     <thead><tr><th>Sym</th><th>Signal</th><th>Conv</th><th>Dip</th><th>Sqz</th><th>&lt;200w</th><th>Thesis</th></tr></thead>
@@ -198,14 +206,6 @@ _PAGE = """<!doctype html>
   <div class="hint" style="margin-top:.8rem">IV-rank progress — days of ATM-IV logged toward the
   <span id="iv-target">20</span>-day rank window (nightly, per stock):</div>
   <div class="ivp" id="iv-progress"><span class="empty">no IV history yet</span></div>
-</div>
-
-<div class="card">
-  <h2>AI usage</h2>
-  <div id="usage-totals" class="usage-totals">loading…</div>
-  <div id="usage-chart"></div>
-  <div class="hint">Daily tokens over the last 30 days (hover a bar for the day's detail).</div>
-  <div id="usage-models" class="hint"></div>
 </div>
 
 <div class="card">
