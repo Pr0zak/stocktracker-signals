@@ -231,6 +231,14 @@ _PAGE = """<!doctype html>
     <div class="hint">CLI mode shells out to the local <code>claude</code> CLI signed in to your
     subscription — no per-token billing, but it draws on your Max rate-limit budget and needs the CLI
     + OAuth present on the server. Keep a key set too, so API mode still works.</div>
+    <div class="hint" id="cli-auth" style="margin-top:.5rem"></div>
+    <div class="row" style="margin-top:.3rem">
+      <button type="button" class="secondary" id="cli-test">Test CLI auth</button>
+      <span class="hint" id="cli-test-status" style="flex:1"></span>
+    </div>
+    <div class="hint" style="margin-top:.35rem">Set up on the server: run <code>claude setup-token</code>
+    (subscription login), then put the token in <code>CLAUDE_CODE_OAUTH_TOKEN</code> in the service env
+    — a dedicated token that won't rotate or get logged out.</div>
     <label for="key">Anthropic API key</label>
     <input id="key" type="password" autocomplete="off" placeholder="leave blank to keep current">
     <div class="hint" id="keyhint"></div>
@@ -368,6 +376,9 @@ Decision support only — not investment advice.</p>
     const s = await (await fetch("/api/settings")).json();
     $("deep").value = s.deep_model; $("scan").value = s.scan_model; $("ttl").value = s.verdict_ttl_seconds;
     $("provider").value = s.llm_provider || "api";
+    $("cli-auth").innerHTML = s.cli_token_set
+      ? "CLI subscription token: <b class=\"ok-t\">set</b> (" + esc(s.cli_token_hint) + ") — used when LLM backend is CLI."
+      : "CLI subscription token: <b class=\"err-t\">not set</b> — CLI mode will fail until you add one.";
     renderChips("watch", s.watchlist || []); renderChips("cwatch", s.crypto_watchlist || []);
     renderSynced(s.watchlist_synced_at);
     $("keyhint").textContent = s.anthropic_api_key_set
@@ -556,6 +567,15 @@ Decision support only — not investment advice.</p>
     loadStatus();
   };
 
+  $("cli-test").onclick = async () => {
+    const st = $("cli-test-status"); st.textContent = "testing…"; st.className = "hint";
+    try {
+      const r = await (await fetch("/api/cli-auth-test")).json();
+      st.textContent = r.ok ? "✓ authenticated" : "✗ " + (r.detail || "failed");
+      st.className = r.ok ? "ok-t" : "err-t";
+    } catch (e) { st.textContent = "✗ request failed"; st.className = "err-t"; }
+  };
+
   load(); checkVersion(); loadUsage();
   loadStatus(); loadScan(); loadSources(); loadCost(); loadLogs();
   setInterval(() => { refreshSynced(); loadUsage(); loadCost(); }, 60000); // heartbeat + usage/cost
@@ -571,10 +591,26 @@ async def home() -> str:
     return _PAGE
 
 
+def _cli_token() -> str:
+    """The headless-CLI subscription token (from `claude setup-token`), set in the service env. Used only
+    to show a masked status on the settings page — the value never leaves the server unredacted."""
+    import os
+    return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+
+
+@app.get("/api/cli-auth-test")
+async def cli_auth_test() -> dict:
+    """Live check that the headless claude CLI is installed + authenticated (subscription token) — one
+    tiny call. Backs the settings page's 'Test CLI auth' button. Never 500s (returns {ok:false,...})."""
+    from . import llm_cli
+    return await llm_cli.auth_probe(settings_store.get().get("scan_model", "claude-haiku-4-5"))
+
+
 @app.get("/api/settings")
 async def get_settings() -> dict:
     cfg = settings_store.get()
     key = cfg["anthropic_api_key"]
+    tok = _cli_token()
     return {
         "anthropic_api_key_set": bool(key),
         "anthropic_api_key_hint": ("…" + key[-4:]) if len(key) >= 4 else ("set" if key else ""),
@@ -582,6 +618,8 @@ async def get_settings() -> dict:
         "deep_model": cfg["deep_model"],
         "scan_model": cfg["scan_model"],
         "llm_provider": cfg.get("llm_provider", "api"),
+        "cli_token_set": bool(tok),
+        "cli_token_hint": ("…" + tok[-4:]) if len(tok) >= 4 else ("set" if tok else ""),
         "verdict_ttl_seconds": cfg["verdict_ttl_seconds"],
         "watchlist": cfg.get("watchlist", []),
         "crypto_watchlist": cfg.get("crypto_watchlist", []),

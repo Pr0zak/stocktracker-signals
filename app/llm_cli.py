@@ -204,6 +204,17 @@ async def structured(system: str, user_prompt: str, output_model: type[BaseModel
     raise CliError(f"claude CLI structured output failed to validate after 2 tries: {str(last_err)[:200]}")
 
 
+async def auth_probe(model: str = "claude-haiku-4-5") -> dict:
+    """Cheap liveness + auth check for cli mode: one tiny headless call. Returns {ok, detail} and never
+    raises — powers the settings page's 'Test CLI auth' button so the operator can confirm the CLI is
+    installed and the subscription token is valid without running a full analysis."""
+    try:
+        env = await _invoke(model, "Reply with the single word OK and nothing else.", "OK", thinking=False)
+        return {"ok": True, "detail": (env.get("result") or "").strip()[:60] or "ok"}
+    except Exception as e:  # noqa: BLE001 — surface the reason (e.g. "Not logged in") to the UI
+        return {"ok": False, "detail": str(e)[:200]}
+
+
 async def text(system: str, user_prompt: str, *, model: str, max_tokens: int = 2048, thinking: bool = False):
     """CLI equivalent of the plain-text options_note create() call: returns (paragraph, usage dict)."""
     env = await _invoke(model, system, user_prompt, thinking=thinking)
