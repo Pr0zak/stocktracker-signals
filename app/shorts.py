@@ -48,6 +48,10 @@ _SEC_UA = {
 
 _SI_TTL = 12 * 3600         # FINRA SI cache per symbol
 _LOCK = asyncio.Lock()      # serialize file-cache writes
+# In-memory memo of parsed FTD period files (immutable once a half-month finalizes). Without this the
+# calendar re-read + re-parsed all 12 whole-market files for EACH watchlist symbol (288 parses → ~25s).
+_FTD_MEM: dict[str, tuple[float, dict | None]] = {}
+_FTD_MEM_TTL = 3600
 
 
 def _read(name: str) -> dict | None:
@@ -174,10 +178,16 @@ def _ftd_periods(n: int) -> list[str]:
 
 
 async def _ftd_period(client: httpx.AsyncClient, period: str) -> dict | None:
-    """Parsed {SYM: [[settle_date, qty, price], ...]} for one half-month. Cached forever."""
+    """Parsed {SYM: [[settle_date, qty, price], ...]} for one half-month. Disk-cached forever, plus an
+    in-memory memo so repeated per-symbol lookups don't re-read + re-parse the whole-market file."""
+    hit = _FTD_MEM.get(period)
+    if hit is not None and time.time() - hit[0] < _FTD_MEM_TTL:
+        return hit[1]
     cached = _read(f"ftd_{period}.json")
     if cached is not None:
-        return cached.get("rows")
+        rows = cached.get("rows")
+        _FTD_MEM[period] = (time.time(), rows)
+        return rows
     try:
         r = await client.get(
             f"https://www.sec.gov/files/data/fails-deliver-data/cnsfails{period}.zip",
@@ -199,6 +209,7 @@ async def _ftd_period(client: httpx.AsyncClient, period: str) -> dict | None:
         return None
     async with _LOCK:
         _write(f"ftd_{period}.json", {"rows": rows})
+    _FTD_MEM[period] = (time.time(), rows)
     return rows
 
 
