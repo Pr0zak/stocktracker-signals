@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
-from . import congress, cycle, fundamentals, insider, market_now, options, shorts, webull
+from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
 from .analyst import analyze, market_overview, options_note, plan_entry, recommend
 from .discover import discover
 from .market import fetch_series, summarize
@@ -793,6 +793,12 @@ async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | No
                 summary["congress"] = cg
         except Exception:  # noqa: BLE001 — enrichment, never a blocker
             pass
+        try:  # seasonality — typical per-month price action from ~10y of monthly bars (weak tilt)
+            sea = seasonality.compact(await seasonality.seasonality(_http, series.symbol))
+            if sea:
+                summary["seasonality"] = sea
+        except Exception:  # noqa: BLE001 — enrichment, never a blocker
+            pass
         try:  # quality tags (Finnhub basic-financials) — stance-neutral business descriptors
             q = fundamentals.compact(await fundamentals.fetch_quality(_http, series.symbol))
             if q:
@@ -1103,6 +1109,16 @@ async def congress_endpoint(symbol: str, months: int = 12) -> dict:
     assert _http is not None
     data = await congress.congress_trades(_http, symbol.upper(), months=months)
     return {"symbol": symbol.upper(), "congress": data}
+
+
+@app.get("/seasonality/{symbol}")
+async def seasonality_endpoint(symbol: str) -> dict:
+    """Typical per-calendar-month price action from ~10y of monthly bars: avg return + hit rate per
+    month, the current month's tendency, and the strongest/weakest months. Free, no LLM. WEAK, sample-
+    limited context. Returns {symbol, seasonality: {...}|null} (null for names with under ~2y history)."""
+    assert _http is not None
+    data = await seasonality.seasonality(_http, symbol.upper())
+    return {"symbol": symbol.upper(), "seasonality": data}
 
 
 @app.get("/quality/{symbol}")

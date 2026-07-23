@@ -113,6 +113,13 @@ buffett_quality / wide_moat / dividend_aristocrat flags): these are stance-NEUTR
 business durability, NOT a buy or sell call. A wide-moat, low-debt, high-ROE compounder is a \
 structurally safer base to be constructive on, and a leveraged, low-margin business warrants more \
 caution — but quality does not time entries and must never override what price and momentum are doing.
+- If the snapshot includes `seasonality` (current_month avg return + hit_rate over ~N years, plus the \
+best/worst calendar months): this is the stock's TYPICAL price action for the calendar month, a WEAK, \
+sample-limited tilt (only a handful of years per month, and seasonal edges decay as they get known). \
+Treat a strong/weak current month as MILD confirming or cautioning context — e.g. a historically weak \
+month with a 30% hit rate is a small reason to be patient — never as a standalone timing signal, and it \
+must never override what price and momentum are doing right now. Mention it in at most one rationale \
+bullet if the current month is notably strong or weak; otherwise ignore it. Always respect the small sample.
 - Crypto snapshots may include `long_term_trend` (price vs 200-week SMA, Mayer Multiple, distance \
 from ATH, 3y CAGR) and, for BTC, `btc_halving_cycle` (cycle position, phase, and a past-cycle \
 analog of 12-month-forward returns from this position). Use them to frame the MULTI-YEAR regime — \
