@@ -377,8 +377,8 @@ Decision support only — not investment advice.</p>
     $("deep").value = s.deep_model; $("scan").value = s.scan_model; $("ttl").value = s.verdict_ttl_seconds;
     $("provider").value = s.llm_provider || "api";
     $("cli-auth").innerHTML = s.cli_token_set
-      ? "CLI subscription token: <b class=\"ok-t\">set</b> (" + esc(s.cli_token_hint) + ") — used when LLM backend is CLI."
-      : "CLI subscription token: <b class=\"err-t\">not set</b> — CLI mode will fail until you add one.";
+      ? 'CLI subscription token: <b class="ok-t">set</b> (' + esc(s.cli_token_hint) + ') — used when LLM backend is CLI.'
+      : 'CLI subscription token: <b class="err-t">not set</b> — CLI mode will fail until you add one.';
     renderChips("watch", s.watchlist || []); renderChips("cwatch", s.crypto_watchlist || []);
     renderSynced(s.watchlist_synced_at);
     $("keyhint").textContent = s.anthropic_api_key_set
