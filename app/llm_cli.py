@@ -65,10 +65,9 @@ def _child_env(thinking: bool) -> dict:
 # Built-in tools denied so the single-turn agent can only answer — this is a pure text/JSON
 # completion, never an action. (MCP tools are already gone via --strict-mcp-config with no
 # --mcp-config.) Denying a name that doesn't exist is harmless; a superset just future-proofs.
-_DENY_TOOLS = (
-    "Bash,BashOutput,KillShell,KillBash,Read,Edit,Write,MultiEdit,NotebookEdit,Glob,Grep,"
-    "WebFetch,WebSearch,Task,TodoWrite,SlashCommand,ExitPlanMode"
-)
+# Only long-stable core tool names — an UNKNOWN name is a non-fatal warning on newer CLIs but noise,
+# and CLI tool sets vary by version, so we keep to names that have existed for many releases.
+_DENY_TOOLS = "Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite,NotebookEdit"
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 
@@ -121,9 +120,17 @@ async def _invoke(model: str, system: str, user_prompt: str, *, thinking: bool =
             raise CliError(f"claude CLI timed out after {_TIMEOUT_S:.0f}s") from e
 
     if proc.returncode != 0:
-        raise CliError(
-            f"claude CLI exited {proc.returncode}: {err.decode(errors='replace')[:300].strip()}"
-        )
+        detail = err.decode(errors="replace")[:300].strip()
+        # The useful error (e.g. "Not logged in · Please run /login", auth/model issues) is usually in
+        # the JSON envelope on STDOUT, not stderr — surface it so real failures aren't masked by the
+        # non-fatal tool-deny warnings the CLI prints to stderr.
+        try:
+            msg = (json.loads(out.decode()).get("result") or "").strip()
+            if msg:
+                detail = f"{msg}{(' | ' + detail) if detail else ''}"
+        except Exception:  # noqa: BLE001
+            pass
+        raise CliError(f"claude CLI exited {proc.returncode}: {detail[:300]}")
     try:
         env = json.loads(out.decode())
     except Exception as e:  # noqa: BLE001
