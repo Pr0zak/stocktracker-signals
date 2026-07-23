@@ -403,7 +403,9 @@ AFTER / CLOSED), the major indices (S&P 500, Nasdaq, Dow, Russell 2000) with % c
 its change, the 11 SPDR sector ETFs split into leaders and laggards by % change, market-wide top \
 gainers/losers, and the user's own watchlist movers.
 
-Write a tight, scannable overview — 3 to 5 short bullets, under ~130 words total:
+Write a tight, scannable overview — 3 to 5 short plain-text sentences (or simple "- " dash bullets), \
+under ~130 words. Use NO markdown formatting: no **bold**, no *italics*, no # headers, no backticks — \
+plain text only, since it renders in a mobile dialog:
 - Lead with the tape's tone: risk-on / risk-off / mixed, grounded in the indices AND the VIX (a rising \
 VIX is fear; small-caps (Russell) leading or lagging tells you about risk appetite).
 - Name what is LEADING and LAGGING by sector and what it implies (e.g. defensives — staples/utilities — \
