@@ -254,10 +254,13 @@ async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tok
     """One structured-output Claude call on the configured scan/deep model. Returns (parsed, usage)."""
     cfg = settings_store.get()
     model = cfg["deep_model"] if deep else cfg["scan_model"]
+    # Adaptive thinking is a deep-tier (Opus/Sonnet/Fable) feature; the cheap scan model runs without it.
+    thinking_model = any(m in model for m in ("opus-4", "sonnet-5", "fable"))
     # Provider toggle: "cli" shells out to the headless claude CLI (subscription OAuth, no per-token
     # billing); the default "api" path below uses the Anthropic SDK's schema-constrained parse().
     if cfg.get("llm_provider") == "cli":
-        return await llm_cli.structured(system, prompt, output_format, model=model, max_tokens=max_tokens)
+        return await llm_cli.structured(system, prompt, output_format, model=model,
+                                        max_tokens=max_tokens, thinking=thinking_model)
     kwargs: dict = dict(
         model=model,
         max_tokens=max_tokens,
@@ -274,7 +277,7 @@ async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tok
         output_format=output_format,
     )
     # Adaptive thinking is a 4.6+ feature; only enable it for the deep-tier models.
-    if any(m in model for m in ("opus-4", "sonnet-5", "fable")):
+    if thinking_model:
         kwargs["thinking"] = {"type": "adaptive"}
 
     resp = await _get_client().messages.parse(**kwargs)
@@ -357,13 +360,14 @@ async def options_note(context: dict, *, deep: bool = True) -> tuple[str, dict]:
     route can swallow it and leave `analyst` null (never a 500)."""
     cfg = settings_store.get()
     model = cfg["deep_model"] if deep else cfg["scan_model"]
+    thinking_model = any(m in model for m in ("opus-4", "sonnet-5", "fable"))
     prompt = (
         "Explain this suggested options trade to a beginner:\n"
         + json.dumps(context, indent=2, default=str)
         + "\n\nReturn ONE short plain-language paragraph."
     )
     if cfg.get("llm_provider") == "cli":
-        return await llm_cli.text(OPTIONS_NOTE_SYSTEM, prompt, model=model, max_tokens=2048)
+        return await llm_cli.text(OPTIONS_NOTE_SYSTEM, prompt, model=model, max_tokens=2048, thinking=thinking_model)
     kwargs: dict = dict(
         model=model,
         max_tokens=2048,
@@ -371,7 +375,7 @@ async def options_note(context: dict, *, deep: bool = True) -> tuple[str, dict]:
         messages=[{"role": "user", "content": prompt}],
     )
     # Adaptive thinking is a 4.6+ feature; only enable it for the deep-tier models (matches _parse).
-    if any(m in model for m in ("opus-4", "sonnet-5", "fable")):
+    if thinking_model:
         kwargs["thinking"] = {"type": "adaptive"}
 
     resp = await _get_client().messages.create(**kwargs)

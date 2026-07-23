@@ -47,8 +47,20 @@ _SEM = asyncio.Semaphore(_CONCURRENCY)
 _AUTH_ENV_STRIP = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 
-def _child_env() -> dict:
-    return {k: v for k, v in os.environ.items() if k not in _AUTH_ENV_STRIP}
+def _child_env(thinking: bool) -> dict:
+    """Child env for the CLI: OAuth-only (no inherited API key), with thinking gated per tier.
+
+    The headless CLI turns on extended thinking by default, which on the scan (Haiku) tier balloons
+    a ~190-token verdict to ~2-9k output tokens (≈22s and heavy quota) for no quality gain — the API
+    scan path never used thinking. So we set MAX_THINKING_TOKENS=0 for non-thinking (scan) calls
+    (22s→1.5s). Deep (Opus) calls DO think — and Opus errors on a 0 budget — so we clear the var and
+    let the model default apply. Mirrors analyst._parse's opus/sonnet/fable thinking predicate."""
+    env = {k: v for k, v in os.environ.items() if k not in _AUTH_ENV_STRIP}
+    if thinking:
+        env.pop("MAX_THINKING_TOKENS", None)   # deep tier: let the model think (Opus 401s on a 0 budget)
+    else:
+        env["MAX_THINKING_TOKENS"] = "0"        # scan tier: no thinking, matching the API scan path
+    return env
 
 # Built-in tools denied so the single-turn agent can only answer — this is a pure text/JSON
 # completion, never an action. (MCP tools are already gone via --strict-mcp-config with no
@@ -80,9 +92,9 @@ def _lean_argv(model: str, system: str) -> list[str]:
     ]
 
 
-async def _invoke(model: str, system: str, user_prompt: str) -> dict:
+async def _invoke(model: str, system: str, user_prompt: str, *, thinking: bool = False) -> dict:
     """Run one headless claude call; return the parsed result envelope. Raises CliError on any failure.
-    The user prompt is fed on stdin so no shell/argv is involved."""
+    The user prompt is fed on stdin so no shell/argv is involved. `thinking` gates extended thinking."""
     argv = _lean_argv(model, system)
     async with _SEM:   # cap concurrent claude processes (see _CONCURRENCY)
         try:
@@ -91,7 +103,7 @@ async def _invoke(model: str, system: str, user_prompt: str) -> dict:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=_child_env(),   # OAuth only — never inherit an API key (would bill per-token)
+                env=_child_env(thinking),   # OAuth only (never an API key); thinking gated per tier
             )
         except FileNotFoundError as e:
             raise CliError(f"claude CLI not found ({_CLAUDE_BIN!r}) — installed and on PATH?") from e
@@ -153,7 +165,7 @@ def _strip_to_json(text: str) -> str:
 
 
 async def structured(system: str, user_prompt: str, output_model: type[BaseModel], *,
-                     model: str, max_tokens: int = 4096):
+                     model: str, max_tokens: int = 4096, thinking: bool = False):
     """CLI equivalent of analyst._parse: returns (validated pydantic model, usage dict). Retries once
     with a stricter nudge if the first reply doesn't parse/validate against output_model."""
     schema = json.dumps(output_model.model_json_schema())
@@ -165,7 +177,7 @@ async def structured(system: str, user_prompt: str, output_model: type[BaseModel
     last_err: Exception | None = None
     prompt = user_prompt
     for attempt in (1, 2):
-        env = await _invoke(model, sys, prompt)
+        env = await _invoke(model, sys, prompt, thinking=thinking)
         raw = _strip_to_json(env.get("result", ""))
         try:
             obj = output_model.model_validate_json(raw)
@@ -185,9 +197,9 @@ async def structured(system: str, user_prompt: str, output_model: type[BaseModel
     raise CliError(f"claude CLI structured output failed to validate after 2 tries: {str(last_err)[:200]}")
 
 
-async def text(system: str, user_prompt: str, *, model: str, max_tokens: int = 2048):
+async def text(system: str, user_prompt: str, *, model: str, max_tokens: int = 2048, thinking: bool = False):
     """CLI equivalent of the plain-text options_note create() call: returns (paragraph, usage dict)."""
-    env = await _invoke(model, system, user_prompt)
+    env = await _invoke(model, system, user_prompt, thinking=thinking)
     out = (env.get("result") or "").strip()
     if not out:
         raise CliError("claude CLI returned empty text")

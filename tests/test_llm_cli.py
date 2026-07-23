@@ -71,7 +71,7 @@ def _patch_invoke(monkeypatch, envs):
     seq = list(envs)
     calls = {"n": 0}
 
-    async def fake(model, system, prompt):
+    async def fake(model, system, prompt, *, thinking=False):
         i = calls["n"]
         calls["n"] += 1
         return seq[min(i, len(seq) - 1)]
@@ -188,9 +188,17 @@ def test_child_env_excludes_auth_keys(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
     monkeypatch.setenv("PATH", "/usr/bin")
-    e = llm_cli._child_env()
+    e = llm_cli._child_env(thinking=False)
     assert "ANTHROPIC_API_KEY" not in e and "ANTHROPIC_AUTH_TOKEN" not in e
     assert e.get("PATH") == "/usr/bin"   # non-auth env still passes through
+
+
+def test_child_env_gates_thinking(monkeypatch):
+    monkeypatch.delenv("MAX_THINKING_TOKENS", raising=False)
+    # scan tier: thinking disabled (Haiku verdict balloons ~15x with thinking on, for no gain)
+    assert llm_cli._child_env(thinking=False).get("MAX_THINKING_TOKENS") == "0"
+    # deep tier: var cleared so the model default applies (Opus errors on a 0 budget)
+    assert "MAX_THINKING_TOKENS" not in llm_cli._child_env(thinking=True)
 
 
 def test_invoke_passes_sanitized_env_to_subprocess(monkeypatch):
@@ -263,8 +271,9 @@ def test_analyst_routes_to_cli_when_selected(monkeypatch):
                         lambda: {"llm_provider": "cli", "deep_model": "d", "scan_model": "s"})
     seen = {}
 
-    async def fake_structured(system, prompt, output_model, *, model, max_tokens=4096):
+    async def fake_structured(system, prompt, output_model, *, model, max_tokens=4096, thinking=False):
         seen["model"] = model
+        seen["thinking"] = thinking
         return _verdict(), {"provider": "cli", "model": model}
     monkeypatch.setattr(llm_cli, "structured", fake_structured)
 
