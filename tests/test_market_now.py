@@ -65,17 +65,18 @@ def test_market_overview_routes_to_cli_scan_tier(monkeypatch):
                         lambda: {"llm_provider": "cli", "deep_model": "claude-opus-4-8", "scan_model": "claude-haiku-4-5"})
     seen = {}
 
-    async def fake_text(system, prompt, *, model, max_tokens=2048, thinking=False):
+    async def fake_structured(system, prompt, output_model, *, model, max_tokens=4096, thinking=False):
         seen["model"] = model
         seen["thinking"] = thinking
-        return "Risk-on tape; tech leads. Not investment advice.", {"provider": "cli", "model": model}
-    monkeypatch.setattr(llm_cli, "text", fake_text)
+        return analyst.MarketOverview(tone="risk-off", headline="Tech leads down", points=["a", "b"]), \
+            {"provider": "cli", "model": model}
+    monkeypatch.setattr(llm_cli, "structured", fake_structured)
 
-    txt, u = asyncio.run(analyst.market_overview({"session": "REGULAR"}, deep=False))
+    ov, u = asyncio.run(analyst.market_overview({"session": "REGULAR"}, deep=False))
     assert u["provider"] == "cli"
     assert seen["model"] == "claude-haiku-4-5"   # scan tier for deep=False
     assert seen["thinking"] is False             # haiku → no thinking
-    assert "Not investment advice" in txt
+    assert ov.tone == "risk-off" and len(ov.points) == 2
 
 
 def test_market_overview_deep_uses_opus_with_thinking(monkeypatch):
@@ -83,11 +84,11 @@ def test_market_overview_deep_uses_opus_with_thinking(monkeypatch):
                         lambda: {"llm_provider": "cli", "deep_model": "claude-opus-4-8", "scan_model": "claude-haiku-4-5"})
     seen = {}
 
-    async def fake_text(system, prompt, *, model, max_tokens=2048, thinking=False):
+    async def fake_structured(system, prompt, output_model, *, model, max_tokens=4096, thinking=False):
         seen["model"] = model
         seen["thinking"] = thinking
-        return "x. Not investment advice.", {"provider": "cli", "model": model}
-    monkeypatch.setattr(llm_cli, "text", fake_text)
+        return analyst.MarketOverview(tone="mixed", headline="x", points=["a"]), {"provider": "cli"}
+    monkeypatch.setattr(llm_cli, "structured", fake_structured)
 
     asyncio.run(analyst.market_overview({"session": "REGULAR"}, deep=True))
     assert seen["model"] == "claude-opus-4-8" and seen["thinking"] is True

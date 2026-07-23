@@ -402,62 +402,43 @@ async def options_note(context: dict, *, deep: bool = True) -> tuple[str, dict]:
 
 
 # ======================================================================================
-# AIE-5 — "Market now": a fast plain-language read of what the whole tape is doing right now.
-# Plain text (like options_note), routed through the same provider toggle. Defaults to the cheap
-# scan model so the on-demand button feels instant.
+# AIE-5 — "Market now": a fast, STRUCTURED read of the tape right now (tone + headline + a few scannable
+# points) so the app renders it grouped, not as one paragraph. Routed through the shared structured
+# _parse() (api/cli). Defaults to the cheap scan model so the on-demand button feels instant.
 # ======================================================================================
 
-MARKET_SYSTEM = """You are a market strategist giving one retail investor a fast, plain-language read of \
+class MarketOverview(BaseModel):
+    tone: str          # "risk-on" | "risk-off" | "mixed"
+    headline: str      # one punchy bottom-line sentence
+    points: list[str]  # 3-5 short, scannable points
+
+
+MARKET_SYSTEM = """You are a market strategist giving one retail investor a fast, SCANNABLE read of \
 what US markets are doing RIGHT NOW. You receive a JSON snapshot: the session phase (PRE / REGULAR / \
-AFTER / CLOSED), the major indices (S&P 500, Nasdaq, Dow, Russell 2000) with % change, the VIX level and \
-its change, the 11 SPDR sector ETFs split into leaders and laggards by % change, market-wide top \
-gainers/losers, and the user's own watchlist movers.
+AFTER / CLOSED), major indices (S&P 500, Nasdaq, Dow, Russell 2000) with % change, the VIX level + change, \
+the 11 SPDR sector ETFs split into leaders/laggards, market-wide top gainers/losers, and the user's \
+watchlist movers.
 
-Write a tight, scannable overview — 3 to 5 short plain-text sentences (or simple "- " dash bullets), \
-under ~130 words. Use NO markdown formatting: no **bold**, no *italics*, no # headers, no backticks — \
-plain text only, since it renders in a mobile dialog:
-- Lead with the tape's tone: risk-on / risk-off / mixed, grounded in the indices AND the VIX (a rising \
-VIX is fear; small-caps (Russell) leading or lagging tells you about risk appetite).
-- Name what is LEADING and LAGGING by sector and what it implies (e.g. defensives — staples/utilities — \
-bid while tech lags = a cautious, rotational tape).
-- Call out the 1-2 most notable moves in the user's WATCHLIST specifically, if any stand out.
-- Ground EVERY claim in the numbers provided. Do NOT invent news, catalysts, earnings, or price levels \
-you were not given; if there's no obvious driver in the data, say the move is happening without one in view.
-- If the session is PRE or AFTER, say so and warn the moves are on thin, unreliable volume; if CLOSED, \
-frame it as where things settled, not live action.
-- No preamble, no headers. End with a short 'Not investment advice.'"""
+Return a structured read (it renders as a tone chip + a bold headline + bullet points on a phone):
+- tone: exactly one of "risk-on", "risk-off", or "mixed" — the overall tape, grounded in indices AND the \
+VIX (a rising VIX is fear; small-caps (Russell) leading/lagging signals risk appetite).
+- headline: ONE punchy bottom-line sentence, under ~14 words.
+- points: 3 to 5 SHORT bullets, each ONE sentence under ~22 words, in this order: (1) indices + VIX read; \
+(2) sector rotation — what's leading/lagging and what it implies (e.g. defensives bid + tech lagging = \
+cautious); (3) the 1-2 most notable moves in the user's WATCHLIST by name; (4) if PRE/AFTER, a thin-volume \
+caveat, or if CLOSED, that it's where things settled.
+Ground EVERY point in the numbers — never invent news, catalysts, earnings, or price levels; if there's \
+no obvious driver, say the move is happening without one in view. Do NOT add a disclaimer line (the app \
+shows one). Each string is plain text, no markdown."""
 
 
-async def market_overview(snapshot: dict, *, deep: bool = False) -> tuple[str, dict]:
-    """One plain-language 'what are the markets doing right now' overview (AIE-5). Returns (text, usage).
-    Defaults to the cheap scan model (deep=False) for an instant feel; deep=True uses Opus for a richer
-    synthesis. Mirrors options_note (plain text) and honors the api/cli provider toggle. Raises on
-    API/empty output so the route can turn it into a clean 502."""
-    cfg = settings_store.get()
-    model = cfg["deep_model"] if deep else cfg["scan_model"]
-    thinking_model = any(m in model for m in ("opus-4", "sonnet-5", "fable"))
+async def market_overview(snapshot: dict, *, deep: bool = False) -> tuple[MarketOverview, dict]:
+    """Structured 'what are the markets doing right now' read (AIE-5): tone + headline + 3-5 points, so
+    the app can render it grouped rather than as one paragraph. Defaults to the cheap scan model
+    (deep=False) for an instant feel; honors the api/cli provider toggle via the shared structured
+    _parse(). Raises on API/empty output so the route can turn it into a clean 502."""
     prompt = (
-        "Here is the current market snapshot. Give the 'what's happening right now' overview:\n"
+        "Here is the current market snapshot. Give the structured 'what's happening right now' read:\n"
         + json.dumps(snapshot, indent=2, default=str)
     )
-    if cfg.get("llm_provider") == "cli":
-        return await llm_cli.text(MARKET_SYSTEM, prompt, model=model, max_tokens=1024, thinking=thinking_model)
-    kwargs: dict = dict(
-        model=model,
-        max_tokens=1024,
-        system=MARKET_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    if thinking_model:
-        kwargs["thinking"] = {"type": "adaptive"}
-    resp = await _get_client().messages.create(**kwargs)
-    u0 = resp.usage
-    log.info("analyst-market %s in=%s out=%s", model, u0.input_tokens, u0.output_tokens)
-    if resp.stop_reason == "max_tokens":
-        raise RuntimeError(f"market overview hit the 1024-token cap and was truncated (stop_reason={resp.stop_reason})")
-    text = "".join(
-        getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text"
-    ).strip()
-    if not text:
-        raise RuntimeError(f"analyst returned no market text (stop_reason={resp.stop_reason})")
-    return text, _usage(model, resp.usage)
+    return await _parse(MARKET_SYSTEM, prompt, MarketOverview, deep=deep, max_tokens=1024)

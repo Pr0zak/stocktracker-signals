@@ -957,13 +957,17 @@ async def market_now_endpoint(deep: bool = False, count: int = 6) -> dict:
         _log.warning("market_now movers failed: %s", e)
 
     try:
-        overview, usage = await market_overview(snap, deep=deep)
+        ov, usage = await market_overview(snap, deep=deep)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
     usage_store.record(usage, symbol="", kind="market_now")
 
+    # `overview` stays a (now grouped, multi-line) string so existing app builds render it prettier
+    # immediately; `overview_struct` carries the tone/headline/points for the app's richer rendering.
+    overview_str = ov.headline + "\n\n" + "\n".join(f"• {p}" for p in ov.points)
     payload = {
-        "overview": overview,
+        "overview": overview_str,
+        "overview_struct": ov.model_dump(),
         "snapshot": snap,
         "session": snap["session"],
         "model": usage["model"],
