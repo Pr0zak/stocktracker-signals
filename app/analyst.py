@@ -13,7 +13,7 @@ from enum import Enum
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel
 
-from . import settings_store
+from . import llm_cli, settings_store
 
 log = logging.getLogger("uvicorn.error")
 
@@ -238,6 +238,7 @@ def _usage(model: str, u) -> dict:
         "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write,
         "cost_usd": round(cost, 6),
+        "provider": "api",
     }
 
 
@@ -253,6 +254,10 @@ async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tok
     """One structured-output Claude call on the configured scan/deep model. Returns (parsed, usage)."""
     cfg = settings_store.get()
     model = cfg["deep_model"] if deep else cfg["scan_model"]
+    # Provider toggle: "cli" shells out to the headless claude CLI (subscription OAuth, no per-token
+    # billing); the default "api" path below uses the Anthropic SDK's schema-constrained parse().
+    if cfg.get("llm_provider") == "cli":
+        return await llm_cli.structured(system, prompt, output_format, model=model, max_tokens=max_tokens)
     kwargs: dict = dict(
         model=model,
         max_tokens=max_tokens,
@@ -357,6 +362,8 @@ async def options_note(context: dict, *, deep: bool = True) -> tuple[str, dict]:
         + json.dumps(context, indent=2, default=str)
         + "\n\nReturn ONE short plain-language paragraph."
     )
+    if cfg.get("llm_provider") == "cli":
+        return await llm_cli.text(OPTIONS_NOTE_SYSTEM, prompt, model=model, max_tokens=2048)
     kwargs: dict = dict(
         model=model,
         max_tokens=2048,

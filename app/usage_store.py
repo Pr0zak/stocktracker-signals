@@ -33,6 +33,8 @@ def record(usage: dict, *, symbol: str, kind: str) -> None:
         "output_tokens": int(usage.get("output_tokens", 0)),
         "cache_read_tokens": int(usage.get("cache_read_tokens", 0)),
         "cost_usd": float(usage.get("cost_usd", 0.0)),
+        # "api" (real per-token $) or "cli" (subscription — cost_usd is notional). Old rows lack this.
+        "provider": (usage.get("provider") or "api"),
     }
     with _lock:
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -58,6 +60,7 @@ def summary(days: int = 30) -> dict:
     total_in = total_out = total_calls = 0
     total_cost = 0.0
     by_model: dict[str, dict] = {}
+    by_provider: dict[str, dict] = {}
     by_day: dict[str, dict] = {}
     with _lock:
         rows = list(_iter_rows())
@@ -76,6 +79,11 @@ def summary(days: int = 30) -> dict:
         bm["input_tokens"] += ti
         bm["output_tokens"] += to
         bm["cost_usd"] += c
+        bp = by_provider.setdefault(str(r.get("provider") or "api"), dict(_ZERO))
+        bp["calls"] += 1
+        bp["input_tokens"] += ti
+        bp["output_tokens"] += to
+        bp["cost_usd"] += c
         day = time.strftime("%Y-%m-%d", time.localtime(r.get("ts", 0)))
         bd = by_day.setdefault(day, dict(_ZERO))
         bd["calls"] += 1
@@ -104,5 +112,6 @@ def summary(days: int = 30) -> dict:
         "total_tokens": total_in + total_out,
         "total_cost_usd": round(total_cost, 6),
         "by_model": {m: {**v, "cost_usd": round(v["cost_usd"], 6)} for m, v in by_model.items()},
+        "by_provider": {p: {**v, "cost_usd": round(v["cost_usd"], 6)} for p, v in by_provider.items()},
         "series": series,
     }

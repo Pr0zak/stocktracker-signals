@@ -80,8 +80,9 @@ _PAGE = """<!doctype html>
   .card h2 { font-size: 1rem; margin: 0 0 .8rem; }
   label { display: block; margin: .85rem 0 .3rem; font-weight: 600; font-size: .88rem; }
   .card label:first-of-type { margin-top: 0; }
-  input { width: 100%; padding: .55rem .65rem; font-size: 1rem; border: 1px solid #8886;
+  input, select { width: 100%; padding: .55rem .65rem; font-size: 1rem; border: 1px solid #8886;
           border-radius: .5rem; background: transparent; color: inherit; }
+  select { appearance: auto; }
   .hint { font-size: .8rem; color: var(--muted); font-weight: 400; }
   .row { display: flex; gap: .5rem; align-items: center; }
   .row input { flex: 1; }
@@ -221,6 +222,14 @@ _PAGE = """<!doctype html>
 <form id="f">
   <div class="card">
     <h2>Connection &amp; models</h2>
+    <label for="provider">LLM backend</label>
+    <select id="provider">
+      <option value="api">Anthropic API — per-token billing</option>
+      <option value="cli">Claude CLI — this machine's subscription (no per-token cost)</option>
+    </select>
+    <div class="hint">CLI mode shells out to the local <code>claude</code> CLI signed in to your
+    subscription — no per-token billing, but it draws on your Max rate-limit budget and needs the CLI
+    + OAuth present on the server. Keep a key set too, so API mode still works.</div>
     <label for="key">Anthropic API key</label>
     <input id="key" type="password" autocomplete="off" placeholder="leave blank to keep current">
     <div class="hint" id="keyhint"></div>
@@ -339,8 +348,13 @@ Decision support only — not investment advice.</p>
   async function loadUsage() {
     try {
       const u = await (await fetch("/api/usage?days=30")).json();
-      $("usage-totals").innerHTML = "<b>" + fmt(u.total_tokens) + "</b> tokens · <b>$" +
-        u.total_cost_usd.toFixed(4) + "</b> · " + fmt(u.total_calls) + " calls" +
+      const bp = u.by_provider || {};
+      const billed = (bp.api && bp.api.cost_usd) || 0;
+      const notional = (bp.cli && bp.cli.cost_usd) || 0;
+      let cost = "<b>$" + billed.toFixed(4) + "</b> billed";
+      if (notional > 0) cost += ' · <span class="hint">$' + notional.toFixed(4) + " notional (subscription)</span>";
+      $("usage-totals").innerHTML = "<b>" + fmt(u.total_tokens) + "</b> tokens · " + cost + " · " +
+        fmt(u.total_calls) + " calls" +
         ' <span class="hint">(' + fmt(u.total_input_tokens) + " in / " + fmt(u.total_output_tokens) + " out, all-time)</span>";
       drawUsageChart(u.series);
       const models = Object.entries(u.by_model).sort((a, b) => b[1].cost_usd - a[1].cost_usd)
@@ -352,6 +366,7 @@ Decision support only — not investment advice.</p>
   async function load() {
     const s = await (await fetch("/api/settings")).json();
     $("deep").value = s.deep_model; $("scan").value = s.scan_model; $("ttl").value = s.verdict_ttl_seconds;
+    $("provider").value = s.llm_provider || "api";
     renderChips("watch", s.watchlist || []); renderChips("cwatch", s.crypto_watchlist || []);
     renderSynced(s.watchlist_synced_at);
     $("keyhint").textContent = s.anthropic_api_key_set
@@ -363,7 +378,7 @@ Decision support only — not investment advice.</p>
   $("f").onsubmit = async (e) => {
     e.preventDefault();
     const body = { deep_model: $("deep").value, scan_model: $("scan").value,
-                   verdict_ttl_seconds: Number($("ttl").value) };
+                   verdict_ttl_seconds: Number($("ttl").value), llm_provider: $("provider").value };
     if ($("key").value) body.anthropic_api_key = $("key").value;
     if ($("fkey").value) body.finnhub_api_key = $("fkey").value;
     const r = await fetch("/api/settings", { method: "POST",
@@ -498,8 +513,12 @@ Decision support only — not investment advice.</p>
 
   async function loadCost() {
     let c; try { c = await (await fetch("/api/cost")).json(); } catch (e) { $("cost-head").textContent = "cost unavailable"; return; }
-    $("cost-head").innerHTML = "Month-to-date <b>" + money(c.month_to_date_usd) + "</b> · projected <b>" +
+    let head = "Billed (API) — MTD <b>" + money(c.month_to_date_usd) + "</b> · projected <b>" +
       money(c.projected_month_usd) + "</b> · all-time <b>" + money(c.all_time_usd) + "</b>";
+    if (c.cli_notional_usd > 0)
+      head += '<br><span class="hint">Subscription (CLI): <b>$0 billed</b> · ' +
+        money(c.cli_notional_usd) + " notional all-time (what it would’ve cost on the API)</span>";
+    $("cost-head").innerHTML = head;
     const kinds = Object.entries(c.by_kind || {}).sort((a, b) => b[1].usd - a[1].usd);
     $("cost-body").innerHTML = kinds.length ? kinds.map(([k, v]) =>
       "<tr><td>" + esc(k) + '</td><td class="num">' + fmt(v.calls) + '</td><td class="num">' +
@@ -561,6 +580,7 @@ async def get_settings() -> dict:
         "finnhub_api_key_set": bool(cfg.get("finnhub_api_key", "")),
         "deep_model": cfg["deep_model"],
         "scan_model": cfg["scan_model"],
+        "llm_provider": cfg.get("llm_provider", "api"),
         "verdict_ttl_seconds": cfg["verdict_ttl_seconds"],
         "watchlist": cfg.get("watchlist", []),
         "crypto_watchlist": cfg.get("crypto_watchlist", []),
@@ -573,6 +593,7 @@ class SettingsPatch(BaseModel):
     finnhub_api_key: str | None = None
     deep_model: str | None = None
     scan_model: str | None = None
+    llm_provider: str | None = None
     verdict_ttl_seconds: int | None = None
     watchlist: str | list[str] | None = None
     crypto_watchlist: str | list[str] | None = None

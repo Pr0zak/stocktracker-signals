@@ -276,11 +276,14 @@ def cost_breakdown(now: float | None = None) -> dict:
     month_prefix = time.strftime("%Y-%m", lt)
 
     by_kind: dict[str, dict] = {}
-    all_time = 0.0
-    mtd = 0.0
+    by_provider: dict[str, dict] = {}
+    billed_all = billed_mtd = 0.0        # real money — API-billed rows only
+    notional_all = notional_mtd = 0.0    # CLI/subscription rows — cost_usd is notional (API-equivalent)
     for r in _iter_jsonl(USAGE_FILE):
         try:
-            kind = r.get("kind") or "?"
+            kind = str(r.get("kind") or "?")
+            # str-coerce: a corrupt row with a non-string kind/provider must skip, never crash the card.
+            provider = str(r.get("provider") or "api")   # rows written before the CLI backend lack this
             cost = float(r.get("cost_usd", 0.0) or 0.0)
             tokens = int(r.get("input_tokens", 0) or 0) + int(r.get("output_tokens", 0) or 0)
             ts = float(r.get("ts", 0) or 0)
@@ -290,14 +293,25 @@ def cost_breakdown(now: float | None = None) -> dict:
         k["calls"] += 1
         k["tokens"] += tokens
         k["usd"] += cost
-        all_time += cost
-        if time.strftime("%Y-%m", time.localtime(ts)) == month_prefix:
-            mtd += cost
+        p = by_provider.setdefault(provider, {"calls": 0, "tokens": 0, "usd": 0.0})
+        p["calls"] += 1
+        p["tokens"] += tokens
+        p["usd"] += cost
+        in_month = time.strftime("%Y-%m", time.localtime(ts)) == month_prefix
+        # Only the API path is real money; CLI rows are subscription-covered (their cost_usd is notional).
+        if provider == "api":
+            billed_all += cost
+            if in_month:
+                billed_mtd += cost
+        else:
+            notional_all += cost
+            if in_month:
+                notional_mtd += cost
 
     day_of_month = lt.tm_mday
     import calendar
     days_in_month = calendar.monthrange(lt.tm_year, lt.tm_mon)[1]
-    projected = (mtd / day_of_month * days_in_month) if day_of_month else mtd
+    projected = (billed_mtd / day_of_month * days_in_month) if day_of_month else billed_mtd
 
     def _avg(kind: str) -> float | None:
         k = by_kind.get(kind)
@@ -306,11 +320,18 @@ def cost_breakdown(now: float | None = None) -> dict:
     return {
         "by_kind": {k: {"calls": v["calls"], "tokens": v["tokens"], "usd": round(v["usd"], 6)}
                     for k, v in sorted(by_kind.items())},
-        "month_to_date_usd": round(mtd, 6),
+        "by_provider": {p: {"calls": v["calls"], "tokens": v["tokens"], "usd": round(v["usd"], 6)}
+                        for p, v in sorted(by_provider.items())},
+        # Headline money figures are REAL spend — API rows only. CLI/subscription usage is reported
+        # separately as notional (what it would have cost on the API), since it bills $0.
+        "billed_usd": round(billed_all, 6),
+        "cli_notional_usd": round(notional_all, 6),
+        "cli_notional_mtd_usd": round(notional_mtd, 6),
+        "month_to_date_usd": round(billed_mtd, 6),
         "projected_month_usd": round(projected, 6),
         "per_scan_avg_usd": _avg("scan"),
         "per_deep_avg_usd": _avg("deep"),
-        "all_time_usd": round(all_time, 6),
+        "all_time_usd": round(billed_all, 6),
     }
 
 

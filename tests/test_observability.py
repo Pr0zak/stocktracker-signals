@@ -225,6 +225,46 @@ def test_cost_breakdown_tolerates_type_malformed_rows(monkeypatch, tmp_path):
     assert c["all_time_usd"] == 0.01
 
 
+def test_cost_breakdown_splits_billed_vs_cli_notional(monkeypatch, tmp_path):
+    now = time.time()
+    lt = time.localtime(now)
+    this_month = time.mktime((lt.tm_year, lt.tm_mon, 1, 12, 0, 0, 0, 0, -1))
+
+    def row(kind, cost, provider):
+        return json.dumps({"ts": this_month, "kind": kind, "cost_usd": cost,
+                           "input_tokens": 10, "output_tokens": 5, "provider": provider})
+
+    usage = tmp_path / "usage.jsonl"
+    usage.write_text("\n".join([
+        row("scan", 0.02, "api"),
+        row("deep", 0.50, "api"),
+        row("scan", 0.03, "cli"),
+        row("scan", 0.04, "cli"),
+    ]) + "\n")
+    monkeypatch.setattr(ob, "USAGE_FILE", usage)
+
+    c = ob.cost_breakdown(now=now)
+    # headline money = real billed (API rows) only
+    assert c["billed_usd"] == 0.52
+    assert c["all_time_usd"] == 0.52
+    assert c["month_to_date_usd"] == 0.52
+    # CLI rows reported separately as notional, never folded into billed
+    assert c["cli_notional_usd"] == 0.07
+    assert c["by_provider"]["api"]["calls"] == 2 and c["by_provider"]["cli"]["calls"] == 2
+
+
+def test_cost_breakdown_tolerates_unhashable_provider(monkeypatch, tmp_path):
+    # A valid-JSON row with a non-string provider must be str-coerced, never 500 the card.
+    usage = tmp_path / "usage.jsonl"
+    usage.write_text(
+        json.dumps({"kind": "scan", "cost_usd": 0.0, "provider": ["x"], "ts": 1_700_000_000}) + "\n"
+        + json.dumps({"kind": "scan", "cost_usd": 0.01, "ts": 1_700_000_000}) + "\n"  # normal api row
+    )
+    monkeypatch.setattr(ob, "USAGE_FILE", usage)
+    c = ob.cost_breakdown()                 # must not raise
+    assert c["all_time_usd"] == 0.01        # the api row's real $; the list-provider row isn't billed
+
+
 # ======================================================================================
 # iv_rank_progress
 # ======================================================================================

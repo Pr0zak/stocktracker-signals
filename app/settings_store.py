@@ -16,7 +16,7 @@ _DATA_DIR = Path(os.environ.get("SIGNALS_DATA_DIR", str(Path(__file__).resolve()
 _FILE = _DATA_DIR / "settings.json"
 _lock = threading.Lock()
 
-_EDITABLE = ("anthropic_api_key", "deep_model", "scan_model", "verdict_ttl_seconds")
+_EDITABLE = ("anthropic_api_key", "deep_model", "scan_model", "verdict_ttl_seconds", "llm_provider")
 
 
 def _split(s: str) -> list[str]:
@@ -29,6 +29,9 @@ def _defaults() -> dict:
         "finnhub_api_key": os.environ.get("FINNHUB_API_KEY", ""),
         "deep_model": os.environ.get("DEEP_MODEL", "claude-opus-4-8"),
         "scan_model": os.environ.get("SCAN_MODEL", "claude-haiku-4-5"),
+        # Which LLM backend the analyst uses: "api" (Anthropic SDK, per-token billing) or "cli"
+        # (headless `claude` CLI on the machine's subscription OAuth — no per-token cost). See llm_cli.
+        "llm_provider": (os.environ.get("LLM_PROVIDER", "api").strip().lower() or "api"),
         "verdict_ttl_seconds": int(os.environ.get("VERDICT_TTL_SECONDS", "14400")),
         "watchlist": _split(os.environ.get("WATCHLIST", "")),
         "crypto_watchlist": _split(os.environ.get("CRYPTO_WATCHLIST", "")),
@@ -67,6 +70,9 @@ def update(patch: dict) -> dict:
         ttl = patch.get("verdict_ttl_seconds")
         if ttl is not None:
             _current["verdict_ttl_seconds"] = max(0, int(ttl))
+        prov = patch.get("llm_provider")
+        if prov is not None and str(prov).strip().lower() in ("api", "cli"):
+            _current["llm_provider"] = str(prov).strip().lower()
         synced = False
         for k in ("watchlist", "crypto_watchlist"):
             v = patch.get(k)
