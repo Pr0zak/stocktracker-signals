@@ -14,15 +14,16 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
-from . import cycle, fundamentals, insider, options, shorts, webull
-from .analyst import analyze, options_note, plan_entry, recommend
+from . import cycle, fundamentals, insider, market_now, options, shorts, webull
+from .analyst import analyze, market_overview, options_note, plan_entry, recommend
 from .discover import discover
 from .market import fetch_series, summarize
 from .news import fetch_context
 from .scan_job import LATEST, run_scan
 
 _http: httpx.AsyncClient | None = None
-_cache: dict[tuple[str, bool], tuple[float, dict]] = {}
+_cache: dict[tuple, tuple[float, dict]] = {}
+_MARKET_NOW_TTL = 180  # market-now overview cached ~3 min so repeated taps don't re-run the model
 _log = logging.getLogger(__name__)
 
 
@@ -847,33 +848,82 @@ async def shorts_endpoint(symbol: str) -> dict:
     return payload
 
 
+async def _movers_side(scr: str, count: int) -> list[dict]:
+    """One side of the market-wide movers (a Yahoo predefined screener). Best-effort → [] on failure."""
+    assert _http is not None
+    from .discover import _raw, _screen  # reuse the screener fetch + raw-field unwrap
+    try:
+        rows = await _screen(_http, scr, count)
+    except Exception as e:  # noqa: BLE001
+        _log.warning("movers %s failed: %s", scr, e)
+        return []
+    out: list[dict] = []
+    for q in rows:
+        sym = q.get("symbol")
+        if not sym:
+            continue
+        out.append({
+            "symbol": sym,
+            "change_percent": round(_raw(q.get("regularMarketChangePercent")), 2),
+            "price": round(_raw(q.get("regularMarketPrice")), 2),
+        })
+    return out[:count]
+
+
 @app.get("/movers")
 async def movers_endpoint(count: int = 6) -> dict:
     """Market-wide top movers on the day — Yahoo's `day_gainers` / `day_losers` predefined screeners.
     Feeds the app's market-close summary when it's set to 'whole market' instead of the watchlist.
     Best-effort: returns empty lists rather than erroring."""
+    return {"gainers": await _movers_side("day_gainers", count), "losers": await _movers_side("day_losers", count)}
+
+
+@app.get("/market_now")
+async def market_now_endpoint(deep: bool = False, count: int = 6) -> dict:
+    """AIE-5 — an instant AI overview of what US markets are doing RIGHT NOW. Composes a live snapshot
+    (session phase, indices, VIX, sector rotation, market-wide + watchlist movers) and has the analyst
+    narrate it. Cached ~3 min so repeated taps don't re-run the model. deep=true uses Opus for a richer
+    read (slower); default is the fast scan model."""
     assert _http is not None
-    from .discover import _raw, _screen  # reuse the screener fetch + raw-field unwrap
+    cfg = settings_store.get()
+    key = ("market_now", deep)
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < _MARKET_NOW_TTL:
+        return {**hit[1], "cached": True}
 
-    async def side(scr: str) -> list[dict]:
-        try:
-            rows = await _screen(_http, scr, count)
-        except Exception as e:  # noqa: BLE001
-            _log.warning("movers %s failed: %s", scr, e)
-            return []
-        out: list[dict] = []
-        for q in rows:
-            sym = q.get("symbol")
-            if not sym:
-                continue
-            out.append({
-                "symbol": sym,
-                "change_percent": round(_raw(q.get("regularMarketChangePercent")), 2),
-                "price": round(_raw(q.get("regularMarketPrice")), 2),
-            })
-        return out[:count]
+    # Crypto trades round the clock; map watchlist crypto to Yahoo's <SYM>-USD so it resolves in the quote.
+    watchlist = list(cfg.get("watchlist") or []) + [f"{c}-USD" for c in (cfg.get("crypto_watchlist") or [])]
+    try:
+        snap = await market_now.build_snapshot(_http, watchlist)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"market snapshot failed: {e}")
+    # Market-wide movers are a bonus — never let them fail the overview.
+    try:
+        snap["market_movers"] = {
+            "gainers": await _movers_side("day_gainers", count),
+            "losers": await _movers_side("day_losers", count),
+        }
+    except Exception as e:  # noqa: BLE001
+        _log.warning("market_now movers failed: %s", e)
 
-    return {"gainers": await side("day_gainers"), "losers": await side("day_losers")}
+    try:
+        overview, usage = await market_overview(snap, deep=deep)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+    usage_store.record(usage, symbol="", kind="market_now")
+
+    payload = {
+        "overview": overview,
+        "snapshot": snap,
+        "session": snap["session"],
+        "model": usage["model"],
+        "as_of": now,
+        "usage": usage,
+        "cached": False,
+    }
+    _cache[key] = (now, payload)
+    return payload
 
 
 @app.get("/calendar")

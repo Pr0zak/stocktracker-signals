@@ -389,3 +389,63 @@ async def options_note(context: dict, *, deep: bool = True) -> tuple[str, dict]:
     if not text:
         raise RuntimeError(f"analyst returned no text (stop_reason={resp.stop_reason})")
     return text, _usage(model, resp.usage)
+
+
+# ======================================================================================
+# AIE-5 — "Market now": a fast plain-language read of what the whole tape is doing right now.
+# Plain text (like options_note), routed through the same provider toggle. Defaults to the cheap
+# scan model so the on-demand button feels instant.
+# ======================================================================================
+
+MARKET_SYSTEM = """You are a market strategist giving one retail investor a fast, plain-language read of \
+what US markets are doing RIGHT NOW. You receive a JSON snapshot: the session phase (PRE / REGULAR / \
+AFTER / CLOSED), the major indices (S&P 500, Nasdaq, Dow, Russell 2000) with % change, the VIX level and \
+its change, the 11 SPDR sector ETFs split into leaders and laggards by % change, market-wide top \
+gainers/losers, and the user's own watchlist movers.
+
+Write a tight, scannable overview — 3 to 5 short bullets, under ~130 words total:
+- Lead with the tape's tone: risk-on / risk-off / mixed, grounded in the indices AND the VIX (a rising \
+VIX is fear; small-caps (Russell) leading or lagging tells you about risk appetite).
+- Name what is LEADING and LAGGING by sector and what it implies (e.g. defensives — staples/utilities — \
+bid while tech lags = a cautious, rotational tape).
+- Call out the 1-2 most notable moves in the user's WATCHLIST specifically, if any stand out.
+- Ground EVERY claim in the numbers provided. Do NOT invent news, catalysts, earnings, or price levels \
+you were not given; if there's no obvious driver in the data, say the move is happening without one in view.
+- If the session is PRE or AFTER, say so and warn the moves are on thin, unreliable volume; if CLOSED, \
+frame it as where things settled, not live action.
+- No preamble, no headers. End with a short 'Not investment advice.'"""
+
+
+async def market_overview(snapshot: dict, *, deep: bool = False) -> tuple[str, dict]:
+    """One plain-language 'what are the markets doing right now' overview (AIE-5). Returns (text, usage).
+    Defaults to the cheap scan model (deep=False) for an instant feel; deep=True uses Opus for a richer
+    synthesis. Mirrors options_note (plain text) and honors the api/cli provider toggle. Raises on
+    API/empty output so the route can turn it into a clean 502."""
+    cfg = settings_store.get()
+    model = cfg["deep_model"] if deep else cfg["scan_model"]
+    thinking_model = any(m in model for m in ("opus-4", "sonnet-5", "fable"))
+    prompt = (
+        "Here is the current market snapshot. Give the 'what's happening right now' overview:\n"
+        + json.dumps(snapshot, indent=2, default=str)
+    )
+    if cfg.get("llm_provider") == "cli":
+        return await llm_cli.text(MARKET_SYSTEM, prompt, model=model, max_tokens=1024, thinking=thinking_model)
+    kwargs: dict = dict(
+        model=model,
+        max_tokens=1024,
+        system=MARKET_SYSTEM,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    if thinking_model:
+        kwargs["thinking"] = {"type": "adaptive"}
+    resp = await _get_client().messages.create(**kwargs)
+    u0 = resp.usage
+    log.info("analyst-market %s in=%s out=%s", model, u0.input_tokens, u0.output_tokens)
+    if resp.stop_reason == "max_tokens":
+        raise RuntimeError(f"market overview hit the 1024-token cap and was truncated (stop_reason={resp.stop_reason})")
+    text = "".join(
+        getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text"
+    ).strip()
+    if not text:
+        raise RuntimeError(f"analyst returned no market text (stop_reason={resp.stop_reason})")
+    return text, _usage(model, resp.usage)
