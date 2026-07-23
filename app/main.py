@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
-from . import cycle, fundamentals, insider, market_now, options, shorts, webull
+from . import congress, cycle, fundamentals, insider, market_now, options, shorts, webull
 from .analyst import analyze, market_overview, options_note, plan_entry, recommend
 from .discover import discover
 from .market import fetch_series, summarize
@@ -744,6 +744,12 @@ async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | No
                 summary["insider"] = ins
         except Exception:  # noqa: BLE001 — enrichment, never a blocker
             pass
+        try:  # congressional / political trades (kadoa dataset) — public-official smart-money, lagging
+            cg = congress.compact(await congress.congress_trades(_http, series.symbol))
+            if cg:
+                summary["congress"] = cg
+        except Exception:  # noqa: BLE001 — enrichment, never a blocker
+            pass
         try:  # quality tags (Finnhub basic-financials) — stance-neutral business descriptors
             q = fundamentals.compact(await fundamentals.fetch_quality(_http, series.symbol))
             if q:
@@ -1033,6 +1039,16 @@ async def insider_endpoint(symbol: str) -> dict:
     if data is None:
         raise HTTPException(status_code=404, detail="no insider data (set a Finnhub key in settings)")
     return {"symbol": symbol.upper(), **data}
+
+
+@app.get("/congress/{symbol}")
+async def congress_endpoint(symbol: str, months: int = 12) -> dict:
+    """Congressional / political trades in a stock over the last `months` — House + Senate + cabinet
+    disclosures (free kadoa dataset). Free, no LLM. Lagging (~45-day STOCK Act filing window). Returns
+    {symbol, congress: {...}|null} — null when nobody disclosed a trade in the name."""
+    assert _http is not None
+    data = await congress.congress_trades(_http, symbol.upper(), months=months)
+    return {"symbol": symbol.upper(), "congress": data}
 
 
 @app.get("/quality/{symbol}")

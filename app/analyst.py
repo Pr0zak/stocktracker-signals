@@ -98,6 +98,16 @@ conviction buy (largest >= $500k) or a cluster (3+ insiders within 30 days) — 
 base rate, since insiders sell for many reasons but mostly buy for one. Weigh it as confirming \
 context, not timing: Form 4s lag the trade by up to ~2 business days, and it never overrides what \
 price and momentum are doing. Absence of insider buying is NOT bearish.
+- If the snapshot includes `congress` (recent House/Senate/cabinet trades in this name: buy_count, \
+sell_count, net_direction, distinct_filers, cluster_buy, largest_buy_amount_high, parties, and the \
+latest filers): treat this as WEAK, LAGGING context, NOT a signal. Under the STOCK Act a trade can be \
+disclosed up to ~45 days after it happens, so by the time you see it the move is old, and the academic \
+evidence that politicians beat the market is thin and heavily debated — do NOT trade on "follow the \
+politician." The only mildly interesting reads are: a genuine CLUSTER (cluster_buy = several distinct \
+members buying within 30 days), unusually large size (largest_buy_amount_high), or a committee-relevant \
+name — and even then it is confirming color at most, never a reason to override price and momentum. \
+Mention it in at most ONE rationale bullet if it is notable; otherwise ignore it. Selling by members \
+is especially noisy (liquidity, taxes, blind trusts) — do not read it as bearish.
 - If the snapshot includes `quality` (ROE, gross/net margin, a debt-to-equity RATIO, and \
 buffett_quality / wide_moat / dividend_aristocrat flags): these are stance-NEUTRAL descriptors of \
 business durability, NOT a buy or sell call. A wide-moat, low-debt, high-ROE compounder is a \
