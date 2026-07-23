@@ -56,6 +56,14 @@ def _child_env(thinking: bool) -> dict:
     (22s→1.5s). Deep (Opus) calls DO think — and Opus errors on a 0 budget — so we clear the var and
     let the model default apply. Mirrors analyst._parse's opus/sonnet/fable thinking predicate."""
     env = {k: v for k, v in os.environ.items() if k not in _AUTH_ENV_STRIP}
+    # CLI subscription token: prefer the one saved via the settings UI, else the CLAUDE_CODE_OAUTH_TOKEN
+    # already in the service env — so the token is editable at runtime without touching .env or restarting.
+    from . import settings_store
+    tok = (settings_store.get().get("cli_oauth_token") or "").strip() or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    if tok:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+    else:
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     if thinking:
         env.pop("MAX_THINKING_TOKENS", None)   # deep tier: let the model think (Opus 401s on a 0 budget)
     else:

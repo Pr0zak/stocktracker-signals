@@ -16,7 +16,8 @@ _DATA_DIR = Path(os.environ.get("SIGNALS_DATA_DIR", str(Path(__file__).resolve()
 _FILE = _DATA_DIR / "settings.json"
 _lock = threading.Lock()
 
-_EDITABLE = ("anthropic_api_key", "deep_model", "scan_model", "verdict_ttl_seconds", "llm_provider")
+_EDITABLE = ("anthropic_api_key", "deep_model", "scan_model", "verdict_ttl_seconds", "llm_provider",
+             "cli_oauth_token")
 
 
 def _split(s: str) -> list[str]:
@@ -32,6 +33,9 @@ def _defaults() -> dict:
         # Which LLM backend the analyst uses: "api" (Anthropic SDK, per-token billing) or "cli"
         # (headless `claude` CLI on the machine's subscription OAuth — no per-token cost). See llm_cli.
         "llm_provider": (os.environ.get("LLM_PROVIDER", "api").strip().lower() or "api"),
+        # CLI subscription token (`claude setup-token`) for cli mode, editable in the UI. Empty here
+        # means "fall back to the CLAUDE_CODE_OAUTH_TOKEN env var"; a UI-set value takes precedence.
+        "cli_oauth_token": "",
         "verdict_ttl_seconds": int(os.environ.get("VERDICT_TTL_SECONDS", "14400")),
         "watchlist": _split(os.environ.get("WATCHLIST", "")),
         "crypto_watchlist": _split(os.environ.get("CRYPTO_WATCHLIST", "")),
@@ -63,7 +67,7 @@ def update(patch: dict) -> dict:
     """Apply a partial update. Empty strings are treated as "leave unchanged" so a blank key field
     in the UI never wipes the stored key."""
     with _lock:
-        for k in ("anthropic_api_key", "finnhub_api_key", "deep_model", "scan_model"):
+        for k in ("anthropic_api_key", "finnhub_api_key", "deep_model", "scan_model", "cli_oauth_token"):
             v = patch.get(k)
             if v is not None and str(v).strip() != "":
                 _current[k] = str(v).strip()

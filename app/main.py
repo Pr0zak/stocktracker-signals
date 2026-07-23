@@ -236,9 +236,11 @@ _PAGE = """<!doctype html>
       <button type="button" class="secondary" id="cli-test">Test CLI auth</button>
       <span class="hint" id="cli-test-status" style="flex:1"></span>
     </div>
-    <div class="hint" style="margin-top:.35rem">Set up on the server: run <code>claude setup-token</code>
-    (subscription login), then put the token in <code>CLAUDE_CODE_OAUTH_TOKEN</code> in the service env
-    — a dedicated token that won't rotate or get logged out.</div>
+    <div class="hint" style="margin-top:.35rem">Set up: run <code>claude setup-token</code> on any machine
+    (subscription login) and paste the token below — a dedicated token that won't rotate or get logged out.
+    Stored server-side and used immediately (no restart, no <code>.env</code> edit).</div>
+    <label for="clitoken">CLI subscription token</label>
+    <input id="clitoken" type="password" autocomplete="off" placeholder="paste to set/replace — leave blank to keep current">
     <label for="key">Anthropic API key</label>
     <input id="key" type="password" autocomplete="off" placeholder="leave blank to keep current">
     <div class="hint" id="keyhint"></div>
@@ -393,11 +395,12 @@ Decision support only — not investment advice.</p>
                    verdict_ttl_seconds: Number($("ttl").value), llm_provider: $("provider").value };
     if ($("key").value) body.anthropic_api_key = $("key").value;
     if ($("fkey").value) body.finnhub_api_key = $("fkey").value;
+    if ($("clitoken").value) body.cli_oauth_token = $("clitoken").value;
     const r = await fetch("/api/settings", { method: "POST",
       headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const st = $("status");
     st.textContent = r.ok ? "Saved ✓" : "Save failed"; st.className = r.ok ? "ok-t" : "err-t";
-    $("key").value = ""; $("fkey").value = ""; load();
+    $("key").value = ""; $("fkey").value = ""; $("clitoken").value = ""; load();
   };
 
   async function checkVersion() {
@@ -592,10 +595,11 @@ async def home() -> str:
 
 
 def _cli_token() -> str:
-    """The headless-CLI subscription token (from `claude setup-token`), set in the service env. Used only
-    to show a masked status on the settings page — the value never leaves the server unredacted."""
+    """The EFFECTIVE headless-CLI subscription token — the one saved via the settings UI, else the
+    CLAUDE_CODE_OAUTH_TOKEN service env var. Used only for the masked settings-page status; the full
+    value never leaves the server (only a last-4 hint does)."""
     import os
-    return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    return (settings_store.get().get("cli_oauth_token") or "").strip() or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
 
 
 @app.get("/api/cli-auth-test")
@@ -633,6 +637,7 @@ class SettingsPatch(BaseModel):
     deep_model: str | None = None
     scan_model: str | None = None
     llm_provider: str | None = None
+    cli_oauth_token: str | None = None
     verdict_ttl_seconds: int | None = None
     watchlist: str | list[str] | None = None
     crypto_watchlist: str | list[str] | None = None

@@ -193,7 +193,27 @@ def test_child_env_excludes_auth_keys(monkeypatch):
     assert e.get("PATH") == "/usr/bin"   # non-auth env still passes through
 
 
+def test_child_env_injects_ui_token_over_env(monkeypatch):
+    # A token saved via the settings UI takes precedence over the CLAUDE_CODE_OAUTH_TOKEN service env.
+    monkeypatch.setattr(settings_store, "get", lambda: {"cli_oauth_token": "sk-ant-oat-ui"})
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-env")
+    assert llm_cli._child_env(thinking=False)["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-ui"
+
+
+def test_child_env_falls_back_to_env_token(monkeypatch):
+    monkeypatch.setattr(settings_store, "get", lambda: {"cli_oauth_token": ""})
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-env")
+    assert llm_cli._child_env(thinking=False)["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-env"
+
+
+def test_child_env_no_token_when_neither_set(monkeypatch):
+    monkeypatch.setattr(settings_store, "get", lambda: {"cli_oauth_token": ""})
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in llm_cli._child_env(thinking=False)
+
+
 def test_child_env_gates_thinking(monkeypatch):
+    monkeypatch.setattr(settings_store, "get", lambda: {"cli_oauth_token": ""})
     monkeypatch.delenv("MAX_THINKING_TOKENS", raising=False)
     # scan tier: thinking disabled (Haiku verdict balloons ~15x with thinking on, for no gain)
     assert llm_cli._child_env(thinking=False).get("MAX_THINKING_TOKENS") == "0"
