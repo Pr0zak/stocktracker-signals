@@ -995,14 +995,21 @@ async def calendar_endpoint(symbol: str | None = None) -> dict:
     if hit and now - hit[0] < 3600:
         return {**hit[1], "cached": True}
     assert _http is not None
-    earnings: dict[str, str] = {}
-    for s in syms:  # Finnhub next-earnings, best-effort (already cached upstream by TTLs)
-        try:
-            ctx = await fetch_context(_http, s)
-            if ctx.get("next_earnings"):
-                earnings[s] = ctx["next_earnings"]
-        except Exception:  # noqa: BLE001
-            continue
+    # Finnhub next-earnings per symbol, fetched CONCURRENTLY (was a sequential await-loop → ~30s for a
+    # full watchlist). A small semaphore caps the burst so we don't trip Finnhub's 60/min rate limit.
+    _earn_sem = asyncio.Semaphore(8)
+
+    async def _next_earnings(s: str) -> tuple[str, str | None]:
+        async with _earn_sem:
+            try:
+                ctx = await fetch_context(_http, s)
+                return s, ctx.get("next_earnings")
+            except Exception:  # noqa: BLE001
+                return s, None
+
+    earnings: dict[str, str] = {
+        s: e for s, e in await asyncio.gather(*[_next_earnings(s) for s in syms]) if e
+    }
     events = await shorts.calendar(_http, syms, earnings) if syms else []
     # Next Bitcoin halving (estimated): on the watchlist-wide view with BTC exposure, and on any
     # BTC-* symbol's own calendar.
