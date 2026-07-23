@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from .analyst import analyze, market_overview, options_note, plan_entry, recommend
+from .analyst import analyze, market_overview, options_note, plan_entry, recommend, review_portfolio
 from .discover import discover
 from .market import fetch_series, summarize
 from .news import fetch_context
@@ -1525,6 +1525,87 @@ class Holding(BaseModel):
     symbol: str
     shares: float
     avg_cost: float
+
+
+class PortfolioReviewRequest(BaseModel):
+    cash: float = 0.0
+    deep: bool = False
+    holdings: list[Holding] = []  # transient — reviewed, never persisted
+
+
+@app.post("/portfolio/review")
+async def portfolio_review_endpoint(req: PortfolioReviewRequest) -> dict:
+    """AI review of the WHOLE portfolio: overall health, concentration/diversification flags, a per-
+    holding action list (trim/hold/add/watch), and a cash-deployment note. One structured LLM call over
+    lightweight technical snapshots of each holding (fast — no per-name enrichment). Cached by the
+    holdings+cash identity for the verdict TTL. Send crypto holdings as <SYM>-USD."""
+    if not req.holdings:
+        raise HTTPException(status_code=422, detail="no holdings to review")
+    assert _http is not None
+    cfg = settings_store.get()
+    key = ("portfolio_review", req.deep, round(req.cash, 2),
+           tuple(sorted((h.symbol.upper(), round(h.shares, 6), round(h.avg_cost, 4)) for h in req.holdings)))
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
+        return {**hit[1], "cached": True}
+
+    try:  # fetch the S&P once for all equity relative-strength calcs
+        bench = (await fetch_series(_http, "^GSPC")).closes
+    except Exception:  # noqa: BLE001 — relative strength just gets skipped
+        bench = None
+
+    _sem = asyncio.Semaphore(6)
+
+    async def _price(h: Holding) -> dict | None:
+        async with _sem:
+            sym = h.symbol.upper()
+            crypto = sym.endswith("-USD")
+            try:
+                series = await fetch_series(_http, sym)
+                summ = summarize(series, None if crypto else bench)
+            except Exception:  # noqa: BLE001 — an unpriceable holding is dropped, not fatal
+                return None
+            price = summ["price"]
+            return {
+                "symbol": sym.removesuffix("-USD"),
+                "shares": h.shares,
+                "avg_cost": h.avg_cost,
+                "price": round(price, 4),
+                "value": round(price * h.shares, 2),
+                "unrealized_gain_pct": round((price / h.avg_cost - 1) * 100, 1) if h.avg_cost else None,
+                "technicals": {k: summ.get(k) for k in (
+                    "rsi14", "macd_hist", "pct_vs_sma50", "golden_cross",
+                    "rel_strength_3mo_vs_benchmark", "pct_off_52w_high") if summ.get(k) is not None},
+            }
+
+    rows = [r for r in await asyncio.gather(*[_price(h) for h in req.holdings]) if r]
+    if not rows:
+        raise HTTPException(status_code=502, detail="couldn't price any holdings")
+    total_value = sum(r["value"] for r in rows) + max(req.cash, 0.0)
+    for r in rows:
+        r["weight_pct"] = round(100.0 * r["value"] / total_value, 1) if total_value else None
+    portfolio = {
+        "cash": round(req.cash, 2),
+        "cash_pct": round(100.0 * max(req.cash, 0.0) / total_value, 1) if total_value else 0.0,
+        "total_value": round(total_value, 2),
+        "positions": sorted(rows, key=lambda r: r["value"], reverse=True),
+    }
+    try:
+        review, usage = await review_portfolio(portfolio, cash=req.cash, deep=req.deep)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+    usage_store.record(usage, symbol="", kind="portfolio")
+    payload = {
+        "review": review.model_dump(),
+        "portfolio": portfolio,
+        "model": usage["model"],
+        "as_of": now,
+        "usage": usage,
+        "cached": False,
+    }
+    _cache[key] = (now, payload)
+    return payload
 
 
 class RecommendRequest(BaseModel):

@@ -449,3 +449,54 @@ async def market_overview(snapshot: dict, *, deep: bool = False) -> tuple[Market
         + json.dumps(snapshot, indent=2, default=str)
     )
     return await _parse(MARKET_SYSTEM, prompt, MarketOverview, deep=deep, max_tokens=1024)
+
+
+# ======================================================================================
+# Portfolio review — a structured, whole-portfolio read: concentration, a per-holding action list,
+# and cash deployment. One structured call over lightweight technical snapshots of each holding.
+# ======================================================================================
+
+class PortfolioAction(BaseModel):
+    symbol: str
+    action: str          # "trim" | "hold" | "add" | "watch"
+    reason: str          # one short sentence, grounded in the numbers
+
+
+class PortfolioReview(BaseModel):
+    health: str                    # one-line overall read of the book
+    concentration: list[str]       # concentration / diversification flags (empty if well-diversified)
+    actions: list[PortfolioAction]  # one entry per holding
+    cash_note: str                 # what to do with idle cash
+
+
+PORTFOLIO_SYSTEM = """You are a disciplined portfolio strategist reviewing one retail investor's WHOLE \
+stock/crypto portfolio. You receive: cash + cash_pct, total_value, and a `positions` list where each \
+holding has its weight_pct, unrealized_gain_pct, price, and key technicals (RSI, MACD histogram, % vs \
+the 50-day MA, golden-cross flag, 3-month relative strength vs the S&P, and % off its 52-week high).
+
+Return a structured review:
+- health: ONE sentence on the book's overall posture (diversified vs concentrated, momentum tilt, cash level).
+- concentration: flag genuine risks — any single position over ~20-25% of the book, several holdings that \
+are clearly the same theme/sector (judge from the tickers you know), or a very low cash buffer. Empty list \
+if it's reasonably balanced. Be specific ("NVDA is 34% of the book"). Do NOT invent sectors you can't infer.
+- actions: EXACTLY ONE entry per holding, action ∈ trim | hold | add | watch, with a one-sentence reason \
+grounded in ITS numbers: trim a large, well-in-profit, extended winner (protect gains / rebalance); add to \
+an underweight name with a genuinely strong setup; hold when there's no edge; watch when it's weakening but \
+not yet actionable. NEVER advise averaging down just because a position is red.
+- cash_note: what to do with the idle cash (deploy into the best-setup adds, keep dry powder if nothing's \
+compelling, etc.), consistent with your actions.
+
+Ground everything in the numbers. You do NOT know their total net worth, tax situation, or holdings outside \
+this list — judge concentration only within this book and say so if it matters. This is decision support, \
+not investment advice."""
+
+
+async def review_portfolio(portfolio: dict, *, cash: float, deep: bool = False) -> tuple[PortfolioReview, dict]:
+    """Structured whole-portfolio review: health, concentration flags, a per-holding action list, and a
+    cash note. Honors the api/cli provider toggle via the shared structured _parse()."""
+    prompt = (
+        "Review this portfolio. Each position carries its weight, unrealized gain, and key technicals.\n"
+        + json.dumps(portfolio, indent=2, default=str)
+        + "\n\nReturn your structured portfolio review (exactly one action per holding)."
+    )
+    return await _parse(PORTFOLIO_SYSTEM, prompt, PortfolioReview, deep=deep, max_tokens=4096)
