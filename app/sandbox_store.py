@@ -46,6 +46,20 @@ DEFAULT_SETTINGS = {
     "max_trades_per_tick": 4,
     "max_new_positions_per_tick": 2,
     "min_conviction_to_trade": 55,     # 0-100 floor for a buy
+    # Goals & horizon
+    "goal_amount": None,               # target $ the AI should push toward (None = no explicit goal)
+    "goal_date": None,                 # ISO date by which to hit the goal
+    # Funds automation
+    "monthly_deposit": 0.0,            # auto-add this much fictional cash each new month (0 = off)
+    # Universe
+    "exclusions": [],                  # tickers the AI must never buy (uppercase, e.g. ["TSLA"])
+    # Automation
+    "cadence": "daily",                # "daily" | "weekly" — how often it DECIDES (NAV still marks daily)
+    # Churn control: cap the % of equity that may CHANGE HANDS in one decision (buys+sells notional).
+    # 0 = unlimited. Lower = calmer, buy-and-hold-ish; higher = lets it reposition aggressively.
+    "max_turnover_pct": 25.0,
+    # App-side preference, stored here so it rides with the account: push a notification per trade.
+    "notify_on_trade": True,
 }
 
 
@@ -60,6 +74,8 @@ def _defaults() -> dict:
         "benchmark": {"symbol": "^GSPC", "shares": 0.0, "cost_basis": 0.0},
         "settings": dict(DEFAULT_SETTINGS),
         "last_tick_date": None,           # ET yyyy-mm-dd — idempotency cursor
+        "last_decision_date": None,       # ET yyyy-mm-dd of the last DECISION (drives weekly cadence)
+        "last_deposit_month": None,       # "yyyy-mm" of the last recurring deposit
         "last_weekly_review_date": None,
         "last_strategy_note": None,
     }

@@ -2140,6 +2140,40 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
 
         settings = blob["settings"]
         cfg = settings_store.get()
+
+        # Recurring monthly deposit (DCA) — added once per ET calendar month, BEFORE the decision so the
+        # AI can deploy it; the benchmark shadow gets the same cash on the same day.
+        dep = float(settings.get("monthly_deposit") or 0.0)
+        month = now.strftime("%Y-%m")
+        if dep > 0 and blob.get("last_deposit_month") != month:
+            try:
+                dspy = (await market_now.fetch_quotes(_http, ["^GSPC"])).get("^GSPC", {}).get("price")
+            except Exception:  # noqa: BLE001
+                dspy = None
+            if dspy:
+                blob["benchmark"]["shares"] = round(blob["benchmark"]["shares"] + dep / dspy, 6)
+                blob["benchmark"]["cost_basis"] = round(blob["benchmark"]["cost_basis"] + dep, 2)
+            blob["cash"] = round(blob["cash"] + dep, 2)
+            blob["funded_total"] = round(blob["funded_total"] + dep, 2)
+            blob["last_deposit_month"] = month
+            sandbox_store.append_trade({
+                "ts": time.time(), "date": sandbox_job.today_et_str(now), "symbol": "CASH",
+                "side": "deposit", "status": "filled", "shares": 0.0, "price": None,
+                "gross": round(dep, 2), "cash_after": blob["cash"], "source": "recurring",
+                "reason": f"Recurring monthly deposit ${dep:,.0f}"})
+
+        # Cadence: "weekly" decides at most every 7 days (NAV still marks daily); "daily" always decides.
+        from datetime import date as _date
+        decide = True
+        if (settings.get("cadence") or "daily").lower() == "weekly":
+            ld = blob.get("last_decision_date")
+            if ld:
+                try:
+                    decide = (now.date() - _date.fromisoformat(ld)).days >= 7
+                except ValueError:
+                    decide = True
+        exclude = {s.upper() for s in (settings.get("exclusions") or [])}
+
         held = [p["symbol"].upper() for p in blob["positions"]]
         watch = [s.upper() for s in (cfg.get("watchlist") or [])]
         cwatch = [f"{c.upper()}-USD" for c in (cfg.get("crypto_watchlist") or [])]
@@ -2154,6 +2188,9 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 candidate_syms.append(s)
         if not settings.get("allow_crypto", True):
             candidate_syms = [s for s in candidate_syms if not s.endswith("-USD")]
+        if exclude:  # never even show the AI an excluded ticker
+            candidate_syms = [s for s in candidate_syms
+                              if s.upper() not in exclude and s.upper().removesuffix("-USD") not in exclude]
         candidate_syms = candidate_syms[:24]
 
         prices = await _sandbox_prices(held, candidate_syms)
@@ -2169,7 +2206,11 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         if flat is not None:
             orders, source = flat, "exit_date"
             posture = "Exit date reached — flattening to cash."
+        elif not decide:
+            orders, source = [], "haiku_tick"
+            posture = "Weekly cadence — holding until the next scheduled decision."
         else:
+            blob["last_decision_date"] = sandbox_job.today_et_str(now)
             holdings = [Holding(symbol=p["symbol"], shares=p["shares"], avg_cost=p["avg_cost"])
                         for p in blob["positions"]]
             if holdings:
@@ -2201,7 +2242,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
 
         try:
             new_blob, filled, skipped = sandbox_job.validate_and_fill(
-                blob, orders, price_of, group_of=_exposure_group, source=source)
+                blob, orders, price_of, group_of=_exposure_group, source=source, exclude=exclude)
         except AssertionError as e:
             _log.error("sandbox tick ABORTED (cash not conserved): %s", e)
             raise HTTPException(status_code=500, detail=f"sandbox tick aborted (cash not conserved): {e}")
@@ -2237,10 +2278,17 @@ class SandboxSettingsPatch(BaseModel):
     risk_tolerance: str | None = None
     retirement_date: str | None = None
     exit_date: str | None = None
+    goal_amount: float | None = None
+    goal_date: str | None = None
+    monthly_deposit: float | None = None
     max_position_pct: float | None = None
     cash_floor_pct: float | None = None
     allow_crypto: bool | None = None
     allow_etf: bool | None = None
+    exclusions: list[str] | None = None
+    cadence: str | None = None
+    max_turnover_pct: float | None = None
+    notify_on_trade: bool | None = None
     max_trades_per_tick: int | None = None
     max_new_positions_per_tick: int | None = None
     min_conviction_to_trade: int | None = None
@@ -2319,9 +2367,22 @@ async def sandbox_set_settings_endpoint(patch: SandboxSettingsPatch) -> dict:
         for k in ("master_enabled", "allow_crypto", "allow_etf"):
             if k in d:
                 s[k] = bool(d[k])
-        for k in ("retirement_date", "exit_date"):
+        for k in ("retirement_date", "exit_date", "goal_date"):
             if k in d:
                 s[k] = d[k] or None
+        if "goal_amount" in d:
+            v = float(d["goal_amount"])
+            s["goal_amount"] = v if v > 0 else None
+        if "monthly_deposit" in d:
+            s["monthly_deposit"] = max(0.0, float(d["monthly_deposit"]))
+        if "cadence" in d and str(d["cadence"]).lower() in ("daily", "weekly"):
+            s["cadence"] = str(d["cadence"]).lower()
+        if "max_turnover_pct" in d:
+            s["max_turnover_pct"] = max(0.0, min(100.0, float(d["max_turnover_pct"])))
+        if "notify_on_trade" in d:
+            s["notify_on_trade"] = bool(d["notify_on_trade"])
+        if "exclusions" in d:
+            s["exclusions"] = sorted({str(x).strip().upper() for x in (d["exclusions"] or []) if str(x).strip()})
         if "max_position_pct" in d:
             s["max_position_pct"] = max(5.0, min(100.0, float(d["max_position_pct"])))
         if "cash_floor_pct" in d:

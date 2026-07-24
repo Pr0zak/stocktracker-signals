@@ -107,6 +107,7 @@ def validate_and_fill(
     group_of: Callable[[str], str],
     now_ts: float | None = None,
     source: str = "haiku_tick",
+    exclude: set[str] | None = None,
 ) -> tuple[dict, list[dict], list[dict]]:
     """Apply an analyst order list to the ledger under hard risk limits. Returns (new_blob, filled_rows,
     skipped_rows). Sells run before buys (free cash / cut exposure first). The blob is copied, not mutated
@@ -126,6 +127,12 @@ def validate_and_fill(
     max_new = int(s.get("max_new_positions_per_tick", 2))
     allow_crypto = bool(s.get("allow_crypto", True))
     allow_etf = bool(s.get("allow_etf", True))  # ETF filtering is best-effort (source-tagged upstream)
+    # Churn control: the max notional (buys+sells) allowed to change hands this tick, as a % of the
+    # starting equity. 0 disables the cap. Computed off the pre-trade book so it's a stable budget.
+    turnover_pct = float(s.get("max_turnover_pct", 0.0) or 0.0)
+    start_equity = cash0 + positions_value(positions, price_of)
+    turnover_budget = (turnover_pct / 100.0 * start_equity) if turnover_pct > 0 else float("inf")
+    traded_notional = 0.0
 
     filled: list[dict] = []
     skipped: list[dict] = []
@@ -164,11 +171,16 @@ def validate_and_fill(
         pos = _find(positions, sym)
         if not pos or pos["shares"] <= 0:
             _skip(o, "not held"); continue
+        room = turnover_budget - traded_notional
+        if room <= 0:
+            _skip(o, f"turnover cap ({turnover_pct:.0f}% of equity) reached"); continue
         want = float(o.get("shares") or 0) or (float(o.get("dollars") or 0) / px)
+        want = min(want, room / px)   # clamp the trade to the remaining churn budget
         shares = round_shares(sym, min(want, pos["shares"]))
         if shares <= 0:
-            _skip(o, "nothing to sell"); continue
+            _skip(o, "nothing to sell (or turnover cap left no room)"); continue
         fill = px * (1 - slip)
+        traded_notional += shares * fill
         proceeds = shares * fill
         realized = shares * (fill - pos["avg_cost"])
         cash += proceeds
@@ -195,6 +207,8 @@ def validate_and_fill(
         if len(filled) >= max_trades:
             _skip(o, "max_trades_per_tick reached"); continue
         sym = o["symbol"].upper()
+        if exclude and (sym in exclude or sym.removesuffix("-USD") in exclude):
+            _skip(o, "excluded ticker"); continue
         if is_crypto(sym) and not allow_crypto:
             _skip(o, "crypto disabled"); continue
         if int(o.get("conviction") or 0) < min_conv:
@@ -212,12 +226,16 @@ def validate_and_fill(
         is_new = _find(positions, sym) is None
         if is_new and new_positions >= max_new:
             _skip(o, "max_new_positions_per_tick reached"); continue
-        spend = min(float(o.get("dollars") or 0) or available, available, cap_room)
+        room = turnover_budget - traded_notional
+        if room <= 0:
+            _skip(o, f"turnover cap ({turnover_pct:.0f}% of equity) reached"); continue
+        spend = min(float(o.get("dollars") or 0) or available, available, cap_room, room)
         fill = px * (1 + slip)
         shares = round_shares(sym, spend / fill)
         if shares <= 0:
-            _skip(o, "cash/cap left no whole share"); continue
+            _skip(o, "cash/cap/turnover left no whole share"); continue
         cost = shares * fill
+        traded_notional += cost
         cash -= cost
         buy_notional += cost
         group_value[g] = group_value.get(g, 0.0) + cost

@@ -775,8 +775,10 @@ whose thesis is breaking (relative-strength rolling over, below the 50-day, mome
 Bias by `risk_tolerance` (conservative = more cash, defensives, broad diversification, smaller positions; \
 aggressive = more concentrated, higher-beta, fully invested) and by the GLIDEPATH: as `retirement_date` \
 or `exit_date` approaches, shift progressively toward cash/defensives; if past/at `exit_date`, sell \
-everything to cash. Respect allow_crypto / allow_etf. Ground EVERY order in the numbers — never invent \
-news or prices. Plain reasons, no markdown."""
+everything to cash. If `goal_amount`/`goal_date` are set, weigh the pace needed to reach that target by \
+that date against current equity — behind pace with little time justifies leaning more aggressive; well \
+ahead lets you de-risk. Respect allow_crypto / allow_etf. Ground EVERY order in the numbers — never \
+invent news or prices. Plain reasons, no markdown."""
 
 
 async def sandbox_decision(
@@ -836,8 +838,9 @@ strength you see.
 - notes: one short paragraph tying it together.
 
 Bias by `risk_tolerance` and the GLIDEPATH toward `retirement_date`/`exit_date` (raise cash + defense as \
-they near). Ground everything in the numbers and the regime — no invented catalysts. Plain text, no \
-markdown."""
+they near); if `goal_amount`/`goal_date` are set, set the stance's aggressiveness by the pace needed to \
+reach the goal in time. Ground everything in the numbers and the regime — no invented catalysts. Plain \
+text, no markdown."""
 
 
 async def strategy_review(context: dict, *, settings: dict, deep: bool = True) -> tuple[StrategyNote, dict]:
