@@ -281,12 +281,28 @@ def _render(summary: dict) -> str:
     )
 
 
+def _is_thinking_model(model: str) -> bool:
+    """Whether this model should run with extended thinking.
+
+    Deliberately a DENY-list: everything reasons except the cheap scan tier (Haiku), which was measured
+    to gain nothing from thinking. An allow-list of model names silently regresses on every new model
+    release — `claude-opus-5` matched none of the previous ("opus-4", "sonnet-5", "fable") entries, which
+    would have run the frontier model with thinking off and, on the cli path, with MAX_THINKING_TOKENS=0
+    (a setting Opus rejects outright)."""
+    return "haiku" not in (model or "").lower()
+
+
 async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tokens: int = 4096):
     """One structured-output Claude call on the configured scan/deep model. Returns (parsed, usage)."""
     cfg = settings_store.get()
     model = cfg["deep_model"] if deep else cfg["scan_model"]
-    # Adaptive thinking is a deep-tier (Opus/Sonnet/Fable) feature; the cheap scan model runs without it.
-    thinking_model = any(m in model for m in ("opus-4", "sonnet-5", "fable"))
+    # Adaptive thinking is for the reasoning tier. Gate by EXCLUDING the deliberate no-thinking scan
+    # model rather than allow-listing model names: an allow-list silently drops thinking the moment a
+    # new frontier model ships (e.g. "claude-opus-5" matched none of the old opus-4/sonnet-5/fable
+    # entries), and on the cli path that also sets MAX_THINKING_TOKENS=0, which Opus errors on.
+    # Haiku is excluded on measurement: thinking ballooned a ~360-token verdict to 2-9k (22s -> 1.5s
+    # once disabled) with no quality gain.
+    thinking_model = _is_thinking_model(model)
     # Provider toggle: "cli" shells out to the headless claude CLI (subscription OAuth, no per-token
     # billing); the default "api" path below uses the Anthropic SDK's schema-constrained parse().
     if cfg.get("llm_provider") == "cli":
@@ -391,7 +407,7 @@ async def options_note(context: dict, *, deep: bool = True) -> tuple[str, dict]:
     route can swallow it and leave `analyst` null (never a 500)."""
     cfg = settings_store.get()
     model = cfg["deep_model"] if deep else cfg["scan_model"]
-    thinking_model = any(m in model for m in ("opus-4", "sonnet-5", "fable"))
+    thinking_model = _is_thinking_model(model)
     prompt = (
         "Explain this suggested options trade to a beginner:\n"
         + json.dumps(context, indent=2, default=str)
