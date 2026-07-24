@@ -131,7 +131,8 @@ def validate_and_fill(
     min_conv = int(s.get("min_conviction_to_trade", 55))
     max_trades = int(s.get("max_trades_per_tick", 4))
     max_new = int(s.get("max_new_positions_per_tick", 2))
-    allow_crypto = bool(s.get("allow_crypto", True))
+    allow_crypto = bool(s.get("allow_crypto", False))          # direct spot (BTC-USD)
+    allow_crypto_etf = bool(s.get("allow_crypto_etf", True))   # spot-crypto ETFs (IBIT/FBTC/FETH)
     allow_etf = bool(s.get("allow_etf", True))  # ETF filtering is best-effort (source-tagged upstream)
     # Churn control: the max notional (buys+sells) allowed to change hands this tick, as a % of the
     # starting equity. 0 disables the cap. Computed off the pre-trade book so it's a stable budget.
@@ -216,7 +217,10 @@ def validate_and_fill(
         if exclude and (sym in exclude or sym.removesuffix("-USD") in exclude):
             _skip(o, "excluded ticker"); continue
         if is_crypto(sym) and not allow_crypto:
-            _skip(o, "crypto disabled"); continue
+            _skip(o, "direct spot crypto disabled (use the ETF)"); continue
+        # A non "-USD" symbol whose exposure group is BTC/ETH is a spot-crypto ETF (IBIT/FBTC/FETH…).
+        if not is_crypto(sym) and group_of(sym) in ("BTC", "ETH") and not allow_crypto_etf:
+            _skip(o, "crypto ETFs disabled"); continue
         if int(o.get("conviction") or 0) < min_conv:
             _skip(o, f"below conviction floor ({min_conv})"); continue
         px = price_of(sym)

@@ -2186,8 +2186,11 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         for s in watch + cwatch + discovered:
             if s not in candidate_syms and s not in held:
                 candidate_syms.append(s)
-        if not settings.get("allow_crypto", True):
+        if not settings.get("allow_crypto", False):      # direct spot crypto (BTC-USD)
             candidate_syms = [s for s in candidate_syms if not s.endswith("-USD")]
+        if not settings.get("allow_crypto_etf", True):  # spot-crypto ETFs (IBIT/FBTC/FETH…)
+            candidate_syms = [s for s in candidate_syms
+                              if s.endswith("-USD") or _exposure_group(s) not in ("BTC", "ETH")]
         if exclude:  # never even show the AI an excluded ticker
             candidate_syms = [s for s in candidate_syms
                               if s.upper() not in exclude and s.upper().removesuffix("-USD") not in exclude]
@@ -2284,6 +2287,7 @@ class SandboxSettingsPatch(BaseModel):
     max_position_pct: float | None = None
     cash_floor_pct: float | None = None
     allow_crypto: bool | None = None
+    allow_crypto_etf: bool | None = None
     allow_etf: bool | None = None
     exclusions: list[str] | None = None
     cadence: str | None = None
@@ -2365,7 +2369,7 @@ async def sandbox_set_settings_endpoint(patch: SandboxSettingsPatch) -> dict:
         d = patch.model_dump(exclude_none=True)
         if d.get("risk_tolerance") in ("conservative", "balanced", "aggressive"):
             s["risk_tolerance"] = d["risk_tolerance"]
-        for k in ("master_enabled", "allow_crypto", "allow_etf", "allow_after_hours"):
+        for k in ("master_enabled", "allow_crypto", "allow_crypto_etf", "allow_etf", "allow_after_hours"):
             if k in d:
                 s[k] = bool(d[k])
         for k in ("retirement_date", "exit_date", "goal_date"):

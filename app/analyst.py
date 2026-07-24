@@ -757,7 +757,10 @@ target weights) you should steer toward (may be null early on).
 
 Positions/candidates that share an `exposure_group` are the SAME economic exposure (e.g. BTC and a \
 spot-bitcoin ETF like FBTC/IBIT are both bitcoin; SPY/VOO are the S&P). Judge weight and caps on the \
-COMBINED exposure, act on ONE vehicle per group, and NEVER sell one to buy its equivalent.
+COMBINED exposure, act on ONE vehicle per group, and NEVER sell one to buy its equivalent. When a group \
+offers BOTH a spot-crypto ETF (IBIT/FBTC/FETH) and direct spot crypto (a "-USD" symbol), PREFER THE ETF \
+— direct spot carries wider spreads, trading fees and custody friction for the same exposure. Only use \
+direct spot if the ETF isn't in the candidate list.
 
 Return a `SandboxDecision`:
 - posture: ONE sentence — what today's plan does and why (e.g. "Trim extended NVDA, start a half-position \

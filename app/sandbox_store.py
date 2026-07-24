@@ -40,7 +40,11 @@ DEFAULT_SETTINGS = {
     "exit_date": None,                 # ISO yyyy-mm-dd; flatten to cash by this date
     "max_position_pct": 20.0,          # cap per EXPOSURE GROUP (BTC+FBTC count as one)
     "cash_floor_pct": 10.0,            # never deploy below this % of equity
-    "allow_crypto": True,
+    # Crypto exposure is split in two because the vehicles differ in cost: a spot-crypto ETF
+    # (IBIT/FBTC/FETH) trades like any equity inside a brokerage, while DIRECT spot (BTC-USD) usually
+    # carries higher trading spreads/fees and custody friction. So ETFs are on, direct spot is off.
+    "allow_crypto": False,       # direct spot crypto (BTC-USD, ETH-USD)
+    "allow_crypto_etf": True,    # spot-crypto ETFs (IBIT, FBTC, FETH, …)
     "allow_etf": True,
     "slippage_bps": 5,                 # modeled fill slippage (buys up, sells down)
     "max_trades_per_tick": 4,
