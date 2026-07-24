@@ -883,7 +883,11 @@ Return a `StrategyNote` — the north star for the coming week:
 - cash_target_pct: how much of equity to hold in cash this week (higher when defensive / near a horizon \
 date / high volatility).
 - targets: a handful of `exposure_group` → target_pct weights that express the plan (they need not sum \
-to 100 with cash; keep each under a sensible single-name cap). Group equivalent vehicles (BTC≡FBTC).
+to 100 with cash). EVERY target MUST be <= `settings.max_position_pct`, and the cash target should be \
+>= `settings.cash_floor_pct` — the execution model enforces both as HARD limits per exposure group, so a \
+target above the cap is simply unreachable and makes the daily tick fire blocked orders forever. If you \
+want more breadth than the cap allows in one vehicle, split across distinct exposure groups instead of \
+overweighting one. Group equivalent vehicles (BTC≡FBTC).
 - themes: 2-4 short things to lean into (sectors/factors), grounded in the sector rotation + relative \
 strength you see.
 - avoid: 1-3 short things to steer clear of.
