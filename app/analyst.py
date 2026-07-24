@@ -508,6 +508,46 @@ async def daily_brief(snapshot: dict, *, deep: bool = False) -> tuple[DailyBrief
 
 
 # ======================================================================================
+# Market regime (Theme D) — a structural read of what KIND of market this is (trend + volatility),
+# beyond market_now's "right this second" snapshot, with a positioning implication.
+# ======================================================================================
+
+class MarketRegime(BaseModel):
+    label: str        # short 2-4 word regime label, e.g. "Risk-on uptrend"
+    trend: str        # "up" | "down" | "sideways"
+    volatility: str   # "calm" | "normal" | "elevated" | "stressed"
+    note: str         # 1-2 sentences: what it means for positioning
+
+
+REGIME_SYSTEM = """You classify the current US market REGIME — the structural backdrop, not the intraday \
+tape. You receive a JSON snapshot: session phase, the major indices (S&P 500, Nasdaq, Dow, Russell 2000) \
+with today's % change, the VIX level, the SPDR sectors split into leaders/laggards, the user's watchlist \
+movers, and `spy_trend` — the S&P 500's structural trend: % vs its 50-day and 200-day moving averages, \
+whether it's above the 200-day, RSI, and MACD histogram.
+
+Return a structured regime read:
+- label: a SHORT 2-4 word regime name (e.g. "Risk-on uptrend", "Choppy range", "Risk-off pullback", \
+"High-volatility stress", "Grinding recovery").
+- trend: exactly one of "up", "down", or "sideways" — grounded in the S&P vs its 50/200-day and whether \
+the four indices confirm each other (small-caps leading = broad risk appetite; only mega-cap up = narrow).
+- volatility: exactly one of "calm" (VIX <15), "normal" (15-20), "elevated" (20-30), or "stressed" (>30).
+- note: 1-2 SHORT sentences on what this regime means for positioning — e.g. "Trend intact above both \
+MAs; pullbacks toward the 50-day have been buyable" or "Below the 200-day with a rising VIX argues for \
+smaller size and defense". Base it on structure (MAs, VIX, breadth), NEVER a price prediction.
+Ground every field in the numbers. Plain text, no markdown, no disclaimer line (the app adds one)."""
+
+
+async def market_regime(snapshot: dict, *, deep: bool = False) -> tuple[MarketRegime, dict]:
+    """Structural market-regime classification (Theme D): trend + volatility + a positioning note, from
+    the market snapshot plus the S&P's 50/200-day trend. Honors the api/cli provider toggle via _parse()."""
+    prompt = (
+        "Here is the market snapshot with the S&P's structural trend. Classify the current regime:\n"
+        + json.dumps(snapshot, indent=2, default=str)
+    )
+    return await _parse(REGIME_SYSTEM, prompt, MarketRegime, deep=deep, max_tokens=512)
+
+
+# ======================================================================================
 # News → move correlation (AIE-4) — line the stock's notable recent daily moves up against dated
 # headlines and judge which move was news-driven and which happened on flows/technicals alone.
 # ======================================================================================

@@ -19,6 +19,7 @@ from .analyst import (
     analyze,
     daily_brief,
     market_overview,
+    market_regime,
     news_moves,
     options_note,
     plan_entry,
@@ -988,6 +989,64 @@ async def market_now_endpoint(deep: bool = False, count: int = 6) -> dict:
         "overview": overview_str,
         "overview_struct": ov.model_dump(),
         "snapshot": snap,
+        "session": snap["session"],
+        "model": usage["model"],
+        "as_of": now,
+        "usage": usage,
+        "cached": False,
+    }
+    _cache[key] = (now, payload)
+    return payload
+
+
+@app.get("/regime")
+async def regime_endpoint(deep: bool = False, count: int = 6) -> dict:
+    """Theme D — the current market REGIME (structural backdrop, not the intraday tape): a short label,
+    trend (up/down/sideways), volatility bucket, and a positioning note. Composes the market_now snapshot
+    plus the S&P's 50/200-day structural trend and has the analyst classify it. Cached ~30 min."""
+    assert _http is not None
+    cfg = settings_store.get()
+    key = ("regime", deep)
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < _DAILY_BRIEF_TTL:
+        return {**hit[1], "cached": True}
+
+    watchlist = list(cfg.get("watchlist") or []) + [f"{c}-USD" for c in (cfg.get("crypto_watchlist") or [])]
+    try:
+        snap = await market_now.build_snapshot(_http, watchlist)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"market snapshot failed: {e}")
+
+    # The S&P's structural trend — what makes this a "regime" read rather than a snapshot. 200-day SMA is
+    # computed here (summarize only carries the 50-day).
+    try:
+        spy = await fetch_series(_http, "^GSPC")
+        ssum = summarize(spy, None)
+        closes = spy.closes
+        sma200 = sum(closes[-200:]) / len(closes[-200:]) if len(closes) >= 200 else None
+        price = ssum["price"]
+        snap["spy_trend"] = {
+            "price": round(price, 2),
+            "pct_vs_sma50": ssum.get("pct_vs_sma50"),
+            "pct_vs_sma200": round((price / sma200 - 1) * 100, 2) if sma200 else None,
+            "above_200d": (price > sma200) if sma200 else None,
+            "rsi14": ssum.get("rsi14"),
+            "macd_hist": ssum.get("macd_hist"),
+            "golden_cross": ssum.get("golden_cross"),
+        }
+    except Exception as e:  # noqa: BLE001 — the snapshot alone still yields a usable regime read
+        _log.warning("regime spy_trend failed: %s", e)
+
+    try:
+        reg, usage = await market_regime(snap, deep=deep)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+    usage_store.record(usage, symbol="", kind="regime")
+
+    payload = {
+        "regime": reg.model_dump(),
+        "spy_trend": snap.get("spy_trend"),
         "session": snap["session"],
         "model": usage["model"],
         "as_of": now,
