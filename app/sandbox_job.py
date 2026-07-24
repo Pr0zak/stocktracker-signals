@@ -135,6 +135,15 @@ def validate_and_fill(
     allow_crypto_etf = bool(s.get("allow_crypto_etf", True))   # spot-crypto ETFs (IBIT/FBTC/FETH)
     allow_etf = bool(s.get("allow_etf", True))  # ETF filtering is best-effort (source-tagged upstream)
     respect_zones = bool(s.get("respect_entry_zones", True))
+    # Brokerage realism. CASH accounts settle T+1 (US moved from T+2 on 2024-05-28), so proceeds from
+    # today's sales cannot fund today's buys — reusing them is a good-faith violation that a real broker
+    # would block. MARGIN accounts may reuse proceeds immediately but are subject to FINRA's pattern-day
+    # -trader rule under $25k equity. (The once-a-day cadence means a same-day round trip is structurally
+    # impossible, so PDT is currently moot — the guard exists so a faster cadence stays compliant.)
+    account_type = str(s.get("account_type", "cash")).lower()
+    is_cash_account = account_type != "margin"
+    avoid_wash = bool(s.get("avoid_wash_sales", True))
+    recent_loss_sales: dict[str, float] = {k.upper(): v for k, v in (blob.get("recent_loss_sales") or {}).items()}
     # Churn control: the max notional (buys+sells) allowed to change hands this tick, as a % of the
     # starting equity. 0 disables the cap. Computed off the pre-trade book so it's a stable budget.
     turnover_pct = float(s.get("max_turnover_pct", 0.0) or 0.0)
@@ -197,6 +206,8 @@ def validate_and_fill(
         sell_notional += proceeds
         pos["shares"] = round(pos["shares"] - shares, 8)
         b["realized_pl_total"] = round(float(b.get("realized_pl_total", 0.0)) + realized, 2)
+        if realized < 0:              # a loss sale starts the 30-day wash-sale clock for this name
+            recent_loss_sales[sym] = now_ts
         _fill(o, "sell", shares, fill, realized, cash, pos)
         if pos["shares"] <= 1e-9:
             positions.remove(pos)
@@ -206,6 +217,8 @@ def validate_and_fill(
     pv_after_sells = positions_value(positions, price_of)
     equity = round(cash + pv_after_sells, 2)
     floor = cash_floor_pct / 100.0 * equity
+    # T+1: in a cash account today's sale proceeds are UNSETTLED and can't fund today's buys.
+    buying_power = cash - sell_notional if is_cash_account else cash
     group_value: dict[str, float] = {}
     for p in positions:
         px = price_of(p["symbol"])
@@ -240,9 +253,16 @@ def validate_and_fill(
                 hi = None
             if hi and hi > 0 and px > hi:
                 _skip(o, f"price {px:.2f} above entry zone (≤{hi:.2f}) — waiting"); continue
-        available = cash - floor
+        # Wash-sale guard (IRS §1091): rebuying a name sold at a LOSS within 30 days disallows the loss.
+        if avoid_wash and sym in recent_loss_sales:
+            days = (now_ts - float(recent_loss_sales[sym])) / 86_400.0
+            if days < 30:
+                _skip(o, f"wash-sale window ({30 - int(days)}d left since the loss sale)"); continue
+        available = min(cash, buying_power) - floor
         if available <= 0:
-            _skip(o, "at cash floor"); continue
+            _skip(o, "unsettled proceeds (T+1) — funds free next session"
+                  if buying_power < cash - 0.01 else "at cash floor")
+            continue
         g = group_of(sym)
         cap_room = max_pos_pct / 100.0 * equity - group_value.get(g, 0.0)
         if cap_room <= 0:
@@ -261,6 +281,7 @@ def validate_and_fill(
         cost = shares * fill
         traded_notional += cost
         cash -= cost
+        buying_power -= cost
         buy_notional += cost
         group_value[g] = group_value.get(g, 0.0) + cost
         pos = _find(positions, sym)
@@ -277,6 +298,8 @@ def validate_and_fill(
         _fill(o, "buy", shares, fill, 0.0, cash, pos)
 
     b["cash"] = round(cash, 2)
+    # Keep the wash-sale clock on the ledger, pruned to the 30-day window it governs.
+    b["recent_loss_sales"] = {k: v for k, v in recent_loss_sales.items() if now_ts - float(v) < 31 * 86_400}
     # Cash-conservation invariant (fail-closed): the caller aborts + does not persist on violation.
     delta = round(cash, 2) - cash0
     expected = round(sell_notional - buy_notional, 2)

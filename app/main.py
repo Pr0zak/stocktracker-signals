@@ -2285,6 +2285,10 @@ class SandboxSettingsPatch(BaseModel):
     master_enabled: bool | None = None
     risk_tolerance: str | None = None
     retirement_date: str | None = None
+    current_age: int | None = None
+    retirement_age: int | None = None
+    account_type: str | None = None
+    avoid_wash_sales: bool | None = None
     exit_date: str | None = None
     goal_amount: float | None = None
     goal_date: str | None = None
@@ -2376,12 +2380,18 @@ async def sandbox_set_settings_endpoint(patch: SandboxSettingsPatch) -> dict:
         if d.get("risk_tolerance") in ("conservative", "balanced", "aggressive"):
             s["risk_tolerance"] = d["risk_tolerance"]
         for k in ("master_enabled", "allow_crypto", "allow_crypto_etf", "allow_etf", "allow_after_hours",
-                  "respect_entry_zones"):
+                  "respect_entry_zones", "avoid_wash_sales"):
             if k in d:
                 s[k] = bool(d[k])
         for k in ("retirement_date", "exit_date", "goal_date"):
             if k in d:
                 s[k] = d[k] or None
+        if "account_type" in d and str(d["account_type"]).lower() in ("cash", "margin"):
+            s["account_type"] = str(d["account_type"]).lower()
+        for k in ("current_age", "retirement_age"):
+            if k in d:
+                v = d[k]
+                s[k] = max(0, min(120, int(v))) if v else None
         if "goal_amount" in d:
             v = float(d["goal_amount"])
             s["goal_amount"] = v if v > 0 else None

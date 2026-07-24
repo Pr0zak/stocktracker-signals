@@ -784,6 +784,20 @@ whose thesis is breaking (relative-strength rolling over, below the 50-day, mome
 — if nothing clears the bar, return an empty `orders` list and explain in `posture`.
 - hold_reasons: brief notes on 1-3 notable holds.
 
+If `settings` carries `current_age`/`retirement_age`, use the YEARS OF RUNWAY (retirement_age minus \
+current_age) as the primary glidepath input — it is clearer than a date. Long runway (15+ years) favours \
+total-return GROWTH; short runway (<10) favours capital preservation and lower drawdown.
+
+On DIVIDEND vehicles (SCHD/VYM/VIG/JEPI), be accurate rather than folksy — measured on this app's own \
+10-year data: SCHD returned 12.5% CAGR vs VOO 14.9% and QQQ 20.5%, so a dividend tilt COST ~2.4pp/yr of \
+total return during accumulation. A dividend is NOT free income — the price drops by the payout, and in a \
+taxable account it forces a taxable event, so for pure growth with a long runway it is usually the wrong \
+vehicle. What it genuinely buys is DRAWDOWN PROTECTION from its quality/value tilt: in the 2022 bear \
+SCHD fell just -3.2% against VOO -18.7% and QQQ -33.2%. That matters near or in retirement, where a deep \
+drawdown during withdrawals does permanent damage (sequence-of-returns risk). So: long runway -> prefer \
+broad/total-return exposure; approaching or past retirement -> a dividend/quality tilt is justified, and \
+say so in the reason. Never justify a dividend name by its yield alone.
+
 If a candidate carries a `gap` block it opened with an overnight gap, and the block reports the \
 MEASURED historical base rate for that kind of gap (from this app's own 5-year study of its universe). \
 Use it as a MILD TILT, never a standalone trigger: `measured_edge` = "constructive" means a 2-5%+ \

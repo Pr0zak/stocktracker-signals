@@ -37,6 +37,10 @@ DEFAULT_SETTINGS = {
     "master_enabled": False,           # off until the user opts in
     "risk_tolerance": "balanced",      # conservative | balanced | aggressive
     "retirement_date": None,           # ISO yyyy-mm-dd; biases the glidepath (de-risk as it nears)
+    # Age-based glidepath — clearer than a date for "how much runway is left". Drives the growth-vs-
+    # income tilt (see the dividend research in research/README.md).
+    "current_age": None,
+    "retirement_age": 65,
     "exit_date": None,                 # ISO yyyy-mm-dd; flatten to cash by this date
     "max_position_pct": 20.0,          # cap per EXPOSURE GROUP (BTC+FBTC count as one)
     "cash_floor_pct": 10.0,            # never deploy below this % of equity
@@ -60,6 +64,11 @@ DEFAULT_SETTINGS = {
     "monthly_deposit": 0.0,            # auto-add this much fictional cash each new month (0 = off)
     # Universe
     "exclusions": [],                  # tickers the AI must never buy (uppercase, e.g. ["TSLA"])
+    # Realism: mimic a retail brokerage account's actual rules.
+    #  cash   = T+1 settlement, sale proceeds unusable until the next session (no PDT rule)
+    #  margin = proceeds usable immediately, but the FINRA PDT rule applies under $25k equity
+    "account_type": "cash",
+    "avoid_wash_sales": True,          # don't rebuy a name sold at a loss within 30 days (IRS §1091)
     # Automation
     "cadence": "daily",                # "daily" | "weekly" — how often it DECIDES (NAV still marks daily)
     # Whether the tick may trade during the 16:00-20:00 ET after-hours window. OFF by default: extended
