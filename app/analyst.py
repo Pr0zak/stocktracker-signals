@@ -605,3 +605,65 @@ async def review_portfolio(portfolio: dict, *, cash: float, deep: bool = False) 
         + "\n\nReturn your structured portfolio review (exactly one action per holding)."
     )
     return await _parse(PORTFOLIO_SYSTEM, prompt, PortfolioReview, deep=deep, max_tokens=4096)
+
+
+# ======================================================================================
+# Portfolio rebalance (Theme C) — turns the review's trim/add judgment into CONCRETE sized moves:
+# sell N shares of the over-weights, redeploy the proceeds + idle cash into the best-setup existing
+# holdings, respecting a target max single-position weight. Actionable for manual (Fidelity) trading.
+# ======================================================================================
+
+class RebalanceMove(BaseModel):
+    symbol: str
+    action: str          # "sell" | "buy" | "hold"
+    shares: float        # share count to trade (0 for hold)
+    dollars: float       # approximate $ value of the trade (0 for hold)
+    reason: str          # one short sentence, grounded in weight + setup
+
+
+class RebalancePlan(BaseModel):
+    summary: str                          # one-line read of what the plan does + the resulting book
+    moves: list[RebalanceMove]            # concrete sized moves (one per holding worth touching; holds allowed)
+    resulting_top_weight_pct: float | None = None  # est. largest position weight AFTER the moves
+    cash_after: float | None = None       # est. leftover cash after the buys
+
+
+REBALANCE_SYSTEM = """You are a disciplined portfolio strategist producing a CONCRETE, ACTIONABLE \
+rebalance plan for one retail investor who trades MANUALLY (so give real share counts and dollar \
+amounts they can enter). You receive: cash + cash_pct, total_value, a `max_position_pct` target (the \
+largest weight any single holding should have after rebalancing), and a `positions` list where each \
+holding has its price, shares, value, weight_pct, unrealized_gain_pct, and key technicals (RSI, MACD \
+histogram, % vs 50-day MA, golden-cross, 3-month relative strength vs the S&P, % off 52-week high).
+
+Produce a plan that ONLY trades the EXISTING holdings + deploys the idle cash (do NOT introduce new \
+tickers — that's a different tool):
+- summary: ONE sentence — what the plan does and the resulting posture (e.g. "Trims NVDA from 61% to \
+~40% and rotates ~$900 into AAPL, leaving a balanced two-name book").
+- moves: for each holding worth touching, an entry with action ∈ sell | buy | hold. For sell/buy give a \
+concrete `shares` and approximate `dollars` (shares × current price). RULES: (1) trim any position over \
+`max_position_pct` back toward that target — compute the dollars to sell = value − max_position_pct% × \
+total_value, then shares = that ÷ price (round to whole shares for stocks; fractional OK for crypto). \
+(2) Redeploy the sell proceeds + idle cash into the underweight holdings with the genuinely BEST \
+technical setup (strong RS, above 50-day MA, MACD positive) — size those buys so you don't spend more \
+than proceeds + cash and don't push a buy target back over the max. (3) Use `hold` (shares 0) for names \
+that are fine as-is. NEVER add to a clearly weak/downtrending name just to spend cash — leave it as cash.
+- resulting_top_weight_pct: your estimate of the largest single weight after the moves.
+- cash_after: your estimate of leftover cash after the buys.
+
+Trimming a big winner realizes gains — mention that in the relevant reason when it applies. You do NOT \
+know their tax situation, total net worth, or outside holdings; judge only within this book. Numbers must \
+tie out (buys ≤ sells + cash). This is decision support, not investment advice."""
+
+
+async def rebalance_portfolio(
+    portfolio: dict, *, max_position_pct: float, deep: bool = False,
+) -> tuple[RebalancePlan, dict]:
+    """Concrete sized rebalance moves (Theme C) from the same portfolio snapshot the review uses, plus a
+    target max single-position weight. Honors the api/cli provider toggle via the shared _parse()."""
+    prompt = (
+        f"Rebalance this portfolio to a max single-position weight of {max_position_pct:.0f}%. "
+        "Each position carries price, shares, value, weight, unrealized gain, and technicals.\n"
+        + json.dumps(portfolio, indent=2, default=str)
+        + "\n\nReturn the concrete rebalance plan (real share counts + dollar amounts)."
+    )
+    return await _parse(REBALANCE_SYSTEM, prompt, RebalancePlan, deep=deep, max_tokens=4096)

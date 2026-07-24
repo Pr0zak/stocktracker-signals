@@ -22,6 +22,7 @@ from .analyst import (
     news_moves,
     options_note,
     plan_entry,
+    rebalance_portfolio,
     recommend,
     review_portfolio,
 )
@@ -1682,29 +1683,12 @@ class Holding(BaseModel):
     avg_cost: float
 
 
-class PortfolioReviewRequest(BaseModel):
-    cash: float = 0.0
-    deep: bool = False
-    holdings: list[Holding] = []  # transient — reviewed, never persisted
-
-
-@app.post("/portfolio/review")
-async def portfolio_review_endpoint(req: PortfolioReviewRequest) -> dict:
-    """AI review of the WHOLE portfolio: overall health, concentration/diversification flags, a per-
-    holding action list (trim/hold/add/watch), and a cash-deployment note. One structured LLM call over
-    lightweight technical snapshots of each holding (fast — no per-name enrichment). Cached by the
-    holdings+cash identity for the verdict TTL. Send crypto holdings as <SYM>-USD."""
-    if not req.holdings:
-        raise HTTPException(status_code=422, detail="no holdings to review")
+async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dict:
+    """Price a set of holdings into the shared portfolio structure used by the review + rebalance
+    endpoints: cash / cash_pct / total_value plus a `positions` list (price, shares, value, weight_pct,
+    unrealized gain, key technicals) sorted by value, priced concurrently against one S&P fetch for
+    relative strength. Unpriceable holdings are dropped; raises 502 if none can be priced."""
     assert _http is not None
-    cfg = settings_store.get()
-    key = ("portfolio_review", req.deep, round(req.cash, 2),
-           tuple(sorted((h.symbol.upper(), round(h.shares, 6), round(h.avg_cost, 4)) for h in req.holdings)))
-    now = time.time()
-    hit = _cache.get(key)
-    if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
-        return {**hit[1], "cached": True}
-
     try:  # fetch the S&P once for all equity relative-strength calcs
         bench = (await fetch_series(_http, "^GSPC")).closes
     except Exception:  # noqa: BLE001 — relative strength just gets skipped
@@ -1734,18 +1718,43 @@ async def portfolio_review_endpoint(req: PortfolioReviewRequest) -> dict:
                     "rel_strength_3mo_vs_benchmark", "pct_off_52w_high") if summ.get(k) is not None},
             }
 
-    rows = [r for r in await asyncio.gather(*[_price(h) for h in req.holdings]) if r]
+    rows = [r for r in await asyncio.gather(*[_price(h) for h in holdings]) if r]
     if not rows:
         raise HTTPException(status_code=502, detail="couldn't price any holdings")
-    total_value = sum(r["value"] for r in rows) + max(req.cash, 0.0)
+    total_value = sum(r["value"] for r in rows) + max(cash, 0.0)
     for r in rows:
         r["weight_pct"] = round(100.0 * r["value"] / total_value, 1) if total_value else None
-    portfolio = {
-        "cash": round(req.cash, 2),
-        "cash_pct": round(100.0 * max(req.cash, 0.0) / total_value, 1) if total_value else 0.0,
+    return {
+        "cash": round(cash, 2),
+        "cash_pct": round(100.0 * max(cash, 0.0) / total_value, 1) if total_value else 0.0,
         "total_value": round(total_value, 2),
         "positions": sorted(rows, key=lambda r: r["value"], reverse=True),
     }
+
+
+class PortfolioReviewRequest(BaseModel):
+    cash: float = 0.0
+    deep: bool = False
+    holdings: list[Holding] = []  # transient — reviewed, never persisted
+
+
+@app.post("/portfolio/review")
+async def portfolio_review_endpoint(req: PortfolioReviewRequest) -> dict:
+    """AI review of the WHOLE portfolio: overall health, concentration/diversification flags, a per-
+    holding action list (trim/hold/add/watch), and a cash-deployment note. One structured LLM call over
+    lightweight technical snapshots of each holding (fast — no per-name enrichment). Cached by the
+    holdings+cash identity for the verdict TTL. Send crypto holdings as <SYM>-USD."""
+    if not req.holdings:
+        raise HTTPException(status_code=422, detail="no holdings to review")
+    cfg = settings_store.get()
+    key = ("portfolio_review", req.deep, round(req.cash, 2),
+           tuple(sorted((h.symbol.upper(), round(h.shares, 6), round(h.avg_cost, 4)) for h in req.holdings)))
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
+        return {**hit[1], "cached": True}
+
+    portfolio = await _build_portfolio_snapshot(req.holdings, req.cash)
     try:
         review, usage = await review_portfolio(portfolio, cash=req.cash, deep=req.deep)
     except Exception as e:  # noqa: BLE001
@@ -1754,6 +1763,49 @@ async def portfolio_review_endpoint(req: PortfolioReviewRequest) -> dict:
     payload = {
         "review": review.model_dump(),
         "portfolio": portfolio,
+        "model": usage["model"],
+        "as_of": now,
+        "usage": usage,
+        "cached": False,
+    }
+    _cache[key] = (now, payload)
+    return payload
+
+
+class RebalanceRequest(BaseModel):
+    cash: float = 0.0
+    deep: bool = False
+    max_position_pct: float = 25.0  # target largest single-position weight after rebalancing
+    holdings: list[Holding] = []    # transient — never persisted
+
+
+@app.post("/portfolio/rebalance")
+async def portfolio_rebalance_endpoint(req: RebalanceRequest) -> dict:
+    """Theme C — a CONCRETE rebalance plan: sell N shares of the over-weights, redeploy proceeds + idle
+    cash into the best-setup existing holdings, targeting `max_position_pct` as the largest single weight.
+    Real share/dollar amounts for manual trading. One structured LLM call over the same priced snapshot
+    the review uses. Cached by holdings+cash+target for the verdict TTL. Send crypto as <SYM>-USD."""
+    if not req.holdings:
+        raise HTTPException(status_code=422, detail="no holdings to rebalance")
+    cfg = settings_store.get()
+    mpp = max(5.0, min(100.0, req.max_position_pct))
+    key = ("portfolio_rebalance", req.deep, round(req.cash, 2), round(mpp, 1),
+           tuple(sorted((h.symbol.upper(), round(h.shares, 6), round(h.avg_cost, 4)) for h in req.holdings)))
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
+        return {**hit[1], "cached": True}
+
+    portfolio = await _build_portfolio_snapshot(req.holdings, req.cash)
+    try:
+        plan, usage = await rebalance_portfolio(portfolio, max_position_pct=mpp, deep=req.deep)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+    usage_store.record(usage, symbol="", kind="rebalance")
+    payload = {
+        "plan": plan.model_dump(),
+        "portfolio": portfolio,
+        "max_position_pct": mpp,
         "model": usage["model"],
         "as_of": now,
         "usage": usage,
