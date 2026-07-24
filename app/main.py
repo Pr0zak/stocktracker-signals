@@ -821,7 +821,7 @@ async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | No
 async def _build_signal(
     symbol: str, *, deep: bool, crypto: bool,
     shares: float | None = None, avg_cost: float | None = None,
-    rule_score: int | None = None,
+    rule_score: int | None = None, refresh: bool = False,
 ) -> dict:
     cfg = settings_store.get()
     # Position is part of the cache identity: a different holding must yield a fresh, re-personalized
@@ -829,7 +829,7 @@ async def _build_signal(
     key = (symbol.upper(), crypto, deep, shares, avg_cost, rule_score)
     now = time.time()
     hit = _cache.get(key)
-    if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
+    if hit and not refresh and now - hit[0] < cfg["verdict_ttl_seconds"]:
         return {**hit[1], "cached": True}
 
     summary = await _snapshot(symbol, crypto=crypto)
@@ -862,14 +862,16 @@ async def _build_signal(
 async def signal(
     symbol: str, deep: bool = False, crypto: bool = False,
     shares: float | None = None, avg_cost: float | None = None,
-    rule_score: int | None = None,
+    rule_score: int | None = None, refresh: bool = False,
 ) -> dict:
     """One asset's analyst verdict. `deep=true` uses the deep model; crypto symbols use Yahoo's
     `BTC-USD` form with `crypto=true` (skips the S&P benchmark). Optional `shares` + `avg_cost`
     personalize the verdict as an add/hold/trim call on an existing position; optional `rule_score`
-    (the app's mechanical 0-100 composite) makes the analyst reconcile a diverging read."""
+    (the app's mechanical 0-100 composite) makes the analyst reconcile a diverging read.
+    `refresh=true` bypasses the cache to force a freshly generated verdict."""
     return await _build_signal(
-        symbol, deep=deep, crypto=crypto, shares=shares, avg_cost=avg_cost, rule_score=rule_score,
+        symbol, deep=deep, crypto=crypto, shares=shares, avg_cost=avg_cost,
+        rule_score=rule_score, refresh=refresh,
     )
 
 
@@ -1205,11 +1207,11 @@ async def seasonality_endpoint(symbol: str) -> dict:
 
 
 @app.get("/news_moves/{symbol}")
-async def news_moves_endpoint(symbol: str, deep: bool = False) -> dict:
+async def news_moves_endpoint(symbol: str, deep: bool = False, refresh: bool = False) -> dict:
     """AIE-4 — why the stock moved. Finds its notable daily moves over ~3 weeks, pulls dated company
     news, and has the analyst correlate them: which move was news-driven and which happened on flows/
-    technicals. Equities only (Finnhub news is equities); crypto returns a friendly note. Cached ~1h.
-    Returns {symbol, news_moves: {summary, drivers[]}|null, note?}."""
+    technicals. Equities only (Finnhub news is equities); crypto returns a friendly note. Cached ~1h
+    (`refresh=true` bypasses it). Returns {symbol, news_moves: {summary, drivers[]}|null, note?}."""
     assert _http is not None
     sym = symbol.upper()
     if sym.endswith("-USD"):
@@ -1218,7 +1220,7 @@ async def news_moves_endpoint(symbol: str, deep: bool = False) -> dict:
     now = time.time()
     key = ("news_moves", sym, deep)
     hit = _cache.get(key)
-    if hit and now - hit[0] < 3600:
+    if hit and not refresh and now - hit[0] < 3600:
         return {**hit[1], "cached": True}
 
     try:
@@ -1636,17 +1638,18 @@ async def covered_call_endpoint(
 @app.get("/plan/{symbol}")
 async def plan(
     symbol: str, cash: float, crypto: bool = False, deep: bool = False,
-    shares: float | None = None, avg_cost: float | None = None,
+    shares: float | None = None, avg_cost: float | None = None, refresh: bool = False,
 ) -> dict:
     """Scenario: "if I deployed $cash into this symbol" — one asset's entry plan (action, entry zone,
-    share count, stop/target, timing). Optional shares+avg_cost tell the analyst it's already held."""
+    share count, stop/target, timing). Optional shares+avg_cost tell the analyst it's already held.
+    `refresh=true` bypasses the cache to force a fresh plan."""
     if cash <= 0:
         raise HTTPException(status_code=422, detail="cash must be > 0")
     cfg = settings_store.get()
     key = ("plan", symbol.upper(), crypto, round(cash, 2), deep, shares, avg_cost)
     now = time.time()
     hit = _cache.get(key)
-    if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
+    if hit and not refresh and now - hit[0] < cfg["verdict_ttl_seconds"]:
         return {**hit[1], "cached": True}
 
     summary = await _snapshot(symbol, crypto=crypto)
