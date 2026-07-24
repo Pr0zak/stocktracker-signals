@@ -21,6 +21,7 @@ _HOSTS = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
 class Series:
     symbol: str
     closes: list[float]
+    opens: list[float | None]   # session opens — needed for overnight-gap detection (see gaps.py)
     volumes: list[float | None]
     dates: list[str]  # YYYYMMDD per bar — lets shorts.py align SEC/FINRA data to prices
     fifty_two_high: float | None
@@ -76,11 +77,12 @@ async def _webull_series(client: httpx.AsyncClient, symbol: str) -> Series:
     if not bars:
         raise RuntimeError(f"no data for {symbol} (Yahoo + Webull)")
     closes = [b["c"] for b in bars]
+    opens: list[float | None] = [b.get("o") for b in bars]
     vols: list[float | None] = [b.get("v") for b in bars]
     dates = [time.strftime("%Y%m%d", time.gmtime(b["t"] / 1000)) for b in bars]
     recent = closes[-252:]
     return Series(
-        symbol=symbol.upper(), closes=closes, volumes=vols, dates=dates,
+        symbol=symbol.upper(), closes=closes, opens=opens, volumes=vols, dates=dates,
         fifty_two_high=max(recent), fifty_two_low=min(recent), currency="USD", source="webull",
     )
 
@@ -96,7 +98,9 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str) -> Series:
     quote = (result.get("indicators", {}).get("quote") or [{}])[0]
     adj_closes = _adjusted_closes(result)
     raw_vols = quote.get("volume") or []
+    raw_opens = quote.get("open") or []
     closes: list[float] = []
+    opens: list[float | None] = []
     vols: list[float | None] = []
     dates: list[str] = []
     for i in range(len(ts)):
@@ -104,12 +108,15 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str) -> Series:
         if c is None:  # Yahoo pads gaps with null
             continue
         closes.append(float(c))
+        o = raw_opens[i] if i < len(raw_opens) else None
+        opens.append(float(o) if o is not None else None)
         v = raw_vols[i] if i < len(raw_vols) else None
         vols.append(float(v) if v is not None else None)
         dates.append(time.strftime("%Y%m%d", time.gmtime(ts[i])))
     return Series(
         symbol=symbol.upper(),
         closes=closes,
+        opens=opens,
         volumes=vols,
         dates=dates,
         fifty_two_high=meta.get("fiftyTwoWeekHigh"),

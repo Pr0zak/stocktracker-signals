@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import market_calendar, sandbox_job, sandbox_store
+from . import gaps, market_calendar, sandbox_job, sandbox_store
 from .analyst import (
     analyze,
     daily_brief,
@@ -2069,11 +2069,16 @@ async def _sandbox_candidate(sym: str, bench_closes, watch_set: set[str]) -> dic
             summ = summarize(series, None if crypto else bench_closes)
         except Exception:  # noqa: BLE001 — an unfetchable candidate is just dropped
             return None
-        return {
+        row = {
             "symbol": sym, "source": "watchlist" if sym in watch_set else "market_screen",
             "price": round(summ["price"], 4), "exposure_group": _exposure_group(sym),
             "technicals": {k: summ.get(k) for k in _SANDBOX_TECH_KEYS if summ.get(k) is not None},
         }
+        # Overnight gap + its MEASURED fill/edge base rate (app/gaps.py) — a mild tilt, not a trigger.
+        g = gaps.compact(gaps.detect(series.closes, series.opens, series.volumes))
+        if g:
+            row["gap"] = g
+        return row
 
 
 async def _sandbox_prices(held: list[str], candidate_syms: list[str]) -> dict[str, float | None]:

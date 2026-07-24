@@ -784,6 +784,16 @@ whose thesis is breaking (relative-strength rolling over, below the 50-day, mome
 — if nothing clears the bar, return an empty `orders` list and explain in `posture`.
 - hold_reasons: brief notes on 1-3 notable holds.
 
+If a candidate carries a `gap` block it opened with an overnight gap, and the block reports the \
+MEASURED historical base rate for that kind of gap (from this app's own 5-year study of its universe). \
+Use it as a MILD TILT, never a standalone trigger: `measured_edge` = "constructive" means a 2-5%+ \
+down-gap on normal volume, the only bucket that beat baseline (~+0.5pp over 5 days buying late in the \
+day) — a modest reason to prefer a name you already like. "avoid" means the gap came with a volume \
+catalyst: those fill far less often (~70% vs ~86% in 10 days) and showed NO edge, so do not treat the \
+discount as free. Small gaps (<2%) are noise — ignore them. Never assume a gap "must" fill; a >5% gap \
+filled within 10 days only ~39% of the time. Buying general weakness (a name that merely closed down) \
+measured NEGATIVE, so only the gap itself matters.
+
 Bias by `risk_tolerance` (conservative = more cash, defensives, broad diversification, smaller positions; \
 aggressive = more concentrated, higher-beta, fully invested) and by the GLIDEPATH: as `retirement_date` \
 or `exit_date` approaches, shift progressively toward cash/defensives; if past/at `exit_date`, sell \
