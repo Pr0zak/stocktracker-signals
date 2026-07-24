@@ -466,6 +466,48 @@ async def market_overview(snapshot: dict, *, deep: bool = False) -> tuple[Market
 
 
 # ======================================================================================
+# AI daily brief (AIE-3) — a once-a-morning push: the tape, the user's names on the move, and any
+# catalyst landing today, compressed into a notification title + a couple of sentences.
+# ======================================================================================
+
+class DailyBrief(BaseModel):
+    title: str  # notification title — a punchy morning headline, a few words
+    body: str   # 2-3 sentence brief for the expanded notification
+    tone: str   # "risk-on" | "risk-off" | "mixed"
+
+
+DAILY_BRIEF_SYSTEM = """You are writing ONE retail investor's morning market brief — it lands as a phone \
+push notification before/around the US open, so it must be tight and scannable. You receive a JSON \
+snapshot: the session phase (PRE / REGULAR / AFTER / CLOSED), major indices (S&P 500, Nasdaq, Dow, \
+Russell 2000) with % change, the VIX level + change, the SPDR sectors split into leaders/laggards, \
+market-wide top movers, the user's WATCHLIST movers, and `catalysts_today` — a list of the user's \
+tickers reporting earnings (or other dated events) today.
+
+Return a structured brief:
+- title: the notification TITLE — a punchy morning headline UNDER ~8 words, leading with the tape's tone \
+or the single most notable item (e.g. "Futures soft; NVDA reports today").
+- body: 2 to 3 SHORT sentences, UNDER ~55 words total, in this priority order: (1) the tape — indices + \
+VIX in one line; (2) the 1-2 most notable moves in the user's OWN watchlist, by name; (3) any \
+`catalysts_today` — name who reports today (this is the highest-value line when present). Skip a bucket \
+if there's nothing worth saying; never pad.
+- tone: exactly one of "risk-on", "risk-off", or "mixed", grounded in indices AND the VIX.
+Ground EVERY claim in the snapshot numbers — never invent news, price levels, or catalysts not in \
+`catalysts_today`. In PRE phase, treat moves as thin-volume futures/pre-market. Plain text, no markdown, \
+no disclaimer line (the app adds one)."""
+
+
+async def daily_brief(snapshot: dict, *, deep: bool = False) -> tuple[DailyBrief, dict]:
+    """Structured morning brief (AIE-3): a notification title + 2-3 sentences + tone, from the same live
+    snapshot market_now uses (plus today's watchlist catalysts). Cheap scan model by default; honors the
+    api/cli provider toggle via the shared _parse(). Raises on API/empty output so the route 502s cleanly."""
+    prompt = (
+        "Here is this morning's market snapshot. Write the structured daily brief:\n"
+        + json.dumps(snapshot, indent=2, default=str)
+    )
+    return await _parse(DAILY_BRIEF_SYSTEM, prompt, DailyBrief, deep=deep, max_tokens=768)
+
+
+# ======================================================================================
 # Portfolio review — a structured, whole-portfolio read: concentration, a per-holding action list,
 # and cash deployment. One structured call over lightweight technical snapshots of each holding.
 # ======================================================================================

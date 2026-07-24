@@ -15,7 +15,15 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from .analyst import analyze, market_overview, options_note, plan_entry, recommend, review_portfolio
+from .analyst import (
+    analyze,
+    daily_brief,
+    market_overview,
+    options_note,
+    plan_entry,
+    recommend,
+    review_portfolio,
+)
 from .discover import discover
 from .market import fetch_series, summarize
 from .news import fetch_context
@@ -24,6 +32,7 @@ from .scan_job import LATEST, run_scan
 _http: httpx.AsyncClient | None = None
 _cache: dict[tuple, tuple[float, dict]] = {}
 _MARKET_NOW_TTL = 180  # market-now overview cached ~3 min so repeated taps don't re-run the model
+_DAILY_BRIEF_TTL = 1800  # morning brief cached ~30 min — the app fires it once/day; this just guards retries
 _log = logging.getLogger(__name__)
 
 
@@ -975,6 +984,79 @@ async def market_now_endpoint(deep: bool = False, count: int = 6) -> dict:
         "overview": overview_str,
         "overview_struct": ov.model_dump(),
         "snapshot": snap,
+        "session": snap["session"],
+        "model": usage["model"],
+        "as_of": now,
+        "usage": usage,
+        "cached": False,
+    }
+    _cache[key] = (now, payload)
+    return payload
+
+
+@app.get("/daily_brief")
+async def daily_brief_endpoint(deep: bool = False, count: int = 6) -> dict:
+    """AIE-3 — a once-a-morning push brief. Same live snapshot as /market_now (session, indices, VIX,
+    sectors, market + watchlist movers) PLUS `catalysts_today` (watchlist names reporting earnings today,
+    in ET), narrated by the analyst into a notification title + a couple of sentences. Cached ~30 min;
+    the app's worker fires it once per trading day, so this mostly just coalesces retries."""
+    assert _http is not None
+    cfg = settings_store.get()
+    key = ("daily_brief", deep)
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < _DAILY_BRIEF_TTL:
+        return {**hit[1], "cached": True}
+
+    watchlist = list(cfg.get("watchlist") or []) + [f"{c}-USD" for c in (cfg.get("crypto_watchlist") or [])]
+    try:
+        snap = await market_now.build_snapshot(_http, watchlist)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"market snapshot failed: {e}")
+    try:
+        snap["market_movers"] = {
+            "gainers": await _movers_side("day_gainers", count),
+            "losers": await _movers_side("day_losers", count),
+        }
+    except Exception as e:  # noqa: BLE001
+        _log.warning("daily_brief movers failed: %s", e)
+
+    # Today's catalysts: which of the user's (equity) names report earnings today, in ET. Best-effort —
+    # a Finnhub hiccup just drops the catalysts line, it never fails the brief.
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    today_et = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    equities = [s for s in (cfg.get("watchlist") or []) if not s.upper().endswith("-USD")]
+    _earn_sem = asyncio.Semaphore(8)
+
+    async def _reports_today(s: str) -> str | None:
+        async with _earn_sem:
+            try:
+                if (await fetch_context(_http, s)).get("next_earnings") == today_et:
+                    return s.upper()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+
+    try:
+        snap["catalysts_today"] = [
+            s for s in await asyncio.gather(*[_reports_today(s) for s in equities]) if s
+        ]
+    except Exception as e:  # noqa: BLE001
+        _log.warning("daily_brief catalysts failed: %s", e)
+        snap["catalysts_today"] = []
+
+    try:
+        brief, usage = await daily_brief(snap, deep=deep)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+    usage_store.record(usage, symbol="", kind="daily_brief")
+
+    payload = {
+        "title": brief.title,
+        "body": brief.body,
+        "tone": brief.tone,
+        "catalysts_today": snap.get("catalysts_today", []),
         "session": snap["session"],
         "model": usage["model"],
         "as_of": now,
