@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import time
 
 from pydantic import BaseModel, ValidationError
 
@@ -152,6 +153,48 @@ async def _invoke(model: str, system: str, user_prompt: str, *, thinking: bool =
     return env
 
 
+# A CLI failure is FATAL (retry is pointless — auth/config) or TRANSIENT (capacity/rate/network — worth
+# one retry). Unknown non-zero exits default to transient so a momentary rejection isn't fatal.
+_FATAL_HINTS = ("not logged in", "/login", "claude cli not found", "invalid api key",
+                "authentication_error", "unauthorized", "401")
+_RATE_HINTS = ("rate limit", "rate-limit", "429", "overloaded", "usage limit", "capacity",
+               "quota", "too many requests")
+
+
+def _is_fatal(err: Exception) -> bool:
+    return any(h in str(err).lower() for h in _FATAL_HINTS)
+
+
+def _friendly(err: Exception) -> str:
+    """Turn a raw CLI failure into something the app can show a human. Rate/capacity rejections (the
+    common cause on the shared subscription budget, esp. for the heavy deep whole-market call) become a
+    clear 'try again' rather than the cryptic 'claude CLI exited 1'."""
+    if any(h in str(err).lower() for h in _RATE_HINTS):
+        return ("the AI is temporarily rate-limited on the Claude subscription — try again in a minute, "
+                "or use the scan (fast) model instead of deep")
+    return str(err)
+
+
+async def _invoke_resilient(model: str, system: str, user_prompt: str, *, thinking: bool = False) -> dict:
+    """_invoke with ONE retry on a transient failure — but only when the failed attempt returned quickly
+    (a fast rejection, not a full-length generation), so a slow deep call that fails can't blow the
+    caller's HTTP timeout by re-running. Fatal (auth/config) errors re-raise immediately. The final error
+    is rewritten via _friendly() so the app shows a human-readable reason."""
+    t0 = time.monotonic()
+    try:
+        return await _invoke(model, system, user_prompt, thinking=thinking)
+    except CliError as e:
+        elapsed = time.monotonic() - t0
+        if _is_fatal(e) or elapsed > 45.0:
+            raise CliError(_friendly(e)) from e
+        log.warning("cli transient failure after %.0fs — retrying once: %s", elapsed, str(e)[:150])
+        await asyncio.sleep(4.0)
+        try:
+            return await _invoke(model, system, user_prompt, thinking=thinking)
+        except CliError as e2:
+            raise CliError(_friendly(e2)) from e2
+
+
 def _usage_from_env(model: str, env: dict) -> dict:
     """Map the CLI envelope's usage into analyst._usage()'s shape, tagged provider=cli. cost_usd is the
     CLI's own notional (API-equivalent) figure — actual spend is $0 against the subscription."""
@@ -192,7 +235,7 @@ async def structured(system: str, user_prompt: str, output_model: type[BaseModel
     last_err: Exception | None = None
     prompt = user_prompt
     for attempt in (1, 2):
-        env = await _invoke(model, sys, prompt, thinking=thinking)
+        env = await _invoke_resilient(model, sys, prompt, thinking=thinking)
         raw = _strip_to_json(env.get("result", ""))
         try:
             obj = output_model.model_validate_json(raw)
@@ -225,7 +268,7 @@ async def auth_probe(model: str = "claude-haiku-4-5") -> dict:
 
 async def text(system: str, user_prompt: str, *, model: str, max_tokens: int = 2048, thinking: bool = False):
     """CLI equivalent of the plain-text options_note create() call: returns (paragraph, usage dict)."""
-    env = await _invoke(model, system, user_prompt, thinking=thinking)
+    env = await _invoke_resilient(model, system, user_prompt, thinking=thinking)
     out = (env.get("result") or "").strip()
     if not out:
         raise CliError("claude CLI returned empty text")
