@@ -2297,6 +2297,7 @@ class SandboxSettingsPatch(BaseModel):
     max_trades_per_tick: int | None = None
     max_new_positions_per_tick: int | None = None
     min_conviction_to_trade: int | None = None
+    respect_entry_zones: bool | None = None
     slippage_bps: int | None = None
 
 
@@ -2369,7 +2370,8 @@ async def sandbox_set_settings_endpoint(patch: SandboxSettingsPatch) -> dict:
         d = patch.model_dump(exclude_none=True)
         if d.get("risk_tolerance") in ("conservative", "balanced", "aggressive"):
             s["risk_tolerance"] = d["risk_tolerance"]
-        for k in ("master_enabled", "allow_crypto", "allow_crypto_etf", "allow_etf", "allow_after_hours"):
+        for k in ("master_enabled", "allow_crypto", "allow_crypto_etf", "allow_etf", "allow_after_hours",
+                  "respect_entry_zones"):
             if k in d:
                 s[k] = bool(d[k])
         for k in ("retirement_date", "exit_date", "goal_date"):

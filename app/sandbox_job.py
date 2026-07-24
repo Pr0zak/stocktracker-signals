@@ -134,6 +134,7 @@ def validate_and_fill(
     allow_crypto = bool(s.get("allow_crypto", False))          # direct spot (BTC-USD)
     allow_crypto_etf = bool(s.get("allow_crypto_etf", True))   # spot-crypto ETFs (IBIT/FBTC/FETH)
     allow_etf = bool(s.get("allow_etf", True))  # ETF filtering is best-effort (source-tagged upstream)
+    respect_zones = bool(s.get("respect_entry_zones", True))
     # Churn control: the max notional (buys+sells) allowed to change hands this tick, as a % of the
     # starting equity. 0 disables the cap. Computed off the pre-trade book so it's a stable budget.
     turnover_pct = float(s.get("max_turnover_pct", 0.0) or 0.0)
@@ -226,6 +227,17 @@ def validate_and_fill(
         px = price_of(sym)
         if not px:
             _skip(o, "no fresh price"); continue
+        # Entry-zone discipline: don't chase. If the analyst named a zone and the market is above its
+        # top, defer the buy — it stays a candidate on later ticks instead of filling at any price.
+        # (Below the zone is fine: cheaper than it wanted to pay.)
+        if respect_zones:
+            hi = o.get("entry_high")
+            try:
+                hi = float(hi) if hi is not None else None
+            except (TypeError, ValueError):
+                hi = None
+            if hi and hi > 0 and px > hi:
+                _skip(o, f"price {px:.2f} above entry zone (≤{hi:.2f}) — waiting"); continue
         available = cash - floor
         if available <= 0:
             _skip(o, "at cash floor"); continue

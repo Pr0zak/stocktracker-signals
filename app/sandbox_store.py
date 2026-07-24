@@ -50,6 +50,9 @@ DEFAULT_SETTINGS = {
     "max_trades_per_tick": 4,
     "max_new_positions_per_tick": 2,
     "min_conviction_to_trade": 55,     # 0-100 floor for a buy
+    # Honour the analyst's per-buy entry zone: skip (and retry a later day) when the market is above
+    # the zone's top, instead of chasing an extended price. Sells always execute at the market.
+    "respect_entry_zones": True,
     # Goals & horizon
     "goal_amount": None,               # target $ the AI should push toward (None = no explicit goal)
     "goal_date": None,                 # ISO date by which to hit the goal

@@ -737,6 +737,10 @@ class SandboxOrder(BaseModel):
     dollars: float       # approximate notional the server sizes against available cash
     conviction: int      # 0-100
     reason: str          # one short sentence grounded in the numbers
+    # Optional BUY entry zone — the price range worth paying. The server defers the buy to a later day
+    # if the market is above entry_high, so it doesn't chase an extended print. Ignored for sells.
+    entry_low: float | None = None
+    entry_high: float | None = None
 
 
 class SandboxDecision(BaseModel):
@@ -768,7 +772,12 @@ in a strong-RS healthcare name, hold the rest").
 - orders: a SMALL list (usually 0-4) of concrete orders. For each: symbol, side (buy|sell), an approximate \
 `dollars` notional and `shares` (whole for stocks, fractional for crypto — the server re-sizes to the \
 available cash, so approximate is fine), a 0-100 `conviction`, and a one-sentence `reason` grounded in \
-ITS numbers. RULES: keep at least `cash_floor_pct`% in cash; keep every exposure_group under \
+ITS numbers. For every BUY also give an ENTRY ZONE (`entry_low`/`entry_high`) — the price range actually \
+worth paying, based on the name's own levels (e.g. near the 50-day MA, the base of the recent range, or \
+a modest premium to the last price for a strong trend). The server executes the buy ONLY if the market \
+sits at or below `entry_high`, otherwise it waits for another day — so set a zone you'd genuinely be \
+happy filling at rather than one that just rubber-stamps today's price. Omit the zone only when you want \
+to fill at any price. Sells always execute at the market (an exit shouldn't wait). RULES: keep at least `cash_floor_pct`% in cash; keep every exposure_group under \
 `max_position_pct`%; only BUY with genuine conviction (skip weak setups — cash is a fine position); \
 TRIM a large, extended, well-in-profit winner to fund a better setup or to de-risk; SELL a position \
 whose thesis is breaking (relative-strength rolling over, below the 50-day, momentum gone). Do NOT churn \
