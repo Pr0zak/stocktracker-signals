@@ -41,6 +41,14 @@ class Signal(str, Enum):
     strong_sell = "strong_sell"
 
 
+class VerdictLevels(BaseModel):
+    """Clean numeric price levels for the chart annotation (AIE-1). Any field may be null."""
+    support: float | None = None             # nearest meaningful support below price
+    resistance: float | None = None          # nearest meaningful resistance above price
+    invalidation_price: float | None = None  # the numeric level behind `invalidation`
+    target: float | None = None              # first realistic upside target
+
+
 class Verdict(BaseModel):
     signal: Signal
     conviction: int              # 0-100
@@ -50,6 +58,7 @@ class Verdict(BaseModel):
     key_risks: list[str]         # what would make this wrong
     invalidation: str            # concrete price level / condition to bail
     catalysts: list[str]         # known events ahead (empty if none provided)
+    levels: VerdictLevels | None = None  # numeric chart levels (AIE-1); null on older/rejected outputs
 
 
 SYSTEM = """You are a disciplined technical analyst assisting one retail investor's personal \
@@ -67,6 +76,11 @@ trend. A strongly extended move is a reason for caution, not for chasing.
 When the picture is mixed or weak, return "hold" with lower conviction rather than forcing a call. \
 conviction is a 0-100 scale — reserve 70+ for genuine confluence; a mixed picture is ~40-55.
 - Always give a concrete invalidation (a price level or condition that would flip your view).
+- Also fill `levels` — clean NUMERIC price levels for the chart, grounded ONLY in the price/indicator \
+numbers provided: support (nearest meaningful support below the current price), resistance (nearest \
+above), invalidation_price (the numeric price behind your `invalidation` condition), and target (a first \
+realistic upside level in the direction of your call). Use null for any level you cannot justify from the \
+numbers you were given — never invent a precise level.
 - thesis is the bottom line in AT MOST two short sentences (under 40 words). Put supporting detail \
 in `rationale` (3-5 bullets, each under 15 words), risks in `key_risks` (2-3 short bullets). Never \
 restate all the numbers in the thesis — the user sees the indicator values already.
