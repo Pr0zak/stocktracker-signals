@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from . import options
+from . import market_calendar, options
 
 _ET = ZoneInfo("America/New_York")
 
@@ -27,10 +27,10 @@ SECTORS = [
 
 def session_phase(now: dt.datetime | None = None) -> str:
     """US equity session phase in ET: PRE (4:00-9:30), REGULAR (9:30-16:00), AFTER (16:00-20:00), else
-    CLOSED. Weekends are CLOSED. Market holidays are NOT modeled (v1) — a holiday reads as its normal
-    weekday phase, but quotes come back flat so the overview still stays sane."""
+    CLOSED. Weekends AND full NYSE holidays are CLOSED (holidays via market_calendar — this closes the
+    old v1 gap where a holiday read as its normal weekday phase)."""
     et = (now or dt.datetime.now(dt.timezone.utc)).astimezone(_ET)
-    if et.weekday() >= 5:
+    if et.weekday() >= 5 or market_calendar.is_market_holiday(et.date()):
         return "CLOSED"
     mins = et.hour * 60 + et.minute
     if 4 * 60 <= mins < 9 * 60 + 30:

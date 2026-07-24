@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
+from . import market_calendar, sandbox_job, sandbox_store
 from .analyst import (
     analyze,
     daily_brief,
@@ -26,6 +27,8 @@ from .analyst import (
     rebalance_portfolio,
     recommend,
     review_portfolio,
+    sandbox_decision,
+    strategy_review,
 )
 from .discover import discover
 from .market import fetch_series, summarize
@@ -2040,3 +2043,337 @@ async def scan_latest() -> dict:
 async def scan_run() -> dict:
     """Run the configured-watchlist scan now (also wired to a nightly systemd timer)."""
     return await run_scan()
+
+
+# ======================================================================================
+# AI Sandbox — an autonomous paper-trading agent (fictional money only; never touches the real
+# Portfolio/watchlist). The systemd timer curls POST /sandbox/tick, so this single uvicorn worker is
+# the SOLE ledger writer; _sandbox_lock serializes the read-modify-write endpoints. The LLM only
+# proposes; sandbox_job.validate_and_fill is the authority on what the ledger does.
+# ======================================================================================
+
+_sandbox_lock = asyncio.Lock()
+_SANDBOX_CAND_SEM = asyncio.Semaphore(6)
+
+_SANDBOX_TECH_KEYS = ("rsi14", "macd_hist", "pct_vs_sma50", "golden_cross",
+                      "rel_strength_3mo_vs_benchmark", "pct_off_52w_high")
+
+
+async def _sandbox_candidate(sym: str, bench_closes, watch_set: set[str]) -> dict | None:
+    """A LIGHT candidate snapshot (core technicals only — no news/shorts/insider enrichment) so the
+    daily tick stays fast. Returns None for unfetchable symbols."""
+    async with _SANDBOX_CAND_SEM:
+        crypto = sym.endswith("-USD")
+        try:
+            series = await fetch_series(_http, sym)
+            summ = summarize(series, None if crypto else bench_closes)
+        except Exception:  # noqa: BLE001 — an unfetchable candidate is just dropped
+            return None
+        return {
+            "symbol": sym, "source": "watchlist" if sym in watch_set else "market_screen",
+            "price": round(summ["price"], 4), "exposure_group": _exposure_group(sym),
+            "technicals": {k: summ.get(k) for k in _SANDBOX_TECH_KEYS if summ.get(k) is not None},
+        }
+
+
+async def _sandbox_prices(held: list[str], candidate_syms: list[str]) -> dict[str, float | None]:
+    """One batched live quote for everything, with a last-close fallback for HELD names missing a live
+    price (we must be able to mark + trade positions even if the quote endpoint drops one)."""
+    syms = list({*held, *candidate_syms, "^GSPC"})
+    prices: dict[str, float | None] = {}
+    try:
+        quotes = await market_now.fetch_quotes(_http, syms)
+    except Exception:  # noqa: BLE001
+        quotes = {}
+    for s in syms:
+        prices[s] = (quotes.get(s) or {}).get("price")
+    for s in held:
+        if not prices.get(s):
+            try:
+                prices[s] = summarize(await fetch_series(_http, s), None)["price"]
+            except Exception:  # noqa: BLE001
+                pass
+    return prices
+
+
+async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
+    """Run the Opus weekly strategy review if it's due (>=7 days). Mutates blob's strategy note/date on
+    success; on failure keeps the prior note and does NOT advance the cursor (retries next trading day)."""
+    from datetime import date as _date
+    last = blob.get("last_weekly_review_date")
+    today = sandbox_job.now_et().date()
+    due = last is None
+    if not due:
+        try:
+            due = (today - _date.fromisoformat(last)).days >= 7
+        except ValueError:
+            due = True
+    if not due:
+        return False
+    context = {
+        "book": book,
+        "performance": {
+            "funded_total": blob.get("funded_total"), "cash": blob.get("cash"),
+            "realized_pl_total": blob.get("realized_pl_total"),
+        },
+    }
+    try:
+        note, usage = await strategy_review(context, settings=settings, deep=True)
+        usage_store.record(usage, symbol="SANDBOX", kind="sandbox_strategy")
+        blob["last_strategy_note"] = note.model_dump()
+        blob["last_weekly_review_date"] = today.isoformat()
+        return True
+    except Exception as e:  # noqa: BLE001 — a failed Opus review must not break the daily tick
+        _log.warning("sandbox weekly review failed (keeping prior note): %s", e)
+        return False
+
+
+async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict:
+    """One decision cycle: gate → price → (weekly review) → decide → validate+fill → log → NAV → persist."""
+    assert _http is not None
+    async with _sandbox_lock:
+        blob = sandbox_store.get()
+        now = sandbox_job.now_et()
+        proceed, status = sandbox_job.tick_gate(blob, now=now, force=force)
+        if not proceed:
+            return {"status": status, "date": sandbox_job.today_et_str(now)}
+
+        settings = blob["settings"]
+        cfg = settings_store.get()
+        held = [p["symbol"].upper() for p in blob["positions"]]
+        watch = [s.upper() for s in (cfg.get("watchlist") or [])]
+        cwatch = [f"{c.upper()}-USD" for c in (cfg.get("crypto_watchlist") or [])]
+        try:
+            discovered = [s.upper() for s in await discover(_http, set(held) | set(watch) | set(cwatch))][:8]
+        except Exception:  # noqa: BLE001
+            discovered = []
+        watch_set = set(watch) | set(cwatch)
+        candidate_syms: list[str] = []
+        for s in watch + cwatch + discovered:
+            if s not in candidate_syms and s not in held:
+                candidate_syms.append(s)
+        if not settings.get("allow_crypto", True):
+            candidate_syms = [s for s in candidate_syms if not s.endswith("-USD")]
+        candidate_syms = candidate_syms[:24]
+
+        prices = await _sandbox_prices(held, candidate_syms)
+        def price_of(sym: str):
+            return prices.get(sym.upper())
+        spy_price = prices.get("^GSPC")
+
+        warnings: list[str] = []
+        weekly_ran = False
+        posture = ""
+
+        flat = sandbox_job.exit_date_flatten_orders(blob, price_of)
+        if flat is not None:
+            orders, source = flat, "exit_date"
+            posture = "Exit date reached — flattening to cash."
+        else:
+            holdings = [Holding(symbol=p["symbol"], shares=p["shares"], avg_cost=p["avg_cost"])
+                        for p in blob["positions"]]
+            if holdings:
+                try:
+                    book = await _build_portfolio_snapshot(holdings, blob["cash"])
+                except Exception as e:  # noqa: BLE001
+                    warnings.append(f"book snapshot failed: {e}")
+                    book = {"total_value": blob["cash"], "cash_pct": 100.0, "positions": []}
+            else:
+                book = {"total_value": blob["cash"], "cash_pct": 100.0, "positions": []}
+            weekly_ran = await _maybe_weekly_review(blob, book, settings)
+            try:
+                bench_closes = (await fetch_series(_http, "^GSPC")).closes
+            except Exception:  # noqa: BLE001
+                bench_closes = None
+            candidates = [c for c in await asyncio.gather(
+                *[_sandbox_candidate(s, bench_closes, watch_set) for s in candidate_syms]) if c]
+            source = "haiku_tick"
+            try:
+                decision, usage = await sandbox_decision(
+                    book, candidates, cash=blob["cash"], settings=settings,
+                    strategy_note=blob.get("last_strategy_note"), deep=False)
+                usage_store.record(usage, symbol="SANDBOX", kind="sandbox_tick")
+                orders = [o.model_dump() for o in decision.orders]
+                posture = decision.posture
+            except Exception as e:  # noqa: BLE001 — a failed decision = no trades, still mark NAV
+                warnings.append(f"decision failed: {e}")
+                orders, posture = [], "No decision (analyst unavailable) — held."
+
+        try:
+            new_blob, filled, skipped = sandbox_job.validate_and_fill(
+                blob, orders, price_of, group_of=_exposure_group, source=source)
+        except AssertionError as e:
+            _log.error("sandbox tick ABORTED (cash not conserved): %s", e)
+            raise HTTPException(status_code=500, detail=f"sandbox tick aborted (cash not conserved): {e}")
+
+        for r in filled + skipped:
+            sandbox_store.append_trade(r)
+        pv = sandbox_job.positions_value(new_blob["positions"], price_of)
+        nav = sandbox_job.nav_row(new_blob, positions_val=pv, spy_price=spy_price)
+        sandbox_store.append_nav(nav)
+        new_blob["last_tick_date"] = sandbox_job.today_et_str(now)
+        sandbox_store.save(new_blob)
+
+        return {"status": "ok", "date": nav["date"], "posture": posture,
+                "orders_filled": filled, "orders_skipped": skipped, "nav": nav,
+                "weekly_review_ran": weekly_ran, "warnings": warnings}
+
+
+class SandboxTickRequest(BaseModel):
+    force: bool = False
+    manual: bool = False
+
+
+class SandboxFundRequest(BaseModel):
+    amount: float
+
+
+class SandboxResetRequest(BaseModel):
+    confirm: bool = False
+
+
+class SandboxSettingsPatch(BaseModel):
+    master_enabled: bool | None = None
+    risk_tolerance: str | None = None
+    retirement_date: str | None = None
+    exit_date: str | None = None
+    max_position_pct: float | None = None
+    cash_floor_pct: float | None = None
+    allow_crypto: bool | None = None
+    allow_etf: bool | None = None
+    max_trades_per_tick: int | None = None
+    max_new_positions_per_tick: int | None = None
+    min_conviction_to_trade: int | None = None
+    slippage_bps: int | None = None
+
+
+@app.post("/sandbox/tick")
+async def sandbox_tick_endpoint(req: SandboxTickRequest = SandboxTickRequest()) -> dict:
+    """Run one paper-trading decision cycle (the systemd timer curls this near the close each trading
+    day). `force` bypasses the once-a-day + intraday-phase gates for a manual "run now"."""
+    return await run_sandbox_tick(force=req.force, manual=req.manual)
+
+
+@app.get("/sandbox/state")
+async def sandbox_state_endpoint() -> dict:
+    """Live-marked snapshot: cash, positions (with unrealized P/L), equity, return vs the S&P shadow,
+    settings, cursors, and the latest strategy note."""
+    assert _http is not None
+    blob = sandbox_store.get()
+    held = [p["symbol"].upper() for p in blob["positions"]]
+    prices = await _sandbox_prices(held, []) if (held or blob["benchmark"]["shares"]) else {}
+    def price_of(sym: str):
+        return prices.get(sym.upper())
+    positions = []
+    pv = 0.0
+    for p in blob["positions"]:
+        px = price_of(p["symbol"]) or p["avg_cost"]
+        val = p["shares"] * px
+        pv += val
+        positions.append({**p, "price": round(px, 4), "value": round(val, 2),
+                          "unrealized_pct": round((px / p["avg_cost"] - 1) * 100, 2) if p["avg_cost"] else None})
+    cash = round(blob["cash"], 2)
+    equity = round(cash + pv, 2)
+    spy = price_of("^GSPC")
+    bench = blob["benchmark"]
+    bench_val = round(bench["shares"] * spy, 2) if spy and bench["shares"] else None
+    funded = blob.get("funded_total") or 0.0
+    return {
+        "cash": cash, "equity": equity, "positions_value": round(pv, 2),
+        "funded_total": round(funded, 2), "realized_pl_total": blob.get("realized_pl_total", 0.0),
+        "total_return_pct": round((equity / funded - 1) * 100, 2) if funded else None,
+        "cash_pct": round(cash / equity * 100, 1) if equity else None,
+        "benchmark_value": bench_val,
+        "vs_benchmark_pct": round((equity - bench_val) / bench_val * 100, 2) if bench_val else None,
+        "positions": sorted(positions, key=lambda x: -x["value"]),
+        "settings": blob["settings"], "enabled": blob["settings"]["master_enabled"],
+        "last_tick_date": blob.get("last_tick_date"),
+        "last_weekly_review_date": blob.get("last_weekly_review_date"),
+        "last_strategy_note": blob.get("last_strategy_note"), "created_at": blob.get("created_at"),
+    }
+
+
+@app.get("/sandbox/nav")
+async def sandbox_nav_endpoint(days: int = 120) -> dict:
+    return {"series": sandbox_store.read_nav(days)}
+
+
+@app.get("/sandbox/trades")
+async def sandbox_trades_endpoint(limit: int = 100) -> dict:
+    return {"trades": sandbox_store.read_trades(limit)}
+
+
+@app.get("/sandbox/settings")
+async def sandbox_get_settings_endpoint() -> dict:
+    return sandbox_store.get()["settings"]
+
+
+@app.post("/sandbox/settings")
+async def sandbox_set_settings_endpoint(patch: SandboxSettingsPatch) -> dict:
+    async with _sandbox_lock:
+        blob = sandbox_store.get()
+        s = blob["settings"]
+        d = patch.model_dump(exclude_none=True)
+        if d.get("risk_tolerance") in ("conservative", "balanced", "aggressive"):
+            s["risk_tolerance"] = d["risk_tolerance"]
+        for k in ("master_enabled", "allow_crypto", "allow_etf"):
+            if k in d:
+                s[k] = bool(d[k])
+        for k in ("retirement_date", "exit_date"):
+            if k in d:
+                s[k] = d[k] or None
+        if "max_position_pct" in d:
+            s["max_position_pct"] = max(5.0, min(100.0, float(d["max_position_pct"])))
+        if "cash_floor_pct" in d:
+            s["cash_floor_pct"] = max(0.0, min(90.0, float(d["cash_floor_pct"])))
+        if "min_conviction_to_trade" in d:
+            s["min_conviction_to_trade"] = max(0, min(100, int(d["min_conviction_to_trade"])))
+        if "max_trades_per_tick" in d:
+            s["max_trades_per_tick"] = max(0, min(20, int(d["max_trades_per_tick"])))
+        if "max_new_positions_per_tick" in d:
+            s["max_new_positions_per_tick"] = max(0, min(20, int(d["max_new_positions_per_tick"])))
+        if "slippage_bps" in d:
+            s["slippage_bps"] = max(0, min(200, int(d["slippage_bps"])))
+        blob["settings"] = s
+        sandbox_store.save(blob)
+        return s
+
+
+@app.post("/sandbox/fund")
+async def sandbox_fund_endpoint(req: SandboxFundRequest) -> dict:
+    """Add (or withdraw, negative) fictional cash. A positive deposit also buys shadow ^GSPC shares at
+    today's price so the benchmark tracks the same money on the same schedule."""
+    assert _http is not None
+    if req.amount == 0:
+        raise HTTPException(status_code=422, detail="amount must be non-zero")
+    async with _sandbox_lock:
+        blob = sandbox_store.get()
+        spy = None
+        try:
+            spy = (await market_now.fetch_quotes(_http, ["^GSPC"])).get("^GSPC", {}).get("price")
+        except Exception:  # noqa: BLE001
+            pass
+        if req.amount > 0 and spy:
+            blob["benchmark"]["shares"] = round(blob["benchmark"]["shares"] + req.amount / spy, 6)
+            blob["benchmark"]["cost_basis"] = round(blob["benchmark"]["cost_basis"] + req.amount, 2)
+        blob["cash"] = round(blob["cash"] + req.amount, 2)
+        blob["funded_total"] = round(blob["funded_total"] + max(0.0, req.amount), 2)
+        if blob.get("created_at") is None:
+            blob["created_at"] = time.time()
+        sandbox_store.save(blob)
+        sandbox_store.append_trade({
+            "ts": time.time(), "date": sandbox_job.today_et_str(), "symbol": "CASH",
+            "side": "deposit" if req.amount > 0 else "withdraw", "status": "filled", "shares": 0.0,
+            "price": None, "gross": round(req.amount, 2), "cash_after": blob["cash"], "source": "funding",
+            "reason": f"{'Added' if req.amount > 0 else 'Withdrew'} ${abs(req.amount):,.0f}",
+        })
+        return {"cash": blob["cash"], "funded_total": blob["funded_total"], "benchmark": blob["benchmark"]}
+
+
+@app.post("/sandbox/reset")
+async def sandbox_reset_endpoint(req: SandboxResetRequest) -> dict:
+    if not req.confirm:
+        raise HTTPException(status_code=422, detail="reset requires confirm=true")
+    async with _sandbox_lock:
+        fresh = sandbox_store.reset()
+        return {"status": "reset", "cash": fresh["cash"], "funded_total": fresh["funded_total"]}

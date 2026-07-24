@@ -722,3 +722,131 @@ async def rebalance_portfolio(
         + "\n\nReturn the concrete rebalance plan (real share counts + dollar amounts)."
     )
     return await _parse(REBALANCE_SYSTEM, prompt, RebalancePlan, deep=deep, max_tokens=4096)
+
+
+# ======================================================================================
+# AI Sandbox (autonomous paper trader) — a daily decision (Haiku) that emits a unified order list to
+# steer a fictional book toward a weekly strategy (Opus). The server validates + fills; the LLM only
+# proposes. Both go through the shared _parse() so the api|cli provider toggle applies.
+# ======================================================================================
+
+class SandboxOrder(BaseModel):
+    symbol: str
+    side: str            # "buy" | "sell"
+    shares: float        # whole for stocks, fractional (6dp) for crypto — the server RE-DERIVES this
+    dollars: float       # approximate notional the server sizes against available cash
+    conviction: int      # 0-100
+    reason: str          # one short sentence grounded in the numbers
+
+
+class SandboxDecision(BaseModel):
+    posture: str                     # one-line read of today's plan
+    orders: list[SandboxOrder]       # the concrete buys/sells for today (may be empty = hold)
+    hold_reasons: list[str] = []     # short notes on notable positions deliberately left alone
+
+
+SANDBOX_SYSTEM = """You are the portfolio manager of a FICTIONAL paper-trading account (no real money). \
+Each trading day you make ONE decision: a short list of concrete buy/sell orders that moves the book \
+toward its strategy while respecting hard risk limits. You receive JSON: `equity` and `cash`+`cash_pct`; \
+a `positions` list (each with weight_pct, unrealized_gain_pct, price, `exposure_group`, and technicals — \
+RSI, MACD histogram, % vs 50-day MA, golden-cross, 3-month relative strength vs the S&P, % off 52-week \
+high); `candidates` (not-yet-held names to consider, each with the same technicals and a `source`); the \
+account `settings` (risk_tolerance, retirement_date, exit_date, max_position_pct, cash_floor_pct, \
+allow_crypto, allow_etf); and `strategy_note` — the weekly game plan (stance, cash target, per-exposure \
+target weights) you should steer toward (may be null early on).
+
+Positions/candidates that share an `exposure_group` are the SAME economic exposure (e.g. BTC and a \
+spot-bitcoin ETF like FBTC/IBIT are both bitcoin; SPY/VOO are the S&P). Judge weight and caps on the \
+COMBINED exposure, act on ONE vehicle per group, and NEVER sell one to buy its equivalent.
+
+Return a `SandboxDecision`:
+- posture: ONE sentence — what today's plan does and why (e.g. "Trim extended NVDA, start a half-position \
+in a strong-RS healthcare name, hold the rest").
+- orders: a SMALL list (usually 0-4) of concrete orders. For each: symbol, side (buy|sell), an approximate \
+`dollars` notional and `shares` (whole for stocks, fractional for crypto — the server re-sizes to the \
+available cash, so approximate is fine), a 0-100 `conviction`, and a one-sentence `reason` grounded in \
+ITS numbers. RULES: keep at least `cash_floor_pct`% in cash; keep every exposure_group under \
+`max_position_pct`%; only BUY with genuine conviction (skip weak setups — cash is a fine position); \
+TRIM a large, extended, well-in-profit winner to fund a better setup or to de-risk; SELL a position \
+whose thesis is breaking (relative-strength rolling over, below the 50-day, momentum gone). Do NOT churn \
+— if nothing clears the bar, return an empty `orders` list and explain in `posture`.
+- hold_reasons: brief notes on 1-3 notable holds.
+
+Bias by `risk_tolerance` (conservative = more cash, defensives, broad diversification, smaller positions; \
+aggressive = more concentrated, higher-beta, fully invested) and by the GLIDEPATH: as `retirement_date` \
+or `exit_date` approaches, shift progressively toward cash/defensives; if past/at `exit_date`, sell \
+everything to cash. Respect allow_crypto / allow_etf. Ground EVERY order in the numbers — never invent \
+news or prices. Plain reasons, no markdown."""
+
+
+async def sandbox_decision(
+    book: dict, candidates: list[dict], *, cash: float, settings: dict,
+    strategy_note: dict | None, deep: bool = False,
+) -> tuple[SandboxDecision, dict]:
+    """The daily sandbox decision (Haiku by default): a unified order list to steer the book toward the
+    strategy within the risk limits. The server validates/clamps/fills afterward — this only proposes."""
+    payload = {
+        "equity": book.get("total_value"),
+        "cash": round(cash, 2),
+        "cash_pct": book.get("cash_pct"),
+        "positions": book.get("positions", []),
+        "candidates": candidates,
+        "settings": settings,
+        "strategy_note": strategy_note,
+    }
+    prompt = (
+        "Make today's paper-trading decision for this account.\n"
+        + json.dumps(payload, indent=2, default=str)
+        + "\n\nReturn the SandboxDecision (a short, concrete order list; empty if nothing clears the bar)."
+    )
+    return await _parse(SANDBOX_SYSTEM, prompt, SandboxDecision, deep=deep, max_tokens=2048)
+
+
+class TargetWeight(BaseModel):
+    exposure_group: str
+    target_pct: float
+
+
+class StrategyNote(BaseModel):
+    stance: str                      # "constructive" | "neutral" | "defensive"
+    cash_target_pct: float
+    targets: list[TargetWeight] = []  # the per-exposure game plan the daily tick steers toward
+    themes: list[str] = []           # what to lean into
+    avoid: list[str] = []            # what to steer clear of
+    notes: str = ""                  # one short paragraph of reasoning
+
+
+STRATEGY_SYSTEM = """You are the chief strategist for a FICTIONAL paper-trading account, setting the \
+WEEKLY game plan that a daily execution model then steers the book toward. You receive JSON: the current \
+`book` (positions with weights + exposure_group + technicals, cash, equity), recent `performance` \
+(total return, return vs the S&P benchmark, max drawdown), a `market` snapshot (indices, VIX, sector \
+leaders/laggards, the S&P's 50/200-day trend), the tradable `universe`, and the account `settings` \
+(risk_tolerance, retirement_date, exit_date).
+
+Return a `StrategyNote` — the north star for the coming week:
+- stance: exactly one of "constructive", "neutral", or "defensive", grounded in the regime (S&P vs its \
+200-day, VIX, breadth) AND the account's risk tolerance + time horizon.
+- cash_target_pct: how much of equity to hold in cash this week (higher when defensive / near a horizon \
+date / high volatility).
+- targets: a handful of `exposure_group` → target_pct weights that express the plan (they need not sum \
+to 100 with cash; keep each under a sensible single-name cap). Group equivalent vehicles (BTC≡FBTC).
+- themes: 2-4 short things to lean into (sectors/factors), grounded in the sector rotation + relative \
+strength you see.
+- avoid: 1-3 short things to steer clear of.
+- notes: one short paragraph tying it together.
+
+Bias by `risk_tolerance` and the GLIDEPATH toward `retirement_date`/`exit_date` (raise cash + defense as \
+they near). Ground everything in the numbers and the regime — no invented catalysts. Plain text, no \
+markdown."""
+
+
+async def strategy_review(context: dict, *, settings: dict, deep: bool = True) -> tuple[StrategyNote, dict]:
+    """The weekly strategy review (Opus by default): a durable game plan the daily sandbox decision then
+    executes toward. Degrades gracefully upstream — the caller keeps the prior note if this fails."""
+    payload = {**context, "settings": settings}
+    prompt = (
+        "Set the weekly strategy for this paper-trading account.\n"
+        + json.dumps(payload, indent=2, default=str)
+        + "\n\nReturn the StrategyNote (stance, cash target, per-exposure targets, themes, avoid, notes)."
+    )
+    return await _parse(STRATEGY_SYSTEM, prompt, StrategyNote, deep=deep, max_tokens=1536)
