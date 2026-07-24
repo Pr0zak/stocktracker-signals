@@ -19,6 +19,7 @@ from .analyst import (
     analyze,
     daily_brief,
     market_overview,
+    news_moves,
     options_note,
     plan_entry,
     recommend,
@@ -26,7 +27,7 @@ from .analyst import (
 )
 from .discover import discover
 from .market import fetch_series, summarize
-from .news import fetch_context
+from .news import fetch_context, fetch_dated_news
 from .scan_job import LATEST, run_scan
 
 _http: httpx.AsyncClient | None = None
@@ -1201,6 +1202,75 @@ async def seasonality_endpoint(symbol: str) -> dict:
     assert _http is not None
     data = await seasonality.seasonality(_http, symbol.upper())
     return {"symbol": symbol.upper(), "seasonality": data}
+
+
+@app.get("/news_moves/{symbol}")
+async def news_moves_endpoint(symbol: str, deep: bool = False) -> dict:
+    """AIE-4 — why the stock moved. Finds its notable daily moves over ~3 weeks, pulls dated company
+    news, and has the analyst correlate them: which move was news-driven and which happened on flows/
+    technicals. Equities only (Finnhub news is equities); crypto returns a friendly note. Cached ~1h.
+    Returns {symbol, news_moves: {summary, drivers[]}|null, note?}."""
+    assert _http is not None
+    sym = symbol.upper()
+    if sym.endswith("-USD"):
+        return {"symbol": sym, "news_moves": None, "note": "News correlation isn't available for crypto."}
+
+    now = time.time()
+    key = ("news_moves", sym, deep)
+    hit = _cache.get(key)
+    if hit and now - hit[0] < 3600:
+        return {**hit[1], "cached": True}
+
+    try:
+        series = await fetch_series(_http, sym)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"price fetch failed: {e}")
+
+    # Notable daily moves over the last ~15 trading days: |move| >= 3%, keep the 4 most extreme, newest
+    # first. A YYYYMMDD date → YYYY-MM-DD so it lines up with the news dates.
+    closes, dates = series.closes[-16:], series.dates[-16:]
+    moves: list[dict] = []
+    for i in range(1, len(closes)):
+        prev, cur = closes[i - 1], closes[i]
+        if not prev:
+            continue
+        pct = (cur - prev) / prev * 100.0
+        if abs(pct) >= 3.0:
+            d = dates[i]
+            iso = f"{d[0:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else d
+            moves.append({"date": iso, "move_pct": round(pct, 2)})
+    moves = sorted(moves, key=lambda m: abs(m["move_pct"]), reverse=True)[:4]
+    moves.sort(key=lambda m: m["date"], reverse=True)
+
+    if not moves:
+        payload = {"symbol": sym, "news_moves": {
+            "summary": "No outsized daily moves in the last few weeks — the stock's been calm.",
+            "drivers": [],
+        }, "model": "", "as_of": now, "cached": False}
+        _cache[key] = (now, payload)
+        return payload
+
+    news = await fetch_dated_news(_http, sym)
+    if not news:
+        # Moves but no news coverage to correlate — report the moves honestly without spending an LLM call.
+        payload = {"symbol": sym, "news_moves": {
+            "summary": "Notable moves, but no news coverage was available to correlate them.",
+            "drivers": [{"date": m["date"], "move_pct": m["move_pct"], "headline": None,
+                         "explanation": "No headlines available for this day."} for m in moves],
+        }, "model": "", "as_of": now, "cached": False}
+        _cache[key] = (now, payload)
+        return payload
+
+    try:
+        nm, usage = await news_moves(sym, moves, news, deep=deep)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+    usage_store.record(usage, symbol=sym, kind="news_moves")
+
+    payload = {"symbol": sym, "news_moves": nm.model_dump(), "model": usage["model"],
+               "as_of": now, "usage": usage, "cached": False}
+    _cache[key] = (now, payload)
+    return payload
 
 
 @app.get("/quality/{symbol}")

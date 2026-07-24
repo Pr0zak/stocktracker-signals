@@ -52,3 +52,45 @@ async def fetch_context(client: httpx.AsyncClient, symbol: str) -> dict:
         pass
 
     return out
+
+
+async def fetch_dated_news(client: httpx.AsyncClient, symbol: str, days: int = 16) -> list[dict]:
+    """Company news over the last [days], each carrying its ET date so the analyst can line headlines
+    up against specific price moves (AIE-4). Returns [{date: YYYY-MM-DD, headline, summary, source, url}]
+    newest-first. Empty when no Finnhub key, on any failure, or for a symbol with no coverage."""
+    key = settings_store.get().get("finnhub_api_key", "")
+    if not key:
+        return []
+    today = dt.date.today()
+    try:
+        r = await client.get(
+            f"{_BASE}/company-news",
+            params={"symbol": symbol, "from": (today - dt.timedelta(days=days)).isoformat(),
+                    "to": today.isoformat(), "token": key},
+            timeout=12,
+        )
+        r.raise_for_status()
+        raw = r.json()
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for n in raw:
+        head = (n.get("headline") or "").strip()
+        ts = n.get("datetime")
+        if not head or not ts:
+            continue
+        try:
+            date = dt.datetime.utcfromtimestamp(int(ts)).date().isoformat()
+        except Exception:  # noqa: BLE001
+            continue
+        out.append({
+            "date": date,
+            "headline": head,
+            "summary": (n.get("summary") or "").strip()[:280],
+            "source": (n.get("source") or "").strip(),
+            "url": (n.get("url") or "").strip(),
+        })
+    out.sort(key=lambda x: x["date"], reverse=True)
+    return out

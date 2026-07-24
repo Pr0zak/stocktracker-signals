@@ -508,6 +508,55 @@ async def daily_brief(snapshot: dict, *, deep: bool = False) -> tuple[DailyBrief
 
 
 # ======================================================================================
+# News → move correlation (AIE-4) — line the stock's notable recent daily moves up against dated
+# headlines and judge which move was news-driven and which happened on flows/technicals alone.
+# ======================================================================================
+
+class NewsDriver(BaseModel):
+    date: str               # YYYY-MM-DD of the move
+    move_pct: float         # that day's % change
+    headline: str | None = None  # the headline that best explains it, verbatim; null if none fits
+    explanation: str        # one sentence: what drove the move (or "no clear catalyst — flows/technicals")
+
+
+class NewsMoves(BaseModel):
+    summary: str            # one-line read: is the stock trading on news, or on flows/technicals?
+    drivers: list[NewsDriver]
+
+
+NEWS_MOVES_SYSTEM = """You explain WHY a stock moved. You receive a ticker, a list of its NOTABLE recent \
+daily moves (each: date + % change), and a list of dated company-news headlines (date, headline, source). \
+Your job is to correlate the two — HONESTLY, without inventing anything.
+
+Return a structured read:
+- summary: ONE sentence — is this stock trading on news/catalysts right now, or drifting on flows and \
+technicals with no obvious headline driver? Ground it in what you actually see.
+- drivers: EXACTLY ONE entry per notable move you were given, most-recent first. For each: echo its date \
+and move_pct; set `headline` to the ONE provided headline (verbatim) that best explains that day's move \
+(same day, or the trading day before an open gap) or null if none genuinely fits; and write `explanation` \
+— one sentence tying the move to that news, OR, when nothing fits, say plainly it moved with no clear \
+catalyst in the headlines (a flows/technical/market-beta move).
+Rules: NEVER invent a headline or attribute a move to news that isn't in the list. Correlation is not \
+proof — hedge with "likely"/"appears". A big move with no matching headline is a REAL and useful finding, \
+not a failure — say so. Plain text, no markdown, no disclaimer line (the app adds one)."""
+
+
+async def news_moves(
+    symbol: str, moves: list[dict], news: list[dict], *, deep: bool = False,
+) -> tuple[NewsMoves, dict]:
+    """Correlate a stock's notable recent daily moves with dated headlines (AIE-4). `moves` is
+    [{date, move_pct}], `news` is [{date, headline, source, ...}]. Cheap scan model by default; honors
+    the api/cli provider toggle via _parse(). Raises on API/empty output so the route 502s cleanly."""
+    prompt = (
+        f"Ticker: {symbol}\n\n"
+        f"Notable recent daily moves (date, % change):\n{json.dumps(moves, indent=2, default=str)}\n\n"
+        f"Dated company-news headlines:\n{json.dumps(news, indent=2, default=str)}\n\n"
+        "Correlate the moves with the headlines and return the structured read."
+    )
+    return await _parse(NEWS_MOVES_SYSTEM, prompt, NewsMoves, deep=deep, max_tokens=1536)
+
+
+# ======================================================================================
 # Portfolio review — a structured, whole-portfolio read: concentration, a per-holding action list,
 # and cash deployment. One structured call over lightweight technical snapshots of each holding.
 # ======================================================================================
