@@ -55,6 +55,10 @@ DEFAULT_SETTINGS = {
     "exclusions": [],                  # tickers the AI must never buy (uppercase, e.g. ["TSLA"])
     # Automation
     "cadence": "daily",                # "daily" | "weekly" — how often it DECIDES (NAV still marks daily)
+    # Whether the tick may trade during the 16:00-20:00 ET after-hours window. OFF by default: extended
+    # -hours books are thin and spreads are wide, so a fill there is less realistic and riskier. With it
+    # off the tick only trades in the regular session (crypto is 24/7 and unaffected).
+    "allow_after_hours": False,
     # Churn control: cap the % of equity that may CHANGE HANDS in one decision (buys+sells notional).
     # 0 = unlimited. Lower = calmer, buy-and-hold-ish; higher = lets it reposition aggressively.
     "max_turnover_pct": 25.0,

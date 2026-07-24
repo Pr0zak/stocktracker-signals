@@ -22,7 +22,8 @@ ET = ZoneInfo("America/New_York")
 
 # Session windows in ET seconds-of-day (mirrors market_now.session_phase, kept local to avoid a cycle).
 _REG_OPEN = 9 * 3600 + 30 * 60   # 09:30
-_AFTER_END = 20 * 3600           # 20:00
+_REG_END = 16 * 3600             # 16:00 — regular session close
+_AFTER_END = 20 * 3600           # 20:00 — after-hours close
 
 
 def now_et() -> dt.datetime:
@@ -53,9 +54,14 @@ def tick_gate(blob: dict, *, now: dt.datetime | None = None, force: bool = False
     if not market_calendar.is_trading_day(today):
         return False, "market_closed"
     sod = now.hour * 3600 + now.minute * 60 + now.second
-    in_session = _REG_OPEN <= sod < _AFTER_END  # REGULAR or AFTER — same-day prices exist
-    if not in_session and not force:
-        return False, "outside_session"
+    allow_after = bool((blob.get("settings") or {}).get("allow_after_hours", False))
+    in_regular = _REG_OPEN <= sod < _REG_END
+    in_after = _REG_END <= sod < _AFTER_END
+    if not force:
+        if in_after and not allow_after:
+            return False, "after_hours_disabled"
+        if not (in_regular or in_after):
+            return False, "outside_session"
     if blob.get("last_tick_date") == today.isoformat() and not force:
         return False, "already_ran"
     return True, "ok"
