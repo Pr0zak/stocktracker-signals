@@ -152,6 +152,7 @@ def validate_and_fill(
         skipped.append({"ts": now_ts, "date": today_et_str(), "symbol": o.get("symbol", "").upper(),
                         "side": o.get("side"), "status": "skipped", "shares": 0.0, "price": None,
                         "conviction": o.get("conviction"), "source": source, "reason": o.get("reason", ""),
+                        "entry_low": o.get("entry_low"), "entry_high": o.get("entry_high"),
                         "skip_reason": why})
 
     def _fill(o: dict, side: str, shares: float, price: float, realized: float, cash_after: float,
@@ -163,6 +164,7 @@ def validate_and_fill(
             "avg_cost_after": round(pos_after["avg_cost"], 4) if pos_after else None,
             "realized_pl": round(realized, 2), "exposure_group": group_of(o["symbol"]),
             "conviction": o.get("conviction"), "source": source, "reason": o.get("reason", ""),
+            "entry_low": o.get("entry_low"), "entry_high": o.get("entry_high"),
         })
 
     sells = [o for o in orders if o.get("side") == "sell"]
