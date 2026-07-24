@@ -615,19 +615,28 @@ class PortfolioReview(BaseModel):
 
 
 PORTFOLIO_SYSTEM = """You are a disciplined portfolio strategist reviewing one retail investor's WHOLE \
-stock/crypto portfolio. You receive: cash + cash_pct, total_value, and a `positions` list where each \
-holding has its weight_pct, unrealized_gain_pct, price, and key technicals (RSI, MACD histogram, % vs \
-the 50-day MA, golden-cross flag, 3-month relative strength vs the S&P, and % off its 52-week high).
+stock/crypto portfolio. You receive: cash + cash_pct, total_value, a `positions` list where each holding \
+has its weight_pct, unrealized_gain_pct, price, an `exposure_group`, and key technicals (RSI, MACD \
+histogram, % vs the 50-day MA, golden-cross flag, 3-month relative strength vs the S&P, and % off its \
+52-week high), and `equivalent_exposures` — a map of any groups the user holds MORE THAN ONE vehicle of.
+
+Positions that share an `exposure_group` are the SAME underlying economic exposure (e.g. BTC and a spot- \
+bitcoin ETF like FBTC/IBIT are both just bitcoin; SPY and VOO are both the S&P 500). Their technicals \
+will look nearly identical — do NOT treat them as independent bets.
 
 Return a structured review:
 - health: ONE sentence on the book's overall posture (diversified vs concentrated, momentum tilt, cash level).
-- concentration: flag genuine risks — any single position over ~20-25% of the book, several holdings that \
-are clearly the same theme/sector (judge from the tickers you know), or a very low cash buffer. Empty list \
-if it's reasonably balanced. Be specific ("NVDA is 34% of the book"). Do NOT invent sectors you can't infer.
+- concentration: flag genuine risks — any single exposure over ~20-25% of the book (SUM the weights of an \
+exposure_group before judging — e.g. BTC + FBTC together), several holdings that are clearly the same \
+theme/sector, or a very low cash buffer. If `equivalent_exposures` is non-empty, flag that the user holds \
+redundant vehicles for the same thing and suggest consolidating into the cheaper/more-liquid one. Empty \
+list if it's reasonably balanced. Be specific ("BTC exposure is 40% of the book across BTC + FBTC").
 - actions: EXACTLY ONE entry per holding, action ∈ trim | hold | add | watch, with a one-sentence reason \
 grounded in ITS numbers: trim a large, well-in-profit, extended winner (protect gains / rebalance); add to \
 an underweight name with a genuinely strong setup; hold when there's no edge; watch when it's weakening but \
-not yet actionable. NEVER advise averaging down just because a position is red.
+not yet actionable. NEVER advise averaging down just because a position is red. Holdings in the SAME \
+exposure_group MUST get a consistent stance — never tell the user to add one and trim its equivalent (a \
+pointless wash); pick ONE vehicle to act on and hold the other.
 - cash_note: what to do with the idle cash (deploy into the best-setup adds, keep dry powder if nothing's \
 compelling, etc.), consistent with your actions.
 
@@ -671,9 +680,15 @@ class RebalancePlan(BaseModel):
 REBALANCE_SYSTEM = """You are a disciplined portfolio strategist producing a CONCRETE, ACTIONABLE \
 rebalance plan for one retail investor who trades MANUALLY (so give real share counts and dollar \
 amounts they can enter). You receive: cash + cash_pct, total_value, a `max_position_pct` target (the \
-largest weight any single holding should have after rebalancing), and a `positions` list where each \
-holding has its price, shares, value, weight_pct, unrealized_gain_pct, and key technicals (RSI, MACD \
-histogram, % vs 50-day MA, golden-cross, 3-month relative strength vs the S&P, % off 52-week high).
+largest weight any single EXPOSURE should have after rebalancing), a `positions` list where each holding \
+has its price, shares, value, weight_pct, unrealized_gain_pct, an `exposure_group`, and key technicals \
+(RSI, MACD histogram, % vs 50-day MA, golden-cross, 3-month relative strength vs the S&P, % off 52-week \
+high), and `equivalent_exposures` — a map of any groups the user holds more than one vehicle of.
+
+Positions sharing an `exposure_group` are the SAME underlying exposure (e.g. BTC and a spot-bitcoin ETF \
+like FBTC/IBIT; SPY and VOO). Judge the max-weight target against the COMBINED weight of a group, act on \
+ONE vehicle per group (prefer the more-liquid / lower-cost one), give the group a consistent direction, \
+and NEVER sell one vehicle to buy its equivalent — that's a wash that just churns fees.
 
 Produce a plan that ONLY trades the EXISTING holdings + deploys the idle cash (do NOT introduce new \
 tickers — that's a different tool):

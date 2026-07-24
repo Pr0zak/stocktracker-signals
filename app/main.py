@@ -1742,6 +1742,26 @@ class Holding(BaseModel):
     avg_cost: float
 
 
+# Holdings that are the SAME economic exposure map to a shared group key, so the portfolio review +
+# rebalance can treat e.g. BTC and a spot-Bitcoin ETF (FBTC/IBIT/…) as one exposure instead of two
+# independent positions with their own (near-identical) technicals. Keys are the un-suffixed symbol.
+_EXPOSURE_GROUP: dict[str, str] = {}
+for _s in ("BTC", "IBIT", "FBTC", "GBTC", "BITB", "ARKB", "BTCO", "HODL", "BRRR", "EZBC", "BTCW"):
+    _EXPOSURE_GROUP[_s] = "BTC"          # bitcoin + US spot-bitcoin ETFs
+for _s in ("ETH", "FETH", "ETHA", "ETHE", "ETHW", "CETH", "EZET", "ETHV"):
+    _EXPOSURE_GROUP[_s] = "ETH"          # ether + US spot-ether ETFs
+for _s in ("GLD", "IAU", "GLDM", "SGOL", "IAUM", "BAR", "AAAU"):
+    _EXPOSURE_GROUP[_s] = "GOLD"         # gold-bullion ETFs
+for _s in ("SPY", "VOO", "IVV", "SPLG"):
+    _EXPOSURE_GROUP[_s] = "SP500"        # S&P 500 index ETFs
+
+
+def _exposure_group(symbol: str) -> str:
+    """The shared-exposure key for a holding (its own symbol when it has no known equivalent)."""
+    base = symbol.upper().removesuffix("-USD")
+    return _EXPOSURE_GROUP.get(base, base)
+
+
 async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dict:
     """Price a set of holdings into the shared portfolio structure used by the review + rebalance
     endpoints: cash / cash_pct / total_value plus a `positions` list (price, shares, value, weight_pct,
@@ -1767,6 +1787,7 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
             price = summ["price"]
             return {
                 "symbol": sym.removesuffix("-USD"),
+                "exposure_group": _exposure_group(sym),
                 "shares": h.shares,
                 "avg_cost": h.avg_cost,
                 "price": round(price, 4),
@@ -1783,11 +1804,19 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
     total_value = sum(r["value"] for r in rows) + max(cash, 0.0)
     for r in rows:
         r["weight_pct"] = round(100.0 * r["value"] / total_value, 1) if total_value else None
+    # Groups the user holds more than one vehicle of — the SAME underlying exposure via redundant
+    # tickers (e.g. BTC + FBTC). Surfaced so the analyst combines their weight + gives a consistent
+    # stance instead of independent per-ticker calls.
+    _by_group: dict[str, list[str]] = {}
+    for r in rows:
+        _by_group.setdefault(r["exposure_group"], []).append(r["symbol"])
+    equivalent = {g: syms for g, syms in _by_group.items() if len(syms) > 1}
     return {
         "cash": round(cash, 2),
         "cash_pct": round(100.0 * max(cash, 0.0) / total_value, 1) if total_value else 0.0,
         "total_value": round(total_value, 2),
         "positions": sorted(rows, key=lambda r: r["value"], reverse=True),
+        "equivalent_exposures": equivalent,
     }
 
 
