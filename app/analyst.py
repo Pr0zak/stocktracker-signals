@@ -842,6 +842,18 @@ discount as free. Small gaps (<2%) are noise — ignore them. Never assume a gap
 filled within 10 days only ~39% of the time. Buying general weakness (a name that merely closed down) \
 measured NEGATIVE, so only the gap itself matters.
 
+If a candidate carries a `track_record` block, that is what setups with THESE numbers actually did over \
+the next 20 trading days, measured on this app's own universe. Most rows are historical setups replayed \
+from price data and carry no call of their own — so treat them as OCCURRENCES, not past predictions. \
+The ONLY figure worth acting on is `vs_benchmark`: median EXCESS return and `beat_rate_20d` against the \
+S&P over the same window. Ignore `positive_rate_20d` entirely — equities drift up, so ~55-60% of any \
+20-day window is positive and a raw win rate near that is evidence of nothing. Use it as a TIE-BREAKER \
+between candidates you already like on trend and momentum, and as a reason to SIZE DOWN or skip when a \
+setup's measured excess is negative. It must never manufacture a buy on its own. Hard limits: respect \
+`n` (under ~20 is anecdote), and remember the sample is roughly two years of ONE market regime on a \
+watchlist the user chose — a strong-looking edge there can be regime luck, not skill, so it may adjust \
+conviction by a little and must never override the conviction floor, position caps, or the strategy note.
+
 Bias by `risk_tolerance` (conservative = more cash, defensives, broad diversification, smaller positions; \
 aggressive = more concentrated, higher-beta, fully invested) and by the GLIDEPATH: as `retirement_date` \
 or `exit_date` approaches, shift progressively toward cash/defensives; if past/at `exit_date`, sell \
@@ -913,7 +925,17 @@ strength you see.
 
 Bias by `risk_tolerance` and the GLIDEPATH toward `retirement_date`/`exit_date` (raise cash + defense as \
 they near); if `goal_amount`/`goal_date` are set, set the stance's aggressiveness by the pace needed to \
-reach the goal in time. Ground everything in the numbers and the regime — no invented catalysts. Plain \
+reach the goal in time. Ground everything in the numbers and the regime — no invented catalysts.
+
+If `track_record` is present it is the honest scorecard of this system's OWN decisions, graded on a \
+20-trading-day horizon: `buy_calls` is what the watchlist analyst called a buy, `sandbox_buys` is what \
+this paper account actually bought. The figure that matters is `avg_excess_20d_pct` / `beat_rate_20d` — \
+performance against simply owning the index. `positive_rate_20d` is noise (equities drift up). You are \
+the only stage that should react to this: if `beat_rate_20d` is persistently below ~0.50 across a \
+meaningful `n`, the method is not adding value, and the correct response is to say so plainly in \
+`notes` and shift toward a simpler, more index-like, lower-turnover stance — NOT to trade harder \
+looking for a win. Respect `n`: under ~20 decisions is far too early to conclude anything, and two \
+years of one market regime cannot prove skill. Never hide a bad number. Plain \
 text, no markdown."""
 
 

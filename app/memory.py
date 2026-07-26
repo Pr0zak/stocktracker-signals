@@ -598,13 +598,24 @@ def stats() -> dict:
             by_kind = db.execute(
                 "SELECT kind, COUNT(*) c FROM notes GROUP BY kind ORDER BY c DESC"
             ).fetchall()
-            hit = db.execute(
-                "SELECT COUNT(*) n, AVG(fwd_20d > 0) rate, AVG(fwd_20d) avg, "
-                "AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d - bench_fwd_20d END) exc, "
-                "AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d > bench_fwd_20d END) beat "
-                "FROM verdicts WHERE scored_at IS NOT NULL AND origin = 'model' "
-                "AND LOWER(COALESCE(signal,'')) IN ('buy','strong_buy','add')"
-            ).fetchone()
+            # Two scorecards, deliberately NOT merged: 'model' is what the analyst *said* on the
+            # watchlist, 'sandbox' is what the paper trader actually *bought*. Different processes
+            # answering different questions — averaging them would hide which one works.
+            cards = {
+                origin: db.execute(
+                    "SELECT COUNT(*) n, AVG(fwd_20d > 0) rate, AVG(fwd_20d) avg, "
+                    "AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d - bench_fwd_20d END) exc, "
+                    "AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d > bench_fwd_20d END) beat "
+                    "FROM verdicts WHERE scored_at IS NOT NULL AND origin = ? "
+                    "AND LOWER(COALESCE(signal,'')) IN ('buy','strong_buy','add')",
+                    (origin,),
+                ).fetchone()
+                for origin in ("model", "sandbox")
+            }
+            by_origin = {
+                r["origin"]: r["c"]
+                for r in db.execute("SELECT origin, COUNT(*) c FROM verdicts GROUP BY origin")
+            }
         out: dict[str, Any] = {
             "verdicts": v["c"] or 0,
             "scored": v["scored"] or 0,
@@ -612,19 +623,23 @@ def stats() -> dict:
             "oldest_ts": v["oldest"],
             "notes": n["c"] or 0,
             "notes_by_kind": {r["kind"]: r["c"] for r in by_kind},
+            "by_origin": by_origin,
             "db_bytes": _FILE.stat().st_size if _FILE.exists() else 0,
         }
-        if (hit["n"] or 0) >= _MIN_SAMPLES:
-            # The service's own scorecard: of everything it called a buy, how much did it actually
-            # beat just owning the index by? This is the number that says whether any of it works.
-            out["buy_calls"] = {
-                "n": hit["n"],
-                "positive_rate_20d": round(float(hit["rate"] or 0), 3),
-                "avg_fwd_20d_pct": round(float(hit["avg"] or 0), 2),
+        # The scorecards: of everything called a buy, how much did it beat simply owning the index?
+        # This is the number that says whether any of this works — surfaced even when unflattering.
+        for label, row in (("buy_calls", cards["model"]), ("sandbox_buys", cards["sandbox"])):
+            if (row["n"] or 0) < _MIN_SAMPLES:
+                continue
+            card = {
+                "n": row["n"],
+                "positive_rate_20d": round(float(row["rate"] or 0), 3),
+                "avg_fwd_20d_pct": round(float(row["avg"] or 0), 2),
             }
-            if hit["exc"] is not None:
-                out["buy_calls"]["avg_excess_20d_pct"] = round(float(hit["exc"]), 2)
-                out["buy_calls"]["beat_rate_20d"] = round(float(hit["beat"] or 0), 3)
+            if row["exc"] is not None:
+                card["avg_excess_20d_pct"] = round(float(row["exc"]), 2)
+                card["beat_rate_20d"] = round(float(row["beat"] or 0), 3)
+            out[label] = card
         return out
     except Exception:  # noqa: BLE001
         log.warning("memory: stats failed", exc_info=True)

@@ -2127,6 +2127,14 @@ async def _sandbox_candidate(sym: str, bench_closes, watch_set: set[str]) -> dic
         g = gaps.compact(gaps.detect(series.closes, series.opens, series.volumes))
         if g:
             row["gap"] = g
+        # What this setup has actually done before, benchmark-relative. The sandbox commits capital on
+        # these decisions, so it is the one caller with real consequences riding on the base rate.
+        try:
+            track = memory.similar_setups(sym, summ)
+            if track:
+                row["track_record"] = track
+        except Exception:  # noqa: BLE001 — enrichment, never a blocker
+            pass
         return row
 
 
@@ -2171,6 +2179,15 @@ async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
             "realized_pl_total": blob.get("realized_pl_total"),
         },
     }
+    # The weekly review is the right altitude to react to "the way I've been picking isn't working" —
+    # the daily tick is too close to the trade to reconsider its own method.
+    try:
+        st = memory.stats()
+        card = {k: st[k] for k in ("buy_calls", "sandbox_buys") if k in st}
+        if card:
+            context["track_record"] = card
+    except Exception:  # noqa: BLE001 — enrichment, never a blocker
+        pass
     try:
         note, usage = await strategy_review(context, settings=settings, deep=True)
         usage_store.record(usage, symbol="SANDBOX", kind="sandbox_strategy")
@@ -2267,6 +2284,9 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         warnings: list[str] = []
         weekly_ran = False
         posture = ""
+        # Bound on every path — the exit-date and weekly-cadence branches below skip the decision
+        # entirely, and the fill recorder after validate_and_fill still reads this.
+        candidates: list[dict] = []
 
         flat = sandbox_job.exit_date_flatten_orders(blob, price_of)
         if flat is not None:
@@ -2325,6 +2345,23 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 + (f" — intended: {r['reason']}" if r.get("reason") else ""),
                 symbol=r.get("symbol"),
                 meta={"skip_reason": r.get("skip_reason"), "date": r.get("date")},
+            )
+        # Fills are the tighter loop: a verdict is an opinion, but a BUY is capital committed, and it
+        # gets graded on exactly the same 20-day horizon as everything else. Recorded with the setup
+        # that justified it, so "when this thing actually bought this pattern, did it beat the index?"
+        # becomes answerable — separately from what it merely said.
+        by_symbol = {c["symbol"]: c for c in candidates}
+        today_str = sandbox_job.today_et_str(now)
+        for r in filled:
+            cand = by_symbol.get(r.get("symbol"))
+            if not cand or r.get("side") not in ("buy", "sell"):
+                continue
+            summ = {"price": r.get("price"), "as_of_date": today_str, **(cand.get("technicals") or {})}
+            memory.record_verdict(
+                symbol=r["symbol"], summary=summ,
+                verdict={"signal": r["side"], "conviction": r.get("conviction"),
+                         "thesis": r.get("reason")},
+                model=settings_store.get()["scan_model"], origin="sandbox",
             )
         pv = sandbox_job.positions_value(new_blob["positions"], price_of)
         nav = sandbox_job.nav_row(new_blob, positions_val=pv, spy_price=spy_price)
