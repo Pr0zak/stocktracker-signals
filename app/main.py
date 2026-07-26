@@ -1046,9 +1046,16 @@ async def memory_backfill(every: int = 3, rng: str = "2y") -> dict:
 
 
 @app.get("/memory/notes")
-async def memory_notes(q: str, kind: str | None = None, limit: int = 5) -> dict:
-    """Fuzzy recall over stored prose memory (weekly strategy, blocked trades, research findings)."""
-    return {"query": q, "results": memory.search_notes(q, kind=kind, limit=max(1, min(limit, 25)))}
+async def memory_notes(kind: str | None = None, limit: int = 10) -> dict:
+    """Recent prose memory (weekly strategy, blocked trades, research findings), newest first.
+
+    Also returns `blocked` — which risk rules actually bound over the last 30 days. That aggregate is
+    the reason this log exists; free-text search over it never had a caller and was removed.
+    """
+    return {
+        "notes": memory.recent_notes(kind=kind, limit=limit),
+        "blocked": memory.blocked_summary(),
+    }
 
 
 @app.get("/regime")
@@ -2186,6 +2193,17 @@ async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
         card = {k: st[k] for k in ("buy_calls", "sandbox_buys") if k in st}
         if card:
             context["track_record"] = card
+        # Which rules actually bound. A cap firing constantly means the plan keeps asking for
+        # something the account forbids — the strategy is the right level to resolve that, not the
+        # daily tick, which can only keep getting refused.
+        blocked = memory.blocked_summary()
+        if blocked:
+            context["blocked_trades"] = blocked
+        # The previous few weeks' stances, so the plan has continuity instead of re-deciding from
+        # scratch every Monday with no memory of what it already tried.
+        prior = memory.recent_notes(kind="strategy", limit=4)
+        if prior:
+            context["prior_strategy_notes"] = [n["body"][:400] for n in prior]
     except Exception:  # noqa: BLE001 — enrichment, never a blocker
         pass
     try:

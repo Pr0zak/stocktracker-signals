@@ -25,6 +25,11 @@ from .news import fetch_context
 
 log = logging.getLogger("signals.scan")
 
+# How many newly-tracked symbols to seed base rates for per nightly run. Each costs one 2y Yahoo
+# fetch plus a few hundred cheap inserts, so a handful a night is invisible; the cap only matters
+# when a batch of names is added at once.
+_BACKFILL_PER_RUN = 4
+
 LATEST = Path(__file__).resolve().parent.parent / "data" / "scan_latest.json"
 
 
@@ -324,6 +329,19 @@ async def run_scan() -> dict:
     except Exception:  # noqa: BLE001
         log.warning("memory scoring failed", exc_info=True)
 
+    # Seed base rates for symbols added to the watchlist since the last backfill. Without this a
+    # newly-tracked ticker silently has no track record for ~20 trading days and the UI just omits
+    # it, which is indistinguishable from "this setup has no edge". Bounded per run so adding a
+    # dozen names at once spreads the fetches over a few nights instead of hammering Yahoo.
+    seeded: dict = {}
+    try:
+        fresh = memory.symbols_missing_baseline(stocks + cryptos)[:_BACKFILL_PER_RUN]
+        if fresh:
+            log.info("memory: seeding base rates for %s", fresh)
+            seeded = await backfill_memory(fresh)
+    except Exception:  # noqa: BLE001 — seeding is enrichment, never a blocker
+        log.warning("memory seeding failed", exc_info=True)
+
     # Day-of / day-before key-date alerts (SI publication, OPEX, earnings, speculative T+35 echoes)
     # so the app can warn BEFORE the event, not after.
     date_alerts: list[str] = []
@@ -351,6 +369,7 @@ async def run_scan() -> dict:
         ],
         "date_alerts": date_alerts,
         "memory_scored": scored,
+        "memory_seeded": seeded or None,
         "total_cost_usd": round(sum(r.get("cost_usd", 0.0) for r in results), 6),
     }
     LATEST.parent.mkdir(parents=True, exist_ok=True)

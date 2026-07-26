@@ -111,18 +111,17 @@ CREATE TABLE IF NOT EXISTS notes (
     meta     TEXT                           -- optional JSON blob
 );
 CREATE INDEX IF NOT EXISTS ix_notes_kind ON notes(kind, ts DESC);
+"""
 
-CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-    body, symbol, kind, content='notes', content_rowid='id', tokenize='porter'
-);
--- Keep the FTS index in lockstep with the base table.
-CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
-    INSERT INTO notes_fts(rowid, body, symbol, kind) VALUES (new.id, new.body, new.symbol, new.kind);
-END;
-CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
-    INSERT INTO notes_fts(notes_fts, rowid, body, symbol, kind)
-    VALUES ('delete', old.id, old.body, old.symbol, old.kind);
-END;
+# Full-text search used to live here (an FTS5 virtual table plus insert/delete triggers). It was
+# removed rather than left in place: nothing ever needed fuzzy text recall. The one question worth
+# asking of this data — "how often did a rule block a trade, and which rule?" — is a GROUP BY, and
+# "find setups like this one" is answered far better by the numeric k-NN above than by matching prose
+# about the numbers. An index with no reader is just a maintenance surface and a lie about intent.
+_DROP_FTS = """
+DROP TRIGGER IF EXISTS notes_ai;
+DROP TRIGGER IF EXISTS notes_ad;
+DROP TABLE IF EXISTS notes_fts;
 """
 
 
@@ -153,6 +152,7 @@ def _migrate(db: sqlite3.Connection) -> None:
     `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so new columns need an explicit
     ALTER. Each is guarded individually — a fresh install already has them and would otherwise raise.
     """
+    db.executescript(_DROP_FTS)  # retire the unused full-text index (see note above)
     # Repair rows written before signals were normalised: "Signal.buy" -> "buy". Left alone they are
     # invisible to every buy filter, so the scorecard would under-count real calls indefinitely.
     db.execute(
@@ -412,35 +412,72 @@ def _excess(pairs: Sequence[tuple[float, sqlite3.Row]]) -> dict | None:
     }
 
 
-def search_notes(query: str, *, kind: str | None = None, limit: int = 5) -> list[dict]:
-    """Fuzzy recall over stored prose. Returns [] on any failure or empty query."""
-    q = (query or "").strip()
-    if not q:
-        return []
+def recent_notes(*, kind: str | None = None, limit: int = 10) -> list[dict]:
+    """Most recent prose memories, newest first. Returns [] on any failure."""
     try:
-        # FTS5 treats bare punctuation as syntax; quoting each token keeps user/model text from
-        # becoming a malformed MATCH expression.
-        tokens = [t for t in "".join(c if c.isalnum() else " " for c in q).split() if len(t) > 2]
-        if not tokens:
-            return []
-        expr = " OR ".join(f'"{t}"' for t in tokens[:12])
-        sql = ("SELECT n.ts, n.kind, n.symbol, n.body FROM notes_fts f JOIN notes n ON n.id = f.rowid "
-               "WHERE notes_fts MATCH ?")
-        params: list[Any] = [expr]
+        sql = "SELECT ts, kind, symbol, body FROM notes"
+        params: list[Any] = []
         if kind:
-            sql += " AND n.kind = ?"
+            sql += " WHERE kind = ?"
             params.append(kind)
-        sql += " ORDER BY rank LIMIT ?"
-        params.append(limit)
+        sql += " ORDER BY ts DESC LIMIT ?"
+        params.append(max(1, min(limit, 50)))
         with _lock:
             rows = _db().execute(sql, params).fetchall()
         return [{"ts": r["ts"], "kind": r["kind"], "symbol": r["symbol"], "body": r["body"]} for r in rows]
     except Exception:  # noqa: BLE001
-        log.warning("memory: search_notes failed", exc_info=True)
+        log.warning("memory: recent_notes failed", exc_info=True)
         return []
 
 
+def blocked_summary(*, days: int = 30) -> dict | None:
+    """Which risk rules actually bound recently, and how often.
+
+    This is the question the blocked-trade log exists to answer. A cap that fires constantly is
+    either mis-set or the strategy is repeatedly trying something the account's own rules forbid —
+    and until this was aggregated, that pattern was only visible by reading raw JSONL by hand.
+    """
+    try:
+        cutoff = time.time() - max(1, days) * 86_400
+        with _lock:
+            rows = _db().execute(
+                "SELECT json_extract(meta, '$.skip_reason') reason, COUNT(*) c "
+                "FROM notes WHERE kind = 'blocked' AND ts >= ? "
+                "GROUP BY reason ORDER BY c DESC LIMIT 8",
+                (cutoff,),
+            ).fetchall()
+        by_reason = {r["reason"]: r["c"] for r in rows if r["reason"]}
+        if not by_reason:
+            return None
+        return {"days": days, "total": sum(by_reason.values()), "by_reason": by_reason}
+    except Exception:  # noqa: BLE001
+        log.warning("memory: blocked_summary failed", exc_info=True)
+        return None
+
+
 # -------------------------------------------------------------------------------------- scoring
+
+def symbols_missing_baseline(candidates: Iterable[str], *, min_rows: int = 20) -> list[str]:
+    """Of `candidates`, which have too little replayed history to produce a track record?
+
+    A symbol added to the watchlist after the one-shot backfill would otherwise carry no base rate
+    for ~20 trading days, and the UI would simply omit its track record with no indication why. The
+    nightly scan uses this to seed newcomers automatically.
+    """
+    try:
+        wanted = {(s or "").upper() for s in candidates if s}
+        if not wanted:
+            return []
+        with _lock:
+            rows = _db().execute(
+                "SELECT symbol, COUNT(*) c FROM verdicts WHERE origin = 'backfill' GROUP BY symbol"
+            ).fetchall()
+        have = {r["symbol"]: r["c"] for r in rows}
+        return sorted(s for s in wanted if have.get(s, 0) < min_rows)
+    except Exception:  # noqa: BLE001
+        log.warning("memory: symbols_missing_baseline failed", exc_info=True)
+        return []
+
 
 def pending_symbols(*, min_age_days: int = 5) -> list[str]:
     """Symbols with verdicts old enough to have a measurable outcome but not yet scored."""
