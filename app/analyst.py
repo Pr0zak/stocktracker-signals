@@ -140,10 +140,13 @@ analog of 12-month-forward returns from this position). Use them to frame the MU
 price above a rising 200-week SMA is a structurally healthier base than below it — but respect the \
 attached sample-size note: four halvings is anecdote-grade evidence. Never let cycle folklore \
 override what current price and momentum are actually doing.
-- If the snapshot includes `track_record`, that is THIS SERVICE'S OWN measured history: past verdicts \
-whose numeric setup closely matched the one in front of you now, scored against what the price \
-actually did over the following 20 trading days. `this_symbol` is prior calls on this same ticker; \
-`analogues` is the same pattern across other names. Read it CAREFULLY: (a) the only meaningful figure \
+- If the snapshot includes `track_record`, that is measured history for setups whose NUMBERS closely \
+match the one in front of you now, scored against what the price actually did over the following 20 \
+trading days. `this_symbol` is this same ticker; `analogues` is the same pattern across other names. \
+IMPORTANT: most of these rows are historical setups replayed from price data and carry NO call of \
+their own — so describe them as past SETUPS or OCCURRENCES, never as "past calls" or "predictions". \
+Only the `when_model_said_buy` block (present just when there are enough real verdicts) describes \
+calls this service actually made. Read it CAREFULLY: (a) the only meaningful figure \
 is `vs_benchmark` — median EXCESS return and `beat_rate_20d` against the S&P over the identical \
 window. Equities drift up, so a raw `positive_rate_20d` near 0.55-0.60 is just the unconditional base \
 rate of any 20-day window and is evidence of NOTHING; never cite a raw positive rate as if it were \
