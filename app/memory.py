@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS verdicts (
     conviction   INTEGER,
     deep         INTEGER NOT NULL DEFAULT 0,
     model        TEXT,
+    -- 'model' = a real verdict this service produced. 'backfill' = a setup replayed from price
+    -- history with NO verdict attached, so the pattern's base rate is measurable on day one instead
+    -- of 20 sessions from now. Backfilled rows must NEVER count toward the model's own calibration.
+    origin       TEXT NOT NULL DEFAULT 'model',
     price        REAL,
     rule_score   INTEGER,
     thesis       TEXT,
@@ -150,7 +154,11 @@ def _migrate(db: sqlite3.Connection) -> None:
     ALTER. Each is guarded individually — a fresh install already has them and would otherwise raise.
     """
     have = {r["name"] for r in db.execute("PRAGMA table_info(verdicts)")}
-    for col, decl in (("bench_fwd_5d", "REAL"), ("bench_fwd_20d", "REAL")):
+    for col, decl in (
+        ("bench_fwd_5d", "REAL"),
+        ("bench_fwd_20d", "REAL"),
+        ("origin", "TEXT NOT NULL DEFAULT 'model'"),
+    ):
         if col not in have:
             db.execute(f"ALTER TABLE verdicts ADD COLUMN {col} {decl}")
 
@@ -235,19 +243,26 @@ def record_verdict(
     verdict: dict,
     model: str | None = None,
     deep: bool = False,
+    origin: str = "model",
+    ts: float | None = None,
 ) -> int | None:
-    """Persist one verdict + the setup that produced it. Returns the row id, or None on failure."""
+    """Persist one verdict + the setup that produced it. Returns the row id, or None on failure.
+
+    `origin="backfill"` records a setup replayed from price history (no real verdict); `ts` lets the
+    backfill stamp the historical bar's own time rather than now, so retention and ordering behave.
+    """
     try:
         feats = features_from_summary(summary)
         asof = _asof_date(summary)
         row = {
             "symbol": (symbol or "").upper(),
-            "ts": time.time(),
+            "ts": ts if ts is not None else time.time(),
             "asof_date": asof,
             "signal": str(verdict.get("signal") or "")[:24] or None,
             "conviction": _int(verdict.get("conviction")),
             "deep": 1 if deep else 0,
             "model": model,
+            "origin": origin,
             "price": _num(summary.get("price")),
             "rule_score": _int(summary.get("rule_score")),
             "thesis": (verdict.get("thesis") or verdict.get("summary") or "")[:1200] or None,
@@ -352,7 +367,13 @@ def _cohort(pairs: Sequence[tuple[float, sqlite3.Row]]) -> dict | None:
     ex = _excess(pairs)
     if ex:
         out["vs_benchmark"] = ex
-    bull = [(d, r) for d, r in pairs if (r["signal"] or "").lower() in ("buy", "strong_buy", "add")]
+    # Only REAL verdicts count here — a replayed setup has no opinion attached, and letting backfill
+    # rows in would silently turn "how well does the model call this setup" into "how does this setup
+    # drift", which is a different question wearing the same label.
+    bull = [
+        (d, r) for d, r in pairs
+        if r["origin"] == "model" and (r["signal"] or "").lower() in ("buy", "strong_buy", "add")
+    ]
     if len(bull) >= _MIN_SAMPLES:
         br = [float(r["fwd_20d"]) for _, r in bull if r["fwd_20d"] is not None]
         if len(br) >= _MIN_SAMPLES:
@@ -581,7 +602,7 @@ def stats() -> dict:
                 "SELECT COUNT(*) n, AVG(fwd_20d > 0) rate, AVG(fwd_20d) avg, "
                 "AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d - bench_fwd_20d END) exc, "
                 "AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d > bench_fwd_20d END) beat "
-                "FROM verdicts WHERE scored_at IS NOT NULL "
+                "FROM verdicts WHERE scored_at IS NOT NULL AND origin = 'model' "
                 "AND LOWER(COALESCE(signal,'')) IN ('buy','strong_buy','add')"
             ).fetchone()
         out: dict[str, Any] = {

@@ -33,6 +33,7 @@ from .analyst import (
 from .discover import discover
 from .market import fetch_series, summarize
 from .news import fetch_context, fetch_dated_news
+from . import scan_job
 from .scan_job import LATEST, run_scan
 
 _http: httpx.AsyncClient | None = None
@@ -1027,6 +1028,21 @@ async def memory_stats() -> dict:
     stays absent until there are enough scored rows to mean anything.
     """
     return memory.stats()
+
+
+@app.post("/memory/backfill")
+async def memory_backfill(every: int = 3, rng: str = "2y") -> dict:
+    """Seed memory from real price history so setup base rates exist immediately.
+
+    A verdict can't be graded until its 20-session horizon elapses, so without this the track record
+    is empty for about a month after deployment. Replayed rows carry `origin="backfill"` and no
+    signal — they inform what a PATTERN does, never what the model's calls achieved.
+    """
+    cfg = settings_store.get()
+    syms = list(cfg.get("watchlist", [])) + list(cfg.get("crypto_watchlist", []))
+    if not syms:
+        raise HTTPException(status_code=422, detail="no watchlist configured")
+    return await scan_job.backfill_memory(syms, every=max(1, every), rng=rng)
 
 
 @app.get("/memory/notes")

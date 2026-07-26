@@ -20,7 +20,7 @@ import httpx
 
 from . import cycle, memory, options, settings_store, shorts, usage_store
 from .analyst import analyze
-from .market import fetch_series, summarize
+from .market import Series, fetch_series, summarize
 from .news import fetch_context
 
 log = logging.getLogger("signals.scan")
@@ -199,6 +199,72 @@ async def score_memory() -> int:
         log.info("memory: scored %d verdict(s) across %d symbol(s)", total, len(syms))
     memory.prune()
     return total
+
+
+async def backfill_memory(symbols: list[str], *, every: int = 3, rng: str = "2y") -> dict:
+    """Seed memory by replaying real price history.
+
+    Without this the track record is empty for ~20 trading days after deployment, since a verdict
+    can't be graded until its horizon exists. Setup base rates, though, are a property of PRICE — they
+    don't need a verdict to have been made — so every `every`-th historical bar is re-summarized from
+    the truncated series and stored with `origin="backfill"` and NO signal attached.
+
+    That distinction is load-bearing: backfilled rows answer "what does this pattern usually do?", and
+    are excluded from `when_model_said_buy`, which must keep meaning "when the MODEL said buy".
+    """
+    out = {"symbols": 0, "recorded": 0, "scored": 0}
+    async with httpx.AsyncClient() as client:
+        bench = None
+        try:
+            bench = await fetch_series(client, "^GSPC", rng=rng)
+        except Exception:  # noqa: BLE001
+            pass
+        bench_idx = {d: i for i, d in enumerate(bench.dates)} if bench else {}
+
+        for sym in symbols:
+            try:
+                s = await fetch_series(client, sym, rng=rng)
+            except Exception:  # noqa: BLE001
+                continue
+            if len(s.closes) < 90:
+                continue
+            out["symbols"] += 1
+            crypto = _is_crypto_symbol(sym)
+            # Start at 60 so SMA50/RSI are warm; stop 21 bars from the end so only rows that can
+            # actually be scored get written.
+            for i in range(60, len(s.closes) - 21, max(1, every)):
+                sub = Series(
+                    symbol=s.symbol, closes=s.closes[:i + 1], opens=s.opens[:i + 1],
+                    volumes=s.volumes[:i + 1], dates=s.dates[:i + 1],
+                    fifty_two_high=max(s.closes[max(0, i - 252):i + 1]),
+                    fifty_two_low=min(s.closes[max(0, i - 252):i + 1]),
+                    currency=s.currency,
+                )
+                bc = None
+                if bench and not crypto:
+                    bj = bench_idx.get(s.dates[i])
+                    bc = bench.closes[:bj + 1] if bj else None
+                if memory.record_verdict(
+                    symbol=s.symbol, summary=summarize(sub, bc), verdict={},
+                    origin="backfill", ts=_bar_ts(s.dates[i]),
+                ):
+                    out["recorded"] += 1
+            out["scored"] += memory.score_symbol(
+                sym, s.dates, s.closes,
+                bench_dates=bench.dates if (bench and not crypto) else None,
+                bench_closes=bench.closes if (bench and not crypto) else None,
+            )
+    log.info("memory backfill: %s", out)
+    return out
+
+
+def _bar_ts(yyyymmdd: str) -> float:
+    """Epoch seconds for a YYYYMMDD bar, so backfilled rows age out on the real retention schedule
+    instead of all looking like they were written the day the backfill ran."""
+    try:
+        return time.mktime(time.strptime(yyyymmdd, "%Y%m%d"))
+    except ValueError:
+        return time.time()
 
 
 def _is_crypto_symbol(sym: str) -> bool:

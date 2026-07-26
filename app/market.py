@@ -87,9 +87,11 @@ async def _webull_series(client: httpx.AsyncClient, symbol: str) -> Series:
     )
 
 
-async def fetch_series(client: httpx.AsyncClient, symbol: str) -> Series:
+async def fetch_series(client: httpx.AsyncClient, symbol: str, rng: str = "1y") -> Series:
+    """Daily bars for `symbol`. `rng` is a Yahoo range string ("1y", "2y", "5y") — the memory
+    backfill wants more history than a signal does, everything else takes the default."""
     try:
-        data = await _fetch_chart(client, symbol)
+        data = await _fetch_chart(client, symbol, rng=rng)
     except Exception:  # noqa: BLE001 — Yahoo has nothing; try the Webull fallback (warrants/OTC)
         return await _webull_series(client, symbol)
     result = data["chart"]["result"][0]
