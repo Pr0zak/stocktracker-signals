@@ -20,9 +20,10 @@ The obvious reach is embeddings, and it is the wrong tool here on two counts:
    dependencies and no embedding drift. Cosine similarity over prose *about* those numbers is a
    lossy proxy for a distance we can just compute directly.
 
-Text memory (strategy notes, blocked-trade reasons, research findings) does want fuzzy recall, and
-that is what FTS5 — already compiled into the stdlib's SQLite here — is for. So: numeric k-NN for
-setups, FTS5 for prose, one file, zero new dependencies.
+Prose memory (strategy notes, blocked-trade reasons, research findings) lives in a plain `notes`
+table. It briefly carried an FTS5 index; that was removed once it became clear nothing needed fuzzy
+text recall — the only question actually asked of it is "which rules blocked trades, and how often",
+which is a GROUP BY. One file, zero dependencies, no index without a reader.
 
 Statistical honesty
 -------------------
@@ -69,8 +70,9 @@ CREATE TABLE IF NOT EXISTS verdicts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol       TEXT    NOT NULL,
     ts           REAL    NOT NULL,          -- epoch seconds when the verdict was produced
-    asof_date    TEXT    NOT NULL,          -- YYYY-MM-DD of the last bar the verdict saw
-    signal       TEXT,                      -- buy / hold / sell / ...
+    asof_date    TEXT    NOT NULL,          -- YYYYMMDD of the last bar the verdict saw,
+                                            -- matching Series.dates so scoring can index straight in
+    signal       TEXT,                      -- normalised lower-case value: buy / hold / sell / ...
     conviction   INTEGER,
     deep         INTEGER NOT NULL DEFAULT 0,
     model        TEXT,
@@ -376,28 +378,69 @@ def _cohort(pairs: Sequence[tuple[float, sqlite3.Row]]) -> dict | None:
     # Only REAL verdicts count here — a replayed setup has no opinion attached, and letting backfill
     # rows in would silently turn "how well does the model call this setup" into "how does this setup
     # drift", which is a different question wearing the same label.
-    bull = [
+    said_buy = _directional(pairs, BUY_SIGNALS, bullish=True)
+    if said_buy:
+        out["when_model_said_buy"] = said_buy
+    said_sell = _directional(pairs, SELL_SIGNALS, bullish=False)
+    if said_sell:
+        out["when_model_said_sell"] = said_sell
+    return out
+
+
+# Signals that express a directional call. "hold" is deliberately in neither: it is the absence of a
+# call, and scoring it would reward doing nothing in a rising market.
+BUY_SIGNALS = ("buy", "strong_buy", "add")
+SELL_SIGNALS = ("sell", "strong_sell", "trim", "reduce")
+
+
+def _directional(
+    pairs: Sequence[tuple[float, sqlite3.Row]], signals: Sequence[str], *, bullish: bool,
+) -> dict | None:
+    """Score one side of the book. Returns None below the minimum sample.
+
+    The SELL convention is inverted, and the inversion is the whole point: a sell is *right* when the
+    name subsequently does WORSE than the benchmark, because the alternative to holding it was owning
+    the index. So `median_excess_20d_pct` is negated for sells and reported as `avoided` — a positive
+    number always means "this call was good", on both sides, which is the only way the two are
+    comparable at a glance. Scoring sells on raw forward return would have marked every sell in a
+    bull market as wrong regardless of judgement.
+    """
+    rows = [
         (d, r) for d, r in pairs
-        if r["origin"] == "model" and (r["signal"] or "").lower() in ("buy", "strong_buy", "add")
+        if r["origin"] == "model" and (r["signal"] or "").lower() in signals
     ]
-    if len(bull) >= _MIN_SAMPLES:
-        br = [float(r["fwd_20d"]) for _, r in bull if r["fwd_20d"] is not None]
-        if len(br) >= _MIN_SAMPLES:
-            # The number that actually matters: when the model said buy into this setup, was it right?
-            said_buy: dict[str, Any] = {
-                "n": len(br),
-                "median_fwd_20d_pct": round(_median(br), 2),
-                "positive_rate": round(sum(1 for x in br if x > 0) / len(br), 2),
-            }
-            bex = _excess(bull)
-            if bex:
-                said_buy["vs_benchmark"] = bex
-            out["when_model_said_buy"] = said_buy
+    if len(rows) < _MIN_SAMPLES:
+        return None
+    fwd = [float(r["fwd_20d"]) for _, r in rows if r["fwd_20d"] is not None]
+    if len(fwd) < _MIN_SAMPLES:
+        return None
+    out: dict[str, Any] = {"n": len(fwd), "median_fwd_20d_pct": round(_median(fwd), 2)}
+    diffs = [
+        float(r["fwd_20d"]) - float(r["bench_fwd_20d"])
+        for _, r in rows
+        if r["fwd_20d"] is not None and r["bench_fwd_20d"] is not None
+    ]
+    if len(diffs) >= _MIN_SAMPLES:
+        sign = 1.0 if bullish else -1.0
+        out["vs_benchmark"] = {
+            "n": len(diffs),
+            ("median_excess_20d_pct" if bullish else "median_avoided_20d_pct"):
+                round(sign * _median(diffs), 2),
+            "correct_rate_20d": round(
+                sum(1 for x in diffs if sign * x > 0) / len(diffs), 2
+            ),
+        }
     return out
 
 
 def _excess(pairs: Sequence[tuple[float, sqlite3.Row]]) -> dict | None:
-    """Median 20-day return minus the benchmark's, over rows where both are known."""
+    """Median 20-day return minus the benchmark's, over rows where both are known.
+
+    Deliberately `beat_rate_20d` and not `correct_rate_20d`: this is the whole cohort, with no
+    directional call attached, so "did this setup beat the index" is literally the question. The
+    directional blocks report `correct_rate_20d` instead, because for a sell, beating the index is
+    the WRONG outcome.
+    """
     diffs = [
         float(r["fwd_20d"]) - float(r["bench_fwd_20d"])
         for _, r in pairs
@@ -644,16 +687,26 @@ def stats() -> dict:
             # Two scorecards, deliberately NOT merged: 'model' is what the analyst *said* on the
             # watchlist, 'sandbox' is what the paper trader actually *bought*. Different processes
             # answering different questions — averaging them would hide which one works.
-            cards = {
-                origin: db.execute(
-                    "SELECT COUNT(*) n, AVG(fwd_20d > 0) rate, AVG(fwd_20d) avg, "
-                    "AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d - bench_fwd_20d END) exc, "
-                    "AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d > bench_fwd_20d END) beat "
-                    "FROM verdicts WHERE scored_at IS NOT NULL AND origin = ? "
-                    "AND LOWER(COALESCE(signal,'')) IN ('buy','strong_buy','add')",
-                    (origin,),
+            def _card(origin: str, signals: Sequence[str], bullish: bool) -> sqlite3.Row:
+                # `beat` uses a comparison whose direction flips for sells: owning the index was the
+                # alternative to holding, so a sell is right when the name UNDERperforms it.
+                cmp_ = ">" if bullish else "<"
+                marks = ",".join("?" for _ in signals)
+                return db.execute(
+                    f"SELECT COUNT(*) n, AVG(fwd_20d > 0) rate, AVG(fwd_20d) avg, "
+                    f"AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d - bench_fwd_20d END) exc, "
+                    f"AVG(CASE WHEN bench_fwd_20d IS NOT NULL "
+                    f"         THEN fwd_20d {cmp_} bench_fwd_20d END) beat "
+                    f"FROM verdicts WHERE scored_at IS NOT NULL AND origin = ? "
+                    f"AND LOWER(COALESCE(signal,'')) IN ({marks})",
+                    (origin, *signals),
                 ).fetchone()
-                for origin in ("model", "sandbox")
+
+            cards = {
+                "buy_calls": (_card("model", BUY_SIGNALS, True), True),
+                "sell_calls": (_card("model", SELL_SIGNALS, False), False),
+                "sandbox_buys": (_card("sandbox", BUY_SIGNALS, True), True),
+                "sandbox_sells": (_card("sandbox", SELL_SIGNALS, False), False),
             }
             by_origin = {
                 r["origin"]: r["c"]
@@ -669,19 +722,22 @@ def stats() -> dict:
             "by_origin": by_origin,
             "db_bytes": _FILE.stat().st_size if _FILE.exists() else 0,
         }
-        # The scorecards: of everything called a buy, how much did it beat simply owning the index?
-        # This is the number that says whether any of this works — surfaced even when unflattering.
-        for label, row in (("buy_calls", cards["model"]), ("sandbox_buys", cards["sandbox"])):
+        # The scorecards: of everything it called, how much better was that than simply owning the
+        # index? The number that says whether any of this works — surfaced even when unflattering.
+        # `correct_rate_20d` means the same thing on both sides (higher is better), so buys and sells
+        # can be read side by side without mentally inverting one of them.
+        for label, (row, bullish) in cards.items():
             if (row["n"] or 0) < _MIN_SAMPLES:
                 continue
             card = {
                 "n": row["n"],
-                "positive_rate_20d": round(float(row["rate"] or 0), 3),
                 "avg_fwd_20d_pct": round(float(row["avg"] or 0), 2),
             }
             if row["exc"] is not None:
-                card["avg_excess_20d_pct"] = round(float(row["exc"]), 2)
-                card["beat_rate_20d"] = round(float(row["beat"] or 0), 3)
+                sign = 1.0 if bullish else -1.0
+                key = "avg_excess_20d_pct" if bullish else "avg_avoided_20d_pct"
+                card[key] = round(sign * float(row["exc"]), 2)
+                card["correct_rate_20d"] = round(float(row["beat"] or 0), 3)
             out[label] = card
         return out
     except Exception:  # noqa: BLE001

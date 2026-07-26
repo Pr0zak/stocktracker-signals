@@ -150,9 +150,12 @@ calls this service actually made. Read it CAREFULLY: (a) the only meaningful fig
 is `vs_benchmark` — median EXCESS return and `beat_rate_20d` against the S&P over the identical \
 window. Equities drift up, so a raw `positive_rate_20d` near 0.55-0.60 is just the unconditional base \
 rate of any 20-day window and is evidence of NOTHING; never cite a raw positive rate as if it were \
-edge. (b) `when_model_said_buy` is the sharpest cut: when this setup drew a bullish call before, did \
-it beat the index? A beat_rate materially below 0.50 is a direct instruction to LOWER conviction on a \
-bullish call now, and you should say so plainly. (c) ALWAYS respect `n` — under ~20 is anecdote; treat \
+edge. (b) `when_model_said_buy` and `when_model_said_sell` are the sharpest cuts: when this setup drew a \
+call before, was that call right? Both report `correct_rate_20d` where HIGHER IS BETTER — the sell \
+side is already inverted for you (a sell counts as correct when the name UNDERperformed the index, \
+since owning the index was the alternative to holding), so never re-invert it yourself. A \
+correct_rate materially below 0.50 on the side you are leaning toward is a direct instruction to \
+LOWER conviction there, and you should say so plainly. (c) ALWAYS respect `n` — under ~20 is anecdote; treat \
 5-20 as a faint hint and say the sample is small if you cite it. (d) This is self-selected data \
 (verdicts exist only for names the user tracks, in whatever regime happened to occur), so it is real \
 evidence about CALIBRATION, not a law. It refines conviction; it never manufactures a call that price \
@@ -846,7 +849,9 @@ If a candidate carries a `track_record` block, that is what setups with THESE nu
 the next 20 trading days, measured on this app's own universe. Most rows are historical setups replayed \
 from price data and carry no call of their own — so treat them as OCCURRENCES, not past predictions. \
 The ONLY figure worth acting on is `vs_benchmark`: median EXCESS return and `beat_rate_20d` against the \
-S&P over the same window. Ignore `positive_rate_20d` entirely — equities drift up, so ~55-60% of any \
+S&P over the same window. Where a `when_model_said_buy` / `when_model_said_sell` block is present it \
+reports `correct_rate_20d`, on which HIGHER IS BETTER for both sides — the sell side is pre-inverted, \
+so do not flip it again. Ignore `positive_rate_20d` entirely — equities drift up, so ~55-60% of any \
 20-day window is positive and a raw win rate near that is evidence of nothing. Use it as a TIE-BREAKER \
 between candidates you already like on trend and momentum, and as a reason to SIZE DOWN or skip when a \
 setup's measured excess is negative. It must never manufacture a buy on its own. Hard limits: respect \
@@ -928,13 +933,16 @@ they near); if `goal_amount`/`goal_date` are set, set the stance's aggressivenes
 reach the goal in time. Ground everything in the numbers and the regime — no invented catalysts.
 
 If `track_record` is present it is the honest scorecard of this system's OWN decisions, graded on a \
-20-trading-day horizon: `buy_calls` is what the watchlist analyst called a buy, `sandbox_buys` is what \
-this paper account actually bought. The figure that matters is `avg_excess_20d_pct` / `beat_rate_20d` — \
-performance against simply owning the index. `positive_rate_20d` is noise (equities drift up). You are \
-the only stage that should react to this: if `beat_rate_20d` is persistently below ~0.50 across a \
-meaningful `n`, the method is not adding value, and the correct response is to say so plainly in \
-`notes` and shift toward a simpler, more index-like, lower-turnover stance — NOT to trade harder \
-looking for a win. Respect `n`: under ~20 decisions is far too early to conclude anything, and two \
+20-trading-day horizon: `buy_calls` / `sell_calls` are what the watchlist analyst called; `sandbox_buys` / \
+`sandbox_sells` are what this paper account actually did. All four report `correct_rate_20d`, where \
+HIGHER IS BETTER and 0.50 is coin-flip — the sell side is pre-inverted (a sell is correct when the \
+name underperformed the index, since owning the index was the alternative), so read the four side by \
+side without flipping anything. `avg_excess_20d_pct` (buys) and `avg_avoided_20d_pct` (sells) are the \
+size of the edge; a positive number is good on both. You are the only stage that should react to \
+this: if `correct_rate_20d` is persistently below ~0.50 across a meaningful `n`, the method is not \
+adding value, and the correct response is to say so plainly in `notes` and shift toward a simpler, \
+more index-like, lower-turnover stance — NOT to trade harder looking for a win. Note which SIDE is \
+weak: consistently poor sells with decent buys usually means exiting too early, not bad selection. Respect `n`: under ~20 decisions is far too early to conclude anything, and two \
 years of one market regime cannot prove skill. Never hide a bad number.
 
 If `blocked_trades` is present it counts which RISK RULES actually stopped trades recently, by \

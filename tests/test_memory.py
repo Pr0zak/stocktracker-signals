@@ -76,7 +76,7 @@ def test_real_verdict_object_reaches_the_scorecard(memory):
     stats = memory.stats()
     assert "buy_calls" in stats, "a real Verdict's buy calls never reached the scorecard"
     assert stats["buy_calls"]["n"] == 8
-    assert stats["buy_calls"]["beat_rate_20d"] is not None
+    assert stats["buy_calls"]["correct_rate_20d"] is not None
 
 
 @pytest.mark.parametrize(
@@ -233,3 +233,59 @@ def test_seeding_targets_only_symbols_without_a_baseline(memory):
     memory.record_verdict(symbol="MSFT", summary=_summary(), verdict={}, origin="backfill")
     missing = memory.symbols_missing_baseline(["AAPL", "MSFT", "NVDA"])
     assert missing == ["MSFT", "NVDA"]               # AAPL has enough; MSFT has only 1 row
+
+
+def test_sell_calls_are_scored_with_an_inverted_convention(memory):
+    """A sell is RIGHT when the name underperforms the index — the alternative to holding it.
+
+    Scored on raw forward return, every sell in a rising market would look wrong regardless of
+    judgement, which is exactly backwards.
+    """
+    from app.analyst import Signal, Verdict
+
+    def dump(sig):
+        return Verdict(signal=sig, conviction=70, thesis="t", rationale=[], key_risks=[],
+                       invalidation="x", horizon="2w", catalysts=[]).model_dump()
+
+    for i in range(8):
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i), verdict=dump(Signal.sell),
+                              origin="model")
+    # Symbol rises 0.3%/bar while the benchmark rises 0.1%/bar: the name OUTperformed, so these
+    # sells were WRONG even though the raw return is positive.
+    _score_all(memory)
+    stats = memory.stats()
+    assert "sell_calls" in stats
+    assert stats["sell_calls"]["avg_fwd_20d_pct"] > 0          # price went up...
+    assert stats["sell_calls"]["avg_avoided_20d_pct"] < 0      # ...so the sell avoided nothing
+    assert stats["sell_calls"]["correct_rate_20d"] == 0.0      # and was never right
+
+
+def test_sell_calls_score_well_when_the_name_underperforms(memory):
+    from app.analyst import Signal, Verdict
+
+    v = Verdict(signal=Signal.sell, conviction=70, thesis="t", rationale=[], key_risks=[],
+                invalidation="x", horizon="2w", catalysts=[]).model_dump()
+    for i in range(8):
+        memory.record_verdict(symbol="LOSER", summary={**_summary(rsi=30 + i), "symbol": "LOSER"},
+                              verdict=v, origin="model")
+    dates = [f"2026010{i + 1}" if i < 9 else f"202601{i + 1}" for i in range(40)]
+    falling = [100.0 * (0.998 ** i) for i in range(40)]        # name falls
+    bench = [100.0 * (1.001 ** i) for i in range(40)]          # index rises
+    memory.score_symbol("LOSER", dates, falling, bench_dates=dates, bench_closes=bench)
+
+    card = memory.stats()["sell_calls"]
+    assert card["avg_avoided_20d_pct"] > 0, "selling a name that fell should score positively"
+    assert card["correct_rate_20d"] == 1.0
+
+
+def test_hold_is_scored_as_neither_side(memory):
+    """'hold' is the absence of a call; scoring it would reward doing nothing in a rising market."""
+    from app.analyst import Signal, Verdict
+
+    v = Verdict(signal=Signal.hold, conviction=50, thesis="t", rationale=[], key_risks=[],
+                invalidation="x", horizon="2w", catalysts=[]).model_dump()
+    for i in range(10):
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i), verdict=v, origin="model")
+    _score_all(memory)
+    stats = memory.stats()
+    assert "buy_calls" not in stats and "sell_calls" not in stats

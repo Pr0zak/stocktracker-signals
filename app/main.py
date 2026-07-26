@@ -1023,9 +1023,11 @@ async def market_now_endpoint(deep: bool = False, count: int = 6) -> dict:
 async def memory_stats() -> dict:
     """What long-term memory holds, and the service's own scorecard.
 
-    `buy_calls.avg_excess_20d_pct` / `beat_rate_20d` are the honest bottom line: across every verdict
-    old enough to grade, did calling a buy beat simply owning the index over the same 20 days? It
-    stays absent until there are enough scored rows to mean anything.
+    Four blocks, each absent until there are enough graded rows to mean anything: `buy_calls` /
+    `sell_calls` (what the analyst said) and `sandbox_buys` / `sandbox_sells` (what the paper trader
+    actually did). `correct_rate_20d` means the same thing on all four — higher is better — because
+    the sell side is inverted: a sell is RIGHT when the name underperforms the index, since owning
+    the index was the alternative to holding it.
     """
     return memory.stats()
 
