@@ -140,6 +140,21 @@ analog of 12-month-forward returns from this position). Use them to frame the MU
 price above a rising 200-week SMA is a structurally healthier base than below it — but respect the \
 attached sample-size note: four halvings is anecdote-grade evidence. Never let cycle folklore \
 override what current price and momentum are actually doing.
+- If the snapshot includes `track_record`, that is THIS SERVICE'S OWN measured history: past verdicts \
+whose numeric setup closely matched the one in front of you now, scored against what the price \
+actually did over the following 20 trading days. `this_symbol` is prior calls on this same ticker; \
+`analogues` is the same pattern across other names. Read it CAREFULLY: (a) the only meaningful figure \
+is `vs_benchmark` — median EXCESS return and `beat_rate_20d` against the S&P over the identical \
+window. Equities drift up, so a raw `positive_rate_20d` near 0.55-0.60 is just the unconditional base \
+rate of any 20-day window and is evidence of NOTHING; never cite a raw positive rate as if it were \
+edge. (b) `when_model_said_buy` is the sharpest cut: when this setup drew a bullish call before, did \
+it beat the index? A beat_rate materially below 0.50 is a direct instruction to LOWER conviction on a \
+bullish call now, and you should say so plainly. (c) ALWAYS respect `n` — under ~20 is anecdote; treat \
+5-20 as a faint hint and say the sample is small if you cite it. (d) This is self-selected data \
+(verdicts exist only for names the user tracks, in whatever regime happened to occur), so it is real \
+evidence about CALIBRATION, not a law. It refines conviction; it never manufactures a call that price \
+and momentum do not support. Mention it in at most ONE rationale bullet, and only when it genuinely \
+changes the read.
 - If the snapshot includes `recent_news` (headlines) or `next_earnings` (a date), use them to \
 populate `catalysts` and sharpen `key_risks` — but do NOT invent news beyond what is provided.
 - If the snapshot includes a `position` block, the user ALREADY HOLDS this asset (shares, average \

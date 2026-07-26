@@ -220,6 +220,9 @@ def summarize(series: Series, bench_closes: list[float] | None) -> dict:
     rs = relative_strength(c, bench_closes)
     return {
         "symbol": series.symbol,
+        # Date of the last bar (YYYYMMDD). Tells the analyst how fresh the data is, and gives
+        # memory.py a stable anchor to measure realized forward returns from.
+        "as_of_date": series.dates[-1] if series.dates else None,
         "currency": series.currency,
         "price": round(price, 4),
         "rsi14": _round(_rsi(c)),

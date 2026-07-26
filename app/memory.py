@@ -1,0 +1,651 @@
+"""Long-term memory for the analyst: what it said, and what actually happened next.
+
+Every verdict this service produces is fire-and-forget today — the model re-derives its view of a
+name from scratch each time and never learns that the last four "buy" calls on it went nowhere. This
+module records each verdict alongside the numeric setup that produced it, scores the *realized*
+forward return once enough bars exist, and hands the calibrated result back on the next call.
+
+Why SQLite + a numeric k-NN and not a vector database
+-----------------------------------------------------
+The obvious reach is embeddings, and it is the wrong tool here on two counts:
+
+1. **Hardware.** CT 237 has 2 cores and 2 GB of RAM, already hosting uvicorn. `sentence-transformers`
+   pulls ~2 GB of torch onto a 12 GB disk and holds hundreds of MB resident. Measured on this host,
+   the reasoning workload is already out of reach locally (an 8B model needs ~22 min for one sandbox
+   tick vs ~20 s today); adding a second model process to serve retrieval buys nothing.
+
+2. **The query isn't semantic.** "Find past setups like this one" is a question about *numbers* —
+   RSI, distance from the 50-day, relative strength, how far off the 52-week high. A weighted
+   nearest-neighbour over ~8 normalized dimensions answers that exactly, in microseconds, with no
+   dependencies and no embedding drift. Cosine similarity over prose *about* those numbers is a
+   lossy proxy for a distance we can just compute directly.
+
+Text memory (strategy notes, blocked-trade reasons, research findings) does want fuzzy recall, and
+that is what FTS5 — already compiled into the stdlib's SQLite here — is for. So: numeric k-NN for
+setups, FTS5 for prose, one file, zero new dependencies.
+
+Statistical honesty
+-------------------
+A hit rate over 3 samples is noise. `similar_setups` refuses to emit a track record below
+`_MIN_SAMPLES` and always reports `n`, so the model can discount it. This mirrors how the
+seasonality and short-interest features already flag weak samples rather than laundering them into
+confident-sounding numbers.
+
+Nothing in here may break a verdict: every public entry point is wrapped by the caller in a
+try/except, and writes are best-effort by design.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+log = logging.getLogger("signals.memory")
+
+_DATA_DIR = Path(os.environ.get("SIGNALS_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
+_FILE = _DATA_DIR / "memory.db"
+
+# Below this many comparable, already-scored setups we report nothing rather than a number that
+# reads as evidence but is noise.
+_MIN_SAMPLES = 5
+# Rows older than this are pruned; two years is plenty to characterise a setup and keeps the file
+# small enough to stay uninteresting on a 12 GB disk.
+_RETAIN_DAYS = 730
+
+_lock = threading.Lock()
+_conn: sqlite3.Connection | None = None
+
+
+# --------------------------------------------------------------------------------------- schema
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS verdicts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol       TEXT    NOT NULL,
+    ts           REAL    NOT NULL,          -- epoch seconds when the verdict was produced
+    asof_date    TEXT    NOT NULL,          -- YYYY-MM-DD of the last bar the verdict saw
+    signal       TEXT,                      -- buy / hold / sell / ...
+    conviction   INTEGER,
+    deep         INTEGER NOT NULL DEFAULT 0,
+    model        TEXT,
+    price        REAL,
+    rule_score   INTEGER,
+    thesis       TEXT,
+    -- the numeric setup, stored flat so k-NN is a plain scan
+    rsi14            REAL,
+    pct_vs_sma20     REAL,
+    pct_vs_sma50     REAL,
+    macd_hist_pct    REAL,                  -- macd_hist / price * 100, so it compares across names
+    bollinger_pct_b  REAL,
+    stochastic_k     REAL,
+    pct_off_52w_high REAL,
+    rel_strength     REAL,
+    -- filled in later by score_symbol()
+    fwd_5d       REAL,
+    fwd_20d      REAL,
+    -- the benchmark's return over the SAME window, so the track record can report excess rather
+    -- than market drift dressed up as skill
+    bench_fwd_5d  REAL,
+    bench_fwd_20d REAL,
+    scored_at    REAL
+);
+CREATE INDEX IF NOT EXISTS ix_verdicts_symbol ON verdicts(symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS ix_verdicts_unscored ON verdicts(scored_at) WHERE scored_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS notes (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       REAL NOT NULL,
+    kind     TEXT NOT NULL,                 -- strategy | blocked | research | trade
+    symbol   TEXT,
+    body     TEXT NOT NULL,
+    meta     TEXT                           -- optional JSON blob
+);
+CREATE INDEX IF NOT EXISTS ix_notes_kind ON notes(kind, ts DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+    body, symbol, kind, content='notes', content_rowid='id', tokenize='porter'
+);
+-- Keep the FTS index in lockstep with the base table.
+CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+    INSERT INTO notes_fts(rowid, body, symbol, kind) VALUES (new.id, new.body, new.symbol, new.kind);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
+    INSERT INTO notes_fts(notes_fts, rowid, body, symbol, kind)
+    VALUES ('delete', old.id, old.body, old.symbol, old.kind);
+END;
+"""
+
+
+def _db() -> sqlite3.Connection:
+    """Open (once) and return the connection. WAL so a long read never blocks the tick's write."""
+    global _conn
+    if _conn is None:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # check_same_thread=False + the module-level lock: uvicorn runs handlers on a threadpool, and
+        # serialising ourselves is simpler to reason about than one connection per thread.
+        _conn = sqlite3.connect(_FILE, check_same_thread=False, timeout=5.0)
+        _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA synchronous=NORMAL")
+        _conn.executescript(_SCHEMA)
+        _migrate(_conn)
+        _conn.commit()
+        try:
+            os.chmod(_FILE, 0o600)
+        except OSError:
+            pass
+    return _conn
+
+
+def _migrate(db: sqlite3.Connection) -> None:
+    """Add columns introduced after a database was first created.
+
+    `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so new columns need an explicit
+    ALTER. Each is guarded individually — a fresh install already has them and would otherwise raise.
+    """
+    have = {r["name"] for r in db.execute("PRAGMA table_info(verdicts)")}
+    for col, decl in (("bench_fwd_5d", "REAL"), ("bench_fwd_20d", "REAL")):
+        if col not in have:
+            db.execute(f"ALTER TABLE verdicts ADD COLUMN {col} {decl}")
+
+
+# ------------------------------------------------------------------------------------- features
+
+# Each dimension is divided by a fixed, domain-chosen scale so the distance is comparable across
+# names and stable as the table grows. Deriving scales from the data instead would make yesterday's
+# neighbours silently change meaning as new rows land.
+_FEATURES: tuple[tuple[str, float, float], ...] = (
+    # (column,            scale,  weight)
+    ("rsi14",             25.0,   1.0),
+    ("pct_vs_sma20",       6.0,   1.0),
+    ("pct_vs_sma50",      12.0,   1.0),
+    ("macd_hist_pct",      1.5,   0.7),
+    ("bollinger_pct_b",    0.4,   0.7),
+    ("stochastic_k",      30.0,   0.5),
+    ("pct_off_52w_high",  15.0,   1.0),
+    ("rel_strength",       0.12,  0.8),
+)
+# A neighbour further than this (mean weighted units) isn't the same setup in any useful sense.
+_MAX_DISTANCE = 1.15
+# ...but a mean alone is too forgiving: dimensions that happen to agree drag it down and let an
+# OPPOSITE setup through. Measured: RSI 29 vs RSI 79 — oversold vs overbought, about as different as
+# two setups get — still scored 0.94 because MACD/Bollinger/RS matched. So any single core dimension
+# this far apart vetoes the match outright, no matter how well the rest line up.
+_VETO_DISTANCE = 1.5
+# Dimensions the veto applies to: the trend/momentum axes that define what a setup *is*. The
+# lower-weight confirmers (Stochastic, %B, MACD) are allowed to disagree.
+_VETO_WEIGHT = 1.0
+
+
+def features_from_summary(summary: dict) -> dict[str, float | None]:
+    """Project a `_snapshot` dict onto the stored feature columns."""
+    price = _num(summary.get("price"))
+    hist = _num(summary.get("macd_hist"))
+    # MACD histogram is in price units, so a $500 name dwarfs a $20 one. Percent-of-price makes the
+    # dimension mean the same thing everywhere.
+    macd_pct = (hist / price * 100.0) if (hist is not None and price) else None
+    return {
+        "rsi14": _num(summary.get("rsi14")),
+        "pct_vs_sma20": _num(summary.get("pct_vs_sma20")),
+        "pct_vs_sma50": _num(summary.get("pct_vs_sma50")),
+        "macd_hist_pct": macd_pct,
+        "bollinger_pct_b": _num(summary.get("bollinger_pct_b")),
+        "stochastic_k": _num(summary.get("stochastic_k")),
+        "pct_off_52w_high": _num(summary.get("pct_off_52w_high")),
+        "rel_strength": _num(summary.get("rel_strength_3mo_vs_benchmark")),
+    }
+
+
+def _distance(a: dict[str, float | None], row: sqlite3.Row) -> float | None:
+    """Weighted mean absolute distance over the dimensions both sides actually have.
+
+    Returns None when too little overlaps to be a fair comparison — a row matching on two of eight
+    dimensions is not a near neighbour, it's an artefact of missing data.
+    """
+    total = 0.0
+    wsum = 0.0
+    used = 0
+    for col, scale, weight in _FEATURES:
+        x, y = a.get(col), row[col]
+        if x is None or y is None:
+            continue
+        d = abs(float(x) - float(y)) / scale
+        if weight >= _VETO_WEIGHT and d > _VETO_DISTANCE:
+            return None  # opposite on an axis that defines the setup — not a neighbour at all
+        total += weight * d
+        wsum += weight
+        used += 1
+    if used < 4 or wsum <= 0:
+        return None
+    return total / wsum
+
+
+# --------------------------------------------------------------------------------------- writes
+
+def record_verdict(
+    *,
+    symbol: str,
+    summary: dict,
+    verdict: dict,
+    model: str | None = None,
+    deep: bool = False,
+) -> int | None:
+    """Persist one verdict + the setup that produced it. Returns the row id, or None on failure."""
+    try:
+        feats = features_from_summary(summary)
+        asof = _asof_date(summary)
+        row = {
+            "symbol": (symbol or "").upper(),
+            "ts": time.time(),
+            "asof_date": asof,
+            "signal": str(verdict.get("signal") or "")[:24] or None,
+            "conviction": _int(verdict.get("conviction")),
+            "deep": 1 if deep else 0,
+            "model": model,
+            "price": _num(summary.get("price")),
+            "rule_score": _int(summary.get("rule_score")),
+            "thesis": (verdict.get("thesis") or verdict.get("summary") or "")[:1200] or None,
+            **feats,
+        }
+        cols = ",".join(row)
+        marks = ",".join("?" for _ in row)
+        with _lock:
+            db = _db()
+            cur = db.execute(f"INSERT INTO verdicts ({cols}) VALUES ({marks})", list(row.values()))
+            db.commit()
+            return cur.lastrowid
+    except Exception:  # noqa: BLE001 — memory must never break a verdict
+        log.warning("memory: record_verdict failed", exc_info=True)
+        return None
+
+
+def add_note(kind: str, body: str, *, symbol: str | None = None, meta: dict | None = None) -> None:
+    """Store a prose memory (weekly strategy, a blocked trade and why, a research finding)."""
+    if not (body or "").strip():
+        return
+    try:
+        with _lock:
+            db = _db()
+            db.execute(
+                "INSERT INTO notes (ts, kind, symbol, body, meta) VALUES (?,?,?,?,?)",
+                (time.time(), kind, (symbol or None) and symbol.upper(),
+                 body.strip()[:4000], json.dumps(meta) if meta else None),
+            )
+            db.commit()
+    except Exception:  # noqa: BLE001
+        log.warning("memory: add_note failed", exc_info=True)
+
+
+# --------------------------------------------------------------------------------------- recall
+
+def similar_setups(symbol: str, summary: dict, *, k: int = 40) -> dict | None:
+    """What happened the last time this setup appeared?
+
+    Returns two independently-reported cohorts, because they answer different questions and
+    averaging them would hide the distinction:
+
+      - `this_symbol`: prior verdicts on *this* name (does the model read this ticker well?)
+      - `analogues`:   the nearest setups across every other name (does this *pattern* work?)
+
+    Either is omitted when it has fewer than `_MIN_SAMPLES` scored rows.
+    """
+    try:
+        feats = features_from_summary(summary)
+        if sum(1 for v in feats.values() if v is not None) < 4:
+            return None
+        sym = (symbol or "").upper()
+        with _lock:
+            db = _db()
+            # Only scored rows can teach anything; cap the scan so a large table stays cheap.
+            rows = db.execute(
+                "SELECT * FROM verdicts WHERE scored_at IS NOT NULL AND fwd_20d IS NOT NULL "
+                "ORDER BY ts DESC LIMIT 4000"
+            ).fetchall()
+
+        mine: list[tuple[float, sqlite3.Row]] = []
+        others: list[tuple[float, sqlite3.Row]] = []
+        for r in rows:
+            d = _distance(feats, r)
+            if d is None or d > _MAX_DISTANCE:
+                continue
+            (mine if r["symbol"] == sym else others).append((d, r))
+
+        out: dict[str, Any] = {}
+        same = _cohort(sorted(mine, key=lambda t: t[0])[:k])
+        if same:
+            out["this_symbol"] = same
+        near = _cohort(sorted(others, key=lambda t: t[0])[:k])
+        if near:
+            out["analogues"] = near
+        return out or None
+    except Exception:  # noqa: BLE001
+        log.warning("memory: similar_setups failed", exc_info=True)
+        return None
+
+
+def _cohort(pairs: Sequence[tuple[float, sqlite3.Row]]) -> dict | None:
+    """Summarize matched neighbours into a track record, or None if the sample is too thin.
+
+    Reports EXCESS return vs the benchmark over the same window wherever the benchmark is known.
+    Raw forward return is nearly useless on its own: equities drift up, so ~55-60% of any 20-day
+    window is positive regardless of setup, and a raw "62% positive" reads as edge when it is drift.
+    """
+    if len(pairs) < _MIN_SAMPLES:
+        return None
+    r20 = [float(r["fwd_20d"]) for _, r in pairs if r["fwd_20d"] is not None]
+    r5 = [float(r["fwd_5d"]) for _, r in pairs if r["fwd_5d"] is not None]
+    if len(r20) < _MIN_SAMPLES:
+        return None
+    out: dict[str, Any] = {
+        "n": len(r20),
+        "median_fwd_20d_pct": round(_median(r20), 2),
+        "positive_rate_20d": round(sum(1 for x in r20 if x > 0) / len(r20), 2),
+    }
+    if len(r5) >= _MIN_SAMPLES:
+        out["median_fwd_5d_pct"] = round(_median(r5), 2)
+    ex = _excess(pairs)
+    if ex:
+        out["vs_benchmark"] = ex
+    bull = [(d, r) for d, r in pairs if (r["signal"] or "").lower() in ("buy", "strong_buy", "add")]
+    if len(bull) >= _MIN_SAMPLES:
+        br = [float(r["fwd_20d"]) for _, r in bull if r["fwd_20d"] is not None]
+        if len(br) >= _MIN_SAMPLES:
+            # The number that actually matters: when the model said buy into this setup, was it right?
+            said_buy: dict[str, Any] = {
+                "n": len(br),
+                "median_fwd_20d_pct": round(_median(br), 2),
+                "positive_rate": round(sum(1 for x in br if x > 0) / len(br), 2),
+            }
+            bex = _excess(bull)
+            if bex:
+                said_buy["vs_benchmark"] = bex
+            out["when_model_said_buy"] = said_buy
+    return out
+
+
+def _excess(pairs: Sequence[tuple[float, sqlite3.Row]]) -> dict | None:
+    """Median 20-day return minus the benchmark's, over rows where both are known."""
+    diffs = [
+        float(r["fwd_20d"]) - float(r["bench_fwd_20d"])
+        for _, r in pairs
+        if r["fwd_20d"] is not None and r["bench_fwd_20d"] is not None
+    ]
+    if len(diffs) < _MIN_SAMPLES:
+        return None
+    return {
+        "n": len(diffs),
+        "median_excess_20d_pct": round(_median(diffs), 2),
+        "beat_rate_20d": round(sum(1 for x in diffs if x > 0) / len(diffs), 2),
+    }
+
+
+def search_notes(query: str, *, kind: str | None = None, limit: int = 5) -> list[dict]:
+    """Fuzzy recall over stored prose. Returns [] on any failure or empty query."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    try:
+        # FTS5 treats bare punctuation as syntax; quoting each token keeps user/model text from
+        # becoming a malformed MATCH expression.
+        tokens = [t for t in "".join(c if c.isalnum() else " " for c in q).split() if len(t) > 2]
+        if not tokens:
+            return []
+        expr = " OR ".join(f'"{t}"' for t in tokens[:12])
+        sql = ("SELECT n.ts, n.kind, n.symbol, n.body FROM notes_fts f JOIN notes n ON n.id = f.rowid "
+               "WHERE notes_fts MATCH ?")
+        params: list[Any] = [expr]
+        if kind:
+            sql += " AND n.kind = ?"
+            params.append(kind)
+        sql += " ORDER BY rank LIMIT ?"
+        params.append(limit)
+        with _lock:
+            rows = _db().execute(sql, params).fetchall()
+        return [{"ts": r["ts"], "kind": r["kind"], "symbol": r["symbol"], "body": r["body"]} for r in rows]
+    except Exception:  # noqa: BLE001
+        log.warning("memory: search_notes failed", exc_info=True)
+        return []
+
+
+# -------------------------------------------------------------------------------------- scoring
+
+def pending_symbols(*, min_age_days: int = 5) -> list[str]:
+    """Symbols with verdicts old enough to have a measurable outcome but not yet scored."""
+    try:
+        cutoff = time.time() - min_age_days * 86_400
+        with _lock:
+            rows = _db().execute(
+                "SELECT DISTINCT symbol FROM verdicts WHERE scored_at IS NULL AND ts < ?", (cutoff,)
+            ).fetchall()
+        return [r["symbol"] for r in rows]
+    except Exception:  # noqa: BLE001
+        log.warning("memory: pending_symbols failed", exc_info=True)
+        return []
+
+
+def score_symbol(
+    symbol: str,
+    dates: Sequence[str],
+    closes: Sequence[float],
+    *,
+    bench_dates: Sequence[str] | None = None,
+    bench_closes: Sequence[float] | None = None,
+) -> int:
+    """Fill in realized forward returns for one symbol from a fetched price series.
+
+    Returns how many rows were scored. A verdict is only scored once the FULL horizon exists, so a
+    20-day return is never computed from 11 bars and quietly treated as equivalent.
+
+    `bench_*` is the benchmark series (^GSPC) indexed on its own dates — the same calendar window is
+    located by date, not by reusing the symbol's index, because a symbol can be missing bars the
+    benchmark has (halts, late listings) and an off-by-a-few-bars comparison would be worse than none.
+    """
+    try:
+        idx = {d: i for i, d in enumerate(dates)}
+        bidx = {d: i for i, d in enumerate(bench_dates or ())}
+        with _lock:
+            db = _db()
+            rows = db.execute(
+                "SELECT id, asof_date, price FROM verdicts WHERE symbol = ? AND scored_at IS NULL",
+                ((symbol or "").upper(),),
+            ).fetchall()
+            updates: list[tuple] = []
+            now = time.time()
+            for r in rows:
+                i = idx.get(r["asof_date"])
+                if i is None:
+                    continue
+                base = float(r["price"] or 0) or (float(closes[i]) if i < len(closes) else 0)
+                if not base:
+                    continue
+                f5 = _fwd(closes, i, 5, base)
+                f20 = _fwd(closes, i, 20, base)
+                if f20 is None:
+                    continue  # not enough history yet — leave unscored and revisit next run
+                b5 = b20 = None
+                bj = bidx.get(r["asof_date"])
+                if bj is not None and bench_closes and bench_closes[bj]:
+                    bbase = float(bench_closes[bj])
+                    b5 = _fwd(bench_closes, bj, 5, bbase)
+                    b20 = _fwd(bench_closes, bj, 20, bbase)
+                updates.append((f5, f20, b5, b20, now, r["id"]))
+            if updates:
+                db.executemany(
+                    "UPDATE verdicts SET fwd_5d=?, fwd_20d=?, bench_fwd_5d=?, bench_fwd_20d=?, "
+                    "scored_at=? WHERE id=?", updates
+                )
+                db.commit()
+            return len(updates)
+    except Exception:  # noqa: BLE001
+        log.warning("memory: score_symbol failed for %s", symbol, exc_info=True)
+        return 0
+
+
+def _fwd(closes: Sequence[float], i: int, horizon: int, base: float) -> float | None:
+    j = i + horizon
+    if j >= len(closes) or not closes[j]:
+        return None
+    return round((float(closes[j]) - base) / base * 100.0, 3)
+
+
+# ------------------------------------------------------------------------------------- seeding
+
+# Findings this project measured on its own universe (see research/README.md). They live here too so
+# recall has real content before any verdict has been scored, and so the numbers survive as text that
+# can be searched rather than only as prose baked into a prompt.
+_RESEARCH: tuple[tuple[str, str], ...] = (
+    ("gap-fill-base-rates",
+     "Overnight gap fill rates measured on this watchlist: 0.5-1% gaps fill 87.8% within 10 sessions, "
+     "1-2% fill 81.5%, 2-5% fill 71.9%, but >5% gaps fill only 39.4%. High-volume gaps fill 69.5%. "
+     "So a 2-5% down gap with no catalyst is constructive; a >5% gap is usually repricing, not noise."),
+    ("gap-catalyst-caveat",
+     "Gaps accompanied by a news catalyst behave differently from mechanical gaps: they are repricing "
+     "to new information and mean-revert far less often. Classify catalyst gaps as 'avoid', not 'buy the dip'."),
+    ("dividend-etf-horizon",
+     "Dividend-focused ETFs (e.g. SCHD) are a WORSE fit than broad total-return funds when the goal is "
+     "long-horizon accumulation: dividends are taxable events in a taxable account and force "
+     "distribution rather than compounding. They fit better near or after retirement when income "
+     "matters more than terminal value. The user's original hypothesis on this was correct."),
+    ("short-interest-direction",
+     "High short interest — especially high days-to-cover — predicts UNDERperformance, not squeezes "
+     "(Boehmer/Jones/Zhang 2008). The effect concentrates in small/illiquid names and is weak-to-absent "
+     "in mega-caps and broad ETFs. Squeeze folklore is not supported by the SEC's own GME 2021 report."),
+)
+
+
+def seed_research() -> int:
+    """Insert the standing research findings once. Returns how many were added.
+
+    Idempotent by slug so a restart (or a redeploy) doesn't pile up duplicates that would then
+    dominate FTS results.
+    """
+    added = 0
+    try:
+        with _lock:
+            db = _db()
+            have = {
+                json.loads(r["meta"] or "{}").get("slug")
+                for r in db.execute("SELECT meta FROM notes WHERE kind = 'research'")
+            }
+            for slug, body in _RESEARCH:
+                if slug in have:
+                    continue
+                db.execute(
+                    "INSERT INTO notes (ts, kind, symbol, body, meta) VALUES (?,?,?,?,?)",
+                    (time.time(), "research", None, body, json.dumps({"slug": slug})),
+                )
+                added += 1
+            db.commit()
+    except Exception:  # noqa: BLE001
+        log.warning("memory: seed_research failed", exc_info=True)
+    return added
+
+
+# ------------------------------------------------------------------------------------ housekeeping
+
+def prune(retain_days: int = _RETAIN_DAYS) -> int:
+    """Drop rows past the retention window. Returns rows removed."""
+    try:
+        cutoff = time.time() - retain_days * 86_400
+        with _lock:
+            db = _db()
+            n = db.execute("DELETE FROM verdicts WHERE ts < ?", (cutoff,)).rowcount
+            n += db.execute("DELETE FROM notes WHERE ts < ?", (cutoff,)).rowcount
+            db.commit()
+        return n
+    except Exception:  # noqa: BLE001
+        log.warning("memory: prune failed", exc_info=True)
+        return 0
+
+
+def stats() -> dict:
+    """Shape of what memory holds — surfaced at /memory/stats so it's inspectable, not a black box."""
+    try:
+        with _lock:
+            db = _db()
+            v = db.execute(
+                "SELECT COUNT(*) c, SUM(scored_at IS NOT NULL) scored, MIN(ts) oldest, "
+                "COUNT(DISTINCT symbol) syms FROM verdicts"
+            ).fetchone()
+            n = db.execute("SELECT COUNT(*) c FROM notes").fetchone()
+            by_kind = db.execute(
+                "SELECT kind, COUNT(*) c FROM notes GROUP BY kind ORDER BY c DESC"
+            ).fetchall()
+            hit = db.execute(
+                "SELECT COUNT(*) n, AVG(fwd_20d > 0) rate, AVG(fwd_20d) avg, "
+                "AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d - bench_fwd_20d END) exc, "
+                "AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d > bench_fwd_20d END) beat "
+                "FROM verdicts WHERE scored_at IS NOT NULL "
+                "AND LOWER(COALESCE(signal,'')) IN ('buy','strong_buy','add')"
+            ).fetchone()
+        out: dict[str, Any] = {
+            "verdicts": v["c"] or 0,
+            "scored": v["scored"] or 0,
+            "symbols": v["syms"] or 0,
+            "oldest_ts": v["oldest"],
+            "notes": n["c"] or 0,
+            "notes_by_kind": {r["kind"]: r["c"] for r in by_kind},
+            "db_bytes": _FILE.stat().st_size if _FILE.exists() else 0,
+        }
+        if (hit["n"] or 0) >= _MIN_SAMPLES:
+            # The service's own scorecard: of everything it called a buy, how much did it actually
+            # beat just owning the index by? This is the number that says whether any of it works.
+            out["buy_calls"] = {
+                "n": hit["n"],
+                "positive_rate_20d": round(float(hit["rate"] or 0), 3),
+                "avg_fwd_20d_pct": round(float(hit["avg"] or 0), 2),
+            }
+            if hit["exc"] is not None:
+                out["buy_calls"]["avg_excess_20d_pct"] = round(float(hit["exc"]), 2)
+                out["buy_calls"]["beat_rate_20d"] = round(float(hit["beat"] or 0), 3)
+        return out
+    except Exception:  # noqa: BLE001
+        log.warning("memory: stats failed", exc_info=True)
+        return {"error": "unavailable"}
+
+
+# --------------------------------------------------------------------------------------- helpers
+
+def _num(v: Any) -> float | None:
+    try:
+        if v is None or isinstance(v, bool):
+            return None
+        f = float(v)
+        return f if f == f and f not in (float("inf"), float("-inf")) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _int(v: Any) -> int | None:
+    f = _num(v)
+    return int(f) if f is not None else None
+
+
+def _median(xs: Iterable[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    if not n:
+        return 0.0
+    m = n // 2
+    return s[m] if n % 2 else (s[m - 1] + s[m]) / 2.0
+
+
+def _asof_date(summary: dict) -> str:
+    """The date of the last bar the verdict saw — the anchor forward returns are measured from.
+
+    Normalised to the bare `YYYYMMDD` that `Series.dates` uses, so `score_symbol` can index straight
+    into the fetched series. Falling back to *today* would silently mis-anchor every verdict formed
+    on a weekend or before the close, so the caller's real bar date is strongly preferred.
+    """
+    d = summary.get("as_of_date") or summary.get("last_date")
+    if isinstance(d, str):
+        digits = "".join(c for c in d if c.isdigit())
+        if len(digits) >= 8:
+            return digits[:8]
+    return time.strftime("%Y%m%d", time.gmtime())

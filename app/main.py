@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import gaps, market_calendar, sandbox_job, sandbox_store
+from . import gaps, market_calendar, memory, sandbox_job, sandbox_store
 from .analyst import (
     analyze,
     daily_brief,
@@ -46,6 +46,10 @@ _log = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     global _http
     _http = httpx.AsyncClient()
+    try:
+        memory.seed_research()  # idempotent by slug; safe on every restart
+    except Exception:  # noqa: BLE001 — memory must never block startup
+        _log.warning("memory: seeding skipped", exc_info=True)
     try:
         yield
     finally:
@@ -844,11 +848,23 @@ async def _build_signal(
         summary["position"] = pos
     if rule_score is not None:  # the app's mechanical composite — the analyst reconciles with it
         summary["rule_score"] = max(0, min(100, rule_score))
+    # What happened the last time this exact setup showed up — the analyst's own measured track
+    # record, not a prior. Absent until enough verdicts have been scored, and never fatal.
+    try:
+        track = memory.similar_setups(symbol, summary)
+        if track:
+            summary["track_record"] = track
+    except Exception:  # noqa: BLE001 — recall is enrichment, never a blocker
+        pass
     try:
         verdict, usage = await analyze(summary, deep=deep)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
     usage_store.record(usage, symbol=summary.get("symbol", symbol.upper()), kind="deep" if deep else "signal")
+    memory.record_verdict(
+        symbol=summary.get("symbol", symbol.upper()), summary=summary, verdict=verdict.model_dump(),
+        model=cfg["deep_model"] if deep else cfg["scan_model"], deep=deep,
+    )
 
     payload = {
         "symbol": summary.get("symbol", symbol.upper()),
@@ -1000,6 +1016,23 @@ async def market_now_endpoint(deep: bool = False, count: int = 6) -> dict:
     }
     _cache[key] = (now, payload)
     return payload
+
+
+@app.get("/memory/stats")
+async def memory_stats() -> dict:
+    """What long-term memory holds, and the service's own scorecard.
+
+    `buy_calls.avg_excess_20d_pct` / `beat_rate_20d` are the honest bottom line: across every verdict
+    old enough to grade, did calling a buy beat simply owning the index over the same 20 days? It
+    stays absent until there are enough scored rows to mean anything.
+    """
+    return memory.stats()
+
+
+@app.get("/memory/notes")
+async def memory_notes(q: str, kind: str | None = None, limit: int = 5) -> dict:
+    """Fuzzy recall over stored prose memory (weekly strategy, blocked trades, research findings)."""
+    return {"query": q, "results": memory.search_notes(q, kind=kind, limit=max(1, min(limit, 25)))}
 
 
 @app.get("/regime")
@@ -2127,6 +2160,15 @@ async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
         usage_store.record(usage, symbol="SANDBOX", kind="sandbox_strategy")
         blob["last_strategy_note"] = note.model_dump()
         blob["last_weekly_review_date"] = today.isoformat()
+        # Keep the weekly reads searchable. Without this each review overwrites the last and the
+        # strategy's own history — what it believed and when — is lost.
+        d = note.model_dump()
+        memory.add_note(
+            "strategy",
+            f"[{today.isoformat()}] stance={d.get('stance')} cash_target={d.get('cash_target_pct')}%\n"
+            f"{d.get('note') or d.get('summary') or ''}",
+            meta={"date": today.isoformat(), "stance": d.get("stance")},
+        )
         return True
     except Exception as e:  # noqa: BLE001 — a failed Opus review must not break the daily tick
         _log.warning("sandbox weekly review failed (keeping prior note): %s", e)
@@ -2257,6 +2299,17 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
 
         for r in filled + skipped:
             sandbox_store.append_trade(r)
+        # Why a trade did NOT happen is the harder thing to reconstruct later — the JSONL has it, but
+        # only searchable by hand. Recording blocks here (rather than inside sandbox_job, which is
+        # deliberately pure) makes "how often does the position cap bind?" a query.
+        for r in skipped:
+            memory.add_note(
+                "blocked",
+                f"{r.get('side','?')} {r.get('symbol','?')} blocked: {r.get('skip_reason','?')}"
+                + (f" — intended: {r['reason']}" if r.get("reason") else ""),
+                symbol=r.get("symbol"),
+                meta={"skip_reason": r.get("skip_reason"), "date": r.get("date")},
+            )
         pv = sandbox_job.positions_value(new_blob["positions"], price_of)
         nav = sandbox_job.nav_row(new_blob, positions_val=pv, spy_price=spy_price)
         sandbox_store.append_nav(nav)

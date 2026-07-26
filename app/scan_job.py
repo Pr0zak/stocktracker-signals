@@ -11,16 +11,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
 
-from . import cycle, options, settings_store, shorts, usage_store
+from . import cycle, memory, options, settings_store, shorts, usage_store
 from .analyst import analyze
 from .market import fetch_series, summarize
 from .news import fetch_context
+
+log = logging.getLogger("signals.scan")
 
 LATEST = Path(__file__).resolve().parent.parent / "data" / "scan_latest.json"
 
@@ -109,8 +112,21 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
             weekly_oversold = lt.get("weekly_oversold") if lt else None
         except Exception:  # noqa: BLE001
             pass
+    # The scan sees the same setup every trading day across the whole watchlist, which makes it by
+    # far the richest source of "what did this setup actually do next" — so recall feeds in here and
+    # the result is recorded, exactly as on the interactive /signal path.
+    try:
+        track = memory.similar_setups(series.symbol, summary)
+        if track:
+            summary["track_record"] = track
+    except Exception:  # noqa: BLE001 — enrichment, never a blocker
+        pass
     verdict, usage = await analyze(summary, deep=False)
     usage_store.record(usage, symbol=series.symbol, kind="scan")
+    memory.record_verdict(
+        symbol=series.symbol, summary=summary, verdict=verdict.model_dump(),
+        model=settings_store.get()["scan_model"], deep=False,
+    )
     if not crypto:  # OC-6a: log this stock's ~30-45 DTE ATM IV for the /options IV-rank read
         await _log_atm_iv(client, series.symbol)
     dip = _dip_tier(series.closes, summary.get("pct_off_52w_high"), below_200wma, weekly_oversold)
@@ -138,6 +154,56 @@ def _prev_state() -> dict[str, dict]:
         }
     except Exception:  # noqa: BLE001
         return {}
+
+
+async def score_memory() -> int:
+    """Grade every verdict old enough to have a 20-day outcome. Returns rows scored.
+
+    Fetches 1y of bars per symbol with pending verdicts, plus the benchmark once, and hands both to
+    `memory.score_symbol`. Symbols are fetched with limited concurrency: this runs unattended
+    alongside the scan and the point is never to hammer Yahoo hard enough to get rate-limited out of
+    the data the user actually asked for.
+    """
+    syms = memory.pending_symbols()
+    if not syms:
+        return 0
+    total = 0
+    async with httpx.AsyncClient() as client:
+        bench_dates: list[str] | None = None
+        bench_closes: list[float] | None = None
+        try:
+            b = await fetch_series(client, "^GSPC")
+            bench_dates, bench_closes = b.dates, b.closes
+        except Exception:  # noqa: BLE001 — without it we still score raw return, just not excess
+            pass
+
+        sem = asyncio.Semaphore(4)
+
+        async def one(sym: str) -> int:
+            async with sem:
+                try:
+                    s = await fetch_series(client, sym)
+                except Exception:  # noqa: BLE001 — a delisted/renamed ticker just stays unscored
+                    return 0
+                # Crypto trades weekends, so aligning it to the S&P's calendar would drop most rows;
+                # score those on raw return only rather than against a mismatched window.
+                same_calendar = bench_dates is not None and not _is_crypto_symbol(sym)
+                return memory.score_symbol(
+                    sym, s.dates, s.closes,
+                    bench_dates=bench_dates if same_calendar else None,
+                    bench_closes=bench_closes if same_calendar else None,
+                )
+
+        total = sum(await asyncio.gather(*[one(s) for s in syms]))
+    if total:
+        log.info("memory: scored %d verdict(s) across %d symbol(s)", total, len(syms))
+    memory.prune()
+    return total
+
+
+def _is_crypto_symbol(sym: str) -> bool:
+    """Yahoo crypto tickers are `BTC-USD`-shaped; equities never contain a dash suffix like that."""
+    return "-" in sym and sym.rsplit("-", 1)[-1].upper() in ("USD", "USDT", "EUR", "GBP")
 
 
 async def run_scan() -> dict:
@@ -183,6 +249,15 @@ async def run_scan() -> dict:
             *[one(s, True) for s in cryptos],
         ))
 
+    # Grade past verdicts against what price actually did. The scan is the natural home for this:
+    # it already runs once a day and the horizons are measured in days, so nothing is gained by
+    # scoring more often. Best-effort — a scoring failure must not cost the user their scan.
+    scored = 0
+    try:
+        scored = await score_memory()
+    except Exception:  # noqa: BLE001
+        log.warning("memory scoring failed", exc_info=True)
+
     # Day-of / day-before key-date alerts (SI publication, OPEX, earnings, speculative T+35 echoes)
     # so the app can warn BEFORE the event, not after.
     date_alerts: list[str] = []
@@ -209,6 +284,7 @@ async def run_scan() -> dict:
             for r in results if r.get("dip_new")
         ],
         "date_alerts": date_alerts,
+        "memory_scored": scored,
         "total_cost_usd": round(sum(r.get("cost_usd", 0.0) for r in results), 6),
     }
     LATEST.parent.mkdir(parents=True, exist_ok=True)
