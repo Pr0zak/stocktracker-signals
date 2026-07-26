@@ -153,6 +153,12 @@ def _migrate(db: sqlite3.Connection) -> None:
     `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so new columns need an explicit
     ALTER. Each is guarded individually — a fresh install already has them and would otherwise raise.
     """
+    # Repair rows written before signals were normalised: "Signal.buy" -> "buy". Left alone they are
+    # invisible to every buy filter, so the scorecard would under-count real calls indefinitely.
+    db.execute(
+        "UPDATE verdicts SET signal = LOWER(SUBSTR(signal, INSTR(signal, '.') + 1)) "
+        "WHERE signal LIKE 'Signal.%'"
+    )
     have = {r["name"] for r in db.execute("PRAGMA table_info(verdicts)")}
     for col, decl in (
         ("bench_fwd_5d", "REAL"),
@@ -258,7 +264,7 @@ def record_verdict(
             "symbol": (symbol or "").upper(),
             "ts": ts if ts is not None else time.time(),
             "asof_date": asof,
-            "signal": str(verdict.get("signal") or "")[:24] or None,
+            "signal": _signal_str(verdict.get("signal")),
             "conviction": _int(verdict.get("conviction")),
             "deep": 1 if deep else 0,
             "model": model,
@@ -647,6 +653,22 @@ def stats() -> dict:
 
 
 # --------------------------------------------------------------------------------------- helpers
+
+def _signal_str(v: Any) -> str | None:
+    """Normalise a verdict signal to its bare value ("buy"), whatever shape the caller passed.
+
+    Pydantic's `model_dump()` (without mode="json") hands back the Enum MEMBER, and `str()` of that is
+    `"Signal.buy"`, not `"buy"`. Stored that way it matched no buy filter, so `when_model_said_buy`
+    and the /memory/stats scorecard would have sat empty forever while looking perfectly healthy —
+    the worst kind of bug in a feature whose entire job is to report honestly. Normalised here at the
+    boundary rather than at each call site so no future caller can reintroduce it.
+    """
+    v = getattr(v, "value", v)          # Enum member -> its value
+    s = str(v or "").strip()
+    if "." in s and s.split(".", 1)[0].lower().endswith("signal"):
+        s = s.split(".", 1)[1]          # tolerate an already-stringified "Signal.buy"
+    return s[:24].lower() or None
+
 
 def _num(v: Any) -> float | None:
     try:
