@@ -145,7 +145,10 @@ def test_puts_three_profiles_ordered_by_assignment_prob():
     for c in cands:
         assert set(c) == PUT_CAND_KEYS, f"candidate key drift: {set(c) ^ PUT_CAND_KEYS}"
         assert -1.0 < c["delta"] < 0.0                       # put delta is negative
-        assert c["assignment_prob_pct"] == round(abs(c["delta"]) * 100)
+        # N(-d2), not |delta|. The old assertion pinned the shorthand, which understates the real
+        # chance of assignment on exactly the strikes this service sells — so the test was encoding
+        # the bug. For a put N(-d2) >= N(-d1) = |delta|, always.
+        assert c["assignment_prob_pct"] >= round(abs(c["delta"]) * 100)
         assert PUT_TICKET_RE.match(c["order_ticket"]), c["order_ticket"]
 
 
@@ -226,7 +229,8 @@ def test_covered_call_default_delta_pick_and_shape():
     assert set(c) == CC_CAND_KEYS, f"candidate key drift: {set(c) ^ CC_CAND_KEYS}"
     assert c["strike"] > body["spot"]                 # ~0.30 delta call is OTM
     assert 0.0 < c["delta"] < 1.0
-    assert c["assignment_prob_pct"] == round(c["delta"] * 100)
+    # For a CALL, N(d2) <= N(d1) = delta — the inequality flips relative to the put case.
+    assert c["assignment_prob_pct"] <= round(c["delta"] * 100)
     assert CC_TICKET_RE.match(c["order_ticket"]), c["order_ticket"]
     # called-away gain = upside to the strike + premium, from today's price
     expected = round((c["strike"] - body["spot"]) * 100 * body["contracts"] + c["premium_income"], 2)

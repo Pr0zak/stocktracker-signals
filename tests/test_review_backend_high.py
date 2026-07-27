@@ -152,3 +152,47 @@ def test_iv_rank_still_works_when_tenor_is_unknown():
     """Rows written before the tenor was recorded have no dte — those must not break ranking."""
     history = [0.20 + i * 0.001 for i in range(40)]
     assert options.iv_rank(history, current=0.30, current_dte=60, history_dte=None) is not None
+
+
+# ---------------------------------------------------------------- medium-severity batch
+
+def test_dte_is_measured_to_the_real_expiry_moment():
+    """Yahoo's `expiration` is MIDNIGHT UTC on the expiry date, but options expire at 16:00 ET —
+    so `(ts - now)/86400` read a full calendar day short through the entire US session. Measured
+    live, today's nearest expiry computed as -1 DTE while it still had ~7.5 hours to run."""
+    import datetime as dt
+
+    # An expiry stamped midnight UTC on a given date.
+    d = dt.date(2026, 8, 21)
+    ts = int(dt.datetime.combine(d, dt.time(0, 0), tzinfo=dt.timezone.utc).timestamp())
+    true_moment = options.expiry_epoch(ts)
+    # The real expiry is 16:00 ET that day — 20 or 21 hours after the stamped timestamp.
+    gap_hours = (true_moment - ts) / 3600.0
+    assert 19.5 <= gap_hours <= 21.5, gap_hours
+
+
+def test_assignment_probability_is_not_delta_for_a_put():
+    """|delta| = N(-d1) is the common shorthand, but the risk-neutral chance of assignment is
+    N(-d2) — strictly larger for a put, so the shorthand made the strategy look safer than it is."""
+    g = options.black_scholes_greeks(spot=100.0, strike=93.0, t=35 / 365, r=0.043,
+                                     sigma=0.30, is_call=False)
+    assert g["prob_itm"] > abs(g["delta"]), "N(-d2) must exceed |delta| for a put"
+
+
+def test_assignment_probability_is_below_delta_for_a_call():
+    g = options.black_scholes_greeks(spot=100.0, strike=107.0, t=35 / 365, r=0.043,
+                                     sigma=0.30, is_call=True)
+    assert g["prob_itm"] < g["delta"], "N(d2) must be below delta for a call"
+
+
+def test_session_phase_respects_a_half_day():
+    """market_now hard-coded a 16:00 close, so it reported REGULAR for hours after the market shut
+    on the three 1pm NYSE half-days a year."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    from app.market_now import session_phase
+    et = ZoneInfo("America/New_York")
+    assert session_phase(dt.datetime(2026, 11, 27, 14, 30, tzinfo=et)) == "AFTER"   # half-day
+    assert session_phase(dt.datetime(2026, 11, 30, 14, 30, tzinfo=et)) == "REGULAR"  # normal day
+    assert session_phase(dt.datetime(2026, 11, 27, 12, 0, tzinfo=et)) == "REGULAR"   # before 1pm

@@ -28,6 +28,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import httpx
@@ -92,6 +93,9 @@ class OptionContract:
     gamma: float | None = None
     theta: float | None = None  # per calendar day
     vega: float | None = None   # per 1 vol point (1% change in IV)
+    # Risk-neutral P(finish ITM) = N(d2)/N(-d2). Distinct from |delta| and the honest basis for an
+    # assignment-probability figure — |delta| understates it for the puts this service sells.
+    prob_itm: float | None = None
 
 
 @dataclass
@@ -334,7 +338,8 @@ def black_scholes_greeks(
             delta = 1.0 if spot > strike else 0.0
         else:
             delta = -1.0 if spot < strike else 0.0
-        return {"delta": delta, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+        return {"delta": delta, "gamma": 0.0, "theta": 0.0, "vega": 0.0,
+                "prob_itm": 1.0 if abs(delta) >= 1.0 else 0.0}
 
     sqrt_t = math.sqrt(t)
     d1 = (math.log(spot / strike) + (r + 0.5 * sigma * sigma) * t) / (sigma * sqrt_t)
@@ -362,6 +367,11 @@ def black_scholes_greeks(
         "gamma": gamma,
         "theta": theta_year / _DAYS_PER_YEAR,  # per calendar day
         "vega": vega_per_1pt,
+        # Risk-neutral probability of finishing in the money: N(d2) for a call, N(-d2) for a put.
+        # This is NOT |delta| (= N(d1) / N(-d1)), which is the common shorthand but is systematically
+        # wrong in a direction that matters here: for the PUTS this service sells, |delta| UNDERSTATES
+        # the chance of assignment, so the strategy looked safer than it is.
+        "prob_itm": norm_cdf(d2) if is_call else norm_cdf(-d2),
     }
 
 
@@ -452,6 +462,7 @@ def annotate_expiry(
             c.gamma = _round(g["gamma"], 6)
             c.theta = _round(g["theta"], 4)
             c.vega = _round(g["vega"], 4)
+            c.prob_itm = _round(g["prob_itm"], 4)
     return expiry
 
 
@@ -718,6 +729,22 @@ def _mmddyy(ts: int) -> str:
 _STALE_TRADE_SECONDS = 3 * 24 * 3600
 
 
+_ET = ZoneInfo("America/New_York")
+
+
+def expiry_epoch(ts: int) -> float:
+    """The moment the contract actually expires: 16:00 ET on the expiry date.
+
+    Yahoo's `expiration` is MIDNIGHT UTC on that date, so `(ts - now)/86400` understates DTE by up to
+    a full calendar day through the whole US session — measured live, today's nearest expiry computed
+    as -1 DTE (already expired) while it still had ~7.5 hours to run. That integer is used twice
+    over: to gate the 45-90 / 25-45 day windows (so a genuine 45-day expiry reads as 44 and gets
+    warned about or skipped), and as the divisor in every annualised yield, which it inflates.
+    """
+    d = dt.datetime.fromtimestamp(ts, dt.timezone.utc).date()
+    return dt.datetime.combine(d, dt.time(16, 0), tzinfo=_ET).timestamp()
+
+
 def _limit_price(c: OptionContract) -> float | None:
     """The limit to quote: contract mid, falling back to last trade when bid/ask are stale/closed."""
     return _limit_price_with_source(c)[0]
@@ -770,7 +797,7 @@ def select_expiry(
     cands: list[dict] = []
     for e in chain.expirations:
         ts = int(e["ts"])
-        dte = (ts - now) / _SECONDS_PER_DAY
+        dte = (expiry_epoch(ts) - now) / _SECONDS_PER_DAY
         if dte <= 0:
             continue
         exp_date = _utc_date(ts)
@@ -1184,7 +1211,7 @@ def select_wheel_expiry(
     cands: list[dict] = []
     for e in chain.expirations:
         ts = int(e["ts"])
-        dte = (ts - now) / _SECONDS_PER_DAY
+        dte = (expiry_epoch(ts) - now) / _SECONDS_PER_DAY
         if dte <= 0:
             continue
         # Round DTE once and classify off the SAME integer we later display (matches select_expiry).
@@ -1283,7 +1310,10 @@ def _put_candidate(
         "contracts": n,
         "static_yield_pct": round(limit / p.strike * 100.0, 2) if p.strike else None,
         "annualized_yield_pct": round(limit / p.strike * 100.0 * _DAYS_PER_YEAR / dte, 2) if (p.strike and dte > 0) else None,
-        "assignment_prob_pct": round(abs(p.delta) * 100.0),
+        # N(-d2), not |delta| — the shorthand understated this by ~14-19% on the strikes this
+        # service actually picks, making the strategy look safer than it is. Falls back to |delta|
+        # only when IV is missing and the greeks could not be computed.
+        "assignment_prob_pct": round((p.prob_itm if p.prob_itm is not None else abs(p.delta)) * 100.0),
         "breakeven": round(net_cost, 2),  # strike − premium (same as net cost per share)
         "delta": p.delta,
         "theta": p.theta,
@@ -1435,7 +1465,8 @@ def assemble_covered_call(
         "premium_income": premium_income,
         "premium_yield_pct": round(limit / spot * 100.0, 2) if spot else None,
         "annualized_yield_pct": round(limit / spot * 100.0 * _DAYS_PER_YEAR / dte, 2) if (spot and dte > 0) else None,
-        "assignment_prob_pct": round((pick.delta or 0.0) * 100.0),
+        "assignment_prob_pct": round(
+            (pick.prob_itm if pick.prob_itm is not None else (pick.delta or 0.0)) * 100.0),
         # Upside to the strike (can be negative if the strike is below spot) + the premium, from today.
         "called_away_gain_from_here": round(((pick.strike - spot) * 100.0 * contracts) + premium_income, 2),
         "delta": pick.delta,

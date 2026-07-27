@@ -1504,10 +1504,14 @@ async def options_endpoint(
     #    assembler stays pure; a missing/short history yields a null rank (noted as "building").
     try:
         options.annotate_expiry(chain)
-        iv_rank = options.iv_rank(
-            options.load_iv_history(chain.symbol), current=chain.expiry.atm_iv,
-            current_dte=int(chosen["dte"]), history_dte=options.load_iv_history_dte(chain.symbol),
-        )
+        # Only rank when TODAY's ATM IV is actually known. iv_rank defaults `current` to the last
+        # historical point, so passing None silently ranked a past reading and labelled it today's.
+        iv_rank = None
+        if chain.expiry.atm_iv:
+            iv_rank = options.iv_rank(
+                options.load_iv_history(chain.symbol), current=chain.expiry.atm_iv,
+                current_dte=int(chosen["dte"]), history_dte=options.load_iv_history_dte(chain.symbol),
+            )
         body = options.assemble_suggestion(
             chain, chain.expiry, summary,
             chosen=chosen, style=style, budget=budget, earnings_date=earnings_date,

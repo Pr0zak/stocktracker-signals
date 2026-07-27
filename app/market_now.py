@@ -33,11 +33,15 @@ def session_phase(now: dt.datetime | None = None) -> str:
     if et.weekday() >= 5 or market_calendar.is_market_holiday(et.date()):
         return "CLOSED"
     mins = et.hour * 60 + et.minute
+    # The day's REAL close: 1pm on the three NYSE half-days a year, 4pm otherwise. Hard-coding 16:00
+    # reported REGULAR for hours after the market had actually shut.
+    reg_end_s, after_end_s = market_calendar.session_end_seconds(et.date())
+    reg_end, after_end = reg_end_s // 60, after_end_s // 60
     if 4 * 60 <= mins < 9 * 60 + 30:
         return "PRE"
-    if 9 * 60 + 30 <= mins < 16 * 60:
+    if 9 * 60 + 30 <= mins < reg_end:
         return "REGULAR"
-    if 16 * 60 <= mins < 20 * 60:
+    if reg_end <= mins < after_end:
         return "AFTER"
     return "CLOSED"
 
