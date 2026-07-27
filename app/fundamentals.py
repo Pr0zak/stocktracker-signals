@@ -62,7 +62,11 @@ async def fetch_quality(client: httpx.AsyncClient, symbol: str) -> dict | None:
         roe = num("roeTTM")                                  # percent
         gross = num("grossMarginTTM")                        # percent
         net = num("netProfitMarginTTM")                      # percent
-        de = num("totalDebt/totalEquityQuarterly") or num("totalDebt/totalEquityAnnual")  # RATIO
+        # `or` treats a legitimate 0.0 as missing — and 0.0 is a DEBT-FREE balance sheet, i.e. the
+        # single best case for the low_debt tag this feeds. The stale annual figure silently won.
+        de = num("totalDebt/totalEquityQuarterly")
+        if de is None:
+            de = num("totalDebt/totalEquityAnnual")  # RATIO
 
         high_roe = roe is not None and roe > 15
         low_debt = de is not None and de < 0.5

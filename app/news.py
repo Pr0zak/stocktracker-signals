@@ -6,6 +6,9 @@ headlines and the next earnings date to a stock's snapshot so Claude can ground 
 from __future__ import annotations
 
 import datetime as dt
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
 
 import httpx
 
@@ -82,7 +85,11 @@ async def fetch_dated_news(client: httpx.AsyncClient, symbol: str, days: int = 1
         if not head or not ts:
             continue
         try:
-            date = dt.datetime.utcfromtimestamp(int(ts)).date().isoformat()
+            # ET, as the docstring promises and as the analyst assumes when lining headlines up
+            # against price moves. utcfromtimestamp pushed anything published after 20:00 ET onto the
+            # FOLLOWING calendar day, so an evening headline appeared to precede the next session's
+            # move rather than follow that day's.
+            date = dt.datetime.fromtimestamp(int(ts), _ET).date().isoformat()
         except Exception:  # noqa: BLE001
             continue
         out.append({

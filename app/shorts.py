@@ -402,8 +402,12 @@ async def short_pressure(
         reasons.append(f"Days-to-cover {dtc:.1f} — covering is slow (fuel)")
     if si_change is not None:
         reasons.append(f"Short interest {'+' if si_change >= 0 else ''}{si_change:.1f}% vs prior period")
-    if sv_avg is not None and sv_avg >= 0.45:
-        reasons.append(f"Elevated daily short-volume ratio ({sv_avg:.0%} 5-day avg)")
+    # ~45% is close to the market-wide norm (short volume includes market-maker hedging, not just
+    # bearish bets), so calling it "elevated" fired for the majority of names and put a meaningless
+    # line into the analyst's evidence list. Only flag a genuinely unusual reading, and say plainly
+    # that it is descriptive.
+    if sv_avg is not None and sv_avg >= 0.60:
+        reasons.append(f"Daily short-volume ratio {sv_avg:.0%} (5-day avg) — descriptive, not predictive")
     if f and f.get("trend") == "rising":
         reasons.append("FTDs rising vs their 6-month median (settlement stress)")
 
@@ -452,6 +456,10 @@ def compact(sp: dict | None) -> dict | None:
     out = {
         "state": sp["state"],
         "days_to_cover": sp["days_to_cover"],
+        # Travels WITH the figure it qualifies. FINRA short interest is bi-monthly with a ~9
+        # business-day publication lag, so days_to_cover can legitimately be four weeks old — and
+        # the analyst was shown it with no as-of date, i.e. no way to discount it for staleness.
+        "si_date": sp.get("si_date"),
         "si_change_pct": sp["si_change_pct"],
         "short_vol_ratio_5d": sp["short_vol_ratio_5d"],
         "ftd_trend": sp["ftd_trend"],

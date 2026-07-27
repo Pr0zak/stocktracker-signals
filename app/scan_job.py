@@ -13,12 +13,13 @@ import asyncio
 import json
 import logging
 import time
+import datetime as dt
 from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
 
-from . import cycle, memory, options, settings_store, shorts, usage_store
+from . import cycle, market_calendar, memory, options, settings_store, shorts, usage_store
 from .analyst import analyze
 from .market import Series, fetch_series, summarize
 from .news import fetch_context
@@ -133,7 +134,12 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
         model=settings_store.get()["scan_model"], deep=False,
     )
     if not crypto:  # OC-6a: log this stock's ~30-45 DTE ATM IV for the /options IV-rank read
-        await _log_atm_iv(client, series.symbol)
+        # Only on real trading days. The scan runs every calendar day, and append_iv_history de-dupes
+        # per CALENDAR date, so weekends and holidays each added a row carrying Friday's stale IV —
+        # inflating the history ~1.4x and letting the 20-point "still building" gate clear after ~14
+        # sessions instead of 20, against a window documented in trading days.
+        if market_calendar.is_trading_day(dt.date.today()):
+            await _log_atm_iv(client, series.symbol)
     dip = _dip_tier(series.closes, summary.get("pct_off_52w_high"), below_200wma, weekly_oversold)
     return {
         "symbol": series.symbol,

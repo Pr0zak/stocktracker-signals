@@ -8,7 +8,7 @@ context with the sample size attached, never as a law.
 
 Long-term trend metrics come from Yahoo's max-range weekly bars (BTC back to 2014): price vs the
 200-week SMA (the classic BTC long-cycle support), Mayer Multiple (price / 200-day SMA), distance
-from all-time high, and a past-cycle analog (what happened 12 months after this same cycle position
+from the 10-year high, and a past-cycle analog (what happened 12 months after this same cycle position
 in each prior cycle). Cached in-process for 6h per symbol.
 """
 from __future__ import annotations
@@ -191,7 +191,7 @@ def long_term_trend(
 
     200-week SMA and where price sits relative to it — the below-the-line zone and week-over-week
     direction (mungbeans' recovering/deepening) — plus a 14-week RSI oversold read, Mayer Multiple,
-    distance from the all-time high, and 3-year CAGR. Returns None when there isn't enough weekly
+    distance from the 10-year high, and 3-year CAGR. Returns None when there isn't enough weekly
     history to say anything; the 200-week fields are omitted (not zero) below ~4 years of data.
     """
     if len(weekly) < 30:
@@ -219,7 +219,11 @@ def long_term_trend(
             lt["rsi_14w"] = round(rsi_w, 1)
             lt["weekly_oversold"] = rsi_w < 30
     ath = max(weekly)
-    lt["pct_off_all_time_high"] = round((price - ath) / ath * 100, 1)
+    # Named for what it MEASURES. `_weekly_max` is hard-coded to rng="10y" (deliberately — Yahoo's
+    # max+1wk combo truncates for some crypto symbols), so this is the 10-year weekly-close high, not
+    # an all-time one. For any name whose real peak predates the window the old label overstated how
+    # close to its record it was, and the number silently shifts as old highs roll off the edge.
+    lt["pct_off_10y_high"] = round((price - ath) / ath * 100, 1)
     # Dislocation z-score: how statistically unusual today's drawdown-from-running-peak is vs this
     # symbol's OWN weekly history. Very negative = an unusually deep drawdown (mungbeans' "how cheap,
     # normalized"); near 0/positive = trading around or above its typical drawdown (near highs).

@@ -219,3 +219,48 @@ def test_debit_spread_is_sized_on_the_same_budget_as_the_long_call():
     assert many["max_loss"] == one["max_loss"] * 10
     assert many["max_profit"] == one["max_profit"] * 10
     assert many["breakeven"] == one["breakeven"], "breakeven is per-share and must not scale"
+
+
+# ---------------------------------------------------------------- low-severity batch
+
+def test_a_debt_free_balance_sheet_is_not_treated_as_missing():
+    """`quarterly or annual` made a legitimate 0.0 — the BEST case for the low_debt tag — fall
+    through to the stale annual figure, because 0.0 is falsy."""
+    from app import fundamentals
+    import inspect
+    src = inspect.getsource(fundamentals)
+    assert 'num("totalDebt/totalEquityQuarterly") or num(' not in src, \
+        "the falsy-zero fallthrough is back"
+
+
+def test_news_dates_are_et_not_utc():
+    """The docstring promises ET so headlines line up with price moves. Computed in UTC, a headline
+    published at 21:00 ET landed on the FOLLOWING calendar day — appearing to precede the next
+    session's move rather than follow that day's."""
+    import datetime as dt
+
+    from app.news import _ET
+
+    # 21:00 ET on 2026-07-15 is 01:00 UTC on the 16th.
+    ts = int(dt.datetime(2026, 7, 15, 21, 0, tzinfo=_ET).timestamp())
+    assert dt.datetime.fromtimestamp(ts, dt.timezone.utc).date().isoformat() == "2026-07-16"
+    assert dt.datetime.fromtimestamp(ts, _ET).date().isoformat() == "2026-07-15"
+
+
+def test_short_pressure_carries_its_as_of_date():
+    """FINRA short interest is bi-monthly with a ~9 business-day lag, so days_to_cover can be four
+    weeks old — the analyst needs the date to discount it."""
+    from app import shorts
+    sp = {"state": "quiet", "days_to_cover": 1.5, "si_change_pct": 2.0, "short_vol_ratio_5d": 0.4,
+          "ftd_trend": "flat", "reasons": [], "si_date": "2026-07-15"}
+    out = shorts.compact(sp)
+    assert out["si_date"] == "2026-07-15"
+
+
+def test_the_ten_year_high_is_named_for_what_it_measures():
+    import inspect
+
+    from app import cycle
+    src = inspect.getsource(cycle)
+    assert "pct_off_all_time_high" not in src, "still labelled all-time"
+    assert "pct_off_10y_high" in src

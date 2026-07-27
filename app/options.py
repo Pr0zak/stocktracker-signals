@@ -260,7 +260,10 @@ async def fetch_chain(
     spot = _f(quote.get("regularMarketPrice"))
     market_state = quote.get("marketState")
     # Yahoo option quotes are ~15-min delayed and bid/ask go stale/0 outside regular hours.
-    quote_delayed = market_state not in (None, "REGULAR")
+    # An ABSENT marketState is exactly the case that should be treated as suspect — it used to map
+    # to "not delayed", suppressing the delayed-quotes warning and letting the traffic light confirm
+    # a spread it could not actually verify.
+    quote_delayed = market_state != "REGULAR"
 
     expirations = [
         {"ts": int(ts), "iso": time.strftime("%Y-%m-%d", time.gmtime(int(ts)))}
@@ -855,7 +858,12 @@ def _ordered_profiles(style: str) -> list[str]:
 
 
 def _candidate(c: OptionContract, profile: str, *, symbol: str, spot: float, budget: float | None) -> dict:
+    # Round to the penny FIRST, then derive — options quote in pennies, and the order ticket shows
+    # this same limit. Deriving cost from an unrounded mid meant the displayed limit and the
+    # displayed cost disagreed by up to half a cent per share ($0.50 a contract), so the numbers on
+    # the ticket didn't reconcile with the numbers beside it. `_debit_spread` already did this.
     limit = _limit_price(c)
+    limit = round(limit, 2) if limit is not None else None
     cost = round(limit * 100.0, 2) if limit is not None else None
     # How many whole contracts the budget buys (None when no budget or no cost to size against).
     affordable = (
@@ -1304,6 +1312,7 @@ def _put_candidate(
     limit = _limit_price(p)  # the premium per share we'd quote (mid, else last trade)
     if limit is None:
         return None
+    limit = round(limit, 2)  # penny-round BEFORE deriving, so the ticket reconciles (see _candidate)
     reserve_per = p.strike * 100.0  # cash-secured: strike × 100 set aside per contract
     # How many whole contracts the cash secures; n is the ticket quantity — never 0 (min 1) so no
     # figure reads $0 while a SELL-n ticket exists (the OC-1 sizing invariant).
