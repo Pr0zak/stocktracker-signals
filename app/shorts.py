@@ -201,10 +201,19 @@ async def _ftd_period(client: httpx.AsyncClient, period: str) -> dict | None:
         for line in text.splitlines()[1:]:
             p = line.split("|")
             if len(p) >= 6 and p[0].isdigit():
+                # The SEC writes a literal "." in the PRICE column when it has no price. Parsing the
+                # price inside the same try as the QUANTITY meant `float(".")` threw and the whole
+                # row was skipped — discarding the fail-to-deliver quantity, which is the figure this
+                # feed exists for, over a missing price we don't even use for the FTD trend.
                 try:
-                    rows.setdefault(p[2], []).append([p[0], int(p[3]), float(p[5]) if p[5] else None])
+                    qty = int(p[3])
                 except ValueError:
                     continue
+                try:
+                    px = float(p[5]) if p[5] else None
+                except ValueError:
+                    px = None
+                rows.setdefault(p[2], []).append([p[0], qty, px])
     except Exception:  # noqa: BLE001
         return None
     async with _LOCK:

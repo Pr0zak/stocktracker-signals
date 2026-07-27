@@ -37,6 +37,9 @@ CAND_KEYS = {
 ALT_KEYS = {
     "structure", "long_strike", "short_strike", "net_debit", "cost", "max_profit", "max_loss",
     "breakeven", "note",
+    # The alternative is now sized on the same budget as the long-call candidate rather than always
+    # quoting a single spread — `spreads` states that quantity (None when no budget was given).
+    "spreads",
 }
 
 _BULLISH = {"golden_cross": True, "pct_vs_sma20": 3.1, "pct_vs_sma50": 6.2, "macd_hist": 0.5,

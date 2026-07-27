@@ -196,3 +196,26 @@ def test_session_phase_respects_a_half_day():
     assert session_phase(dt.datetime(2026, 11, 27, 14, 30, tzinfo=et)) == "AFTER"   # half-day
     assert session_phase(dt.datetime(2026, 11, 30, 14, 30, tzinfo=et)) == "REGULAR"  # normal day
     assert session_phase(dt.datetime(2026, 11, 27, 12, 0, tzinfo=et)) == "REGULAR"   # before 1pm
+
+
+def test_debit_spread_is_sized_on_the_same_budget_as_the_long_call():
+    """Both blocks appear in one body under identical key names (`cost`, `max_loss`), so quoting the
+    spread as a single lot against a budget-scaled long call made the alternative look far cheaper
+    than the thing it is an alternative to."""
+    from app.options import ExpiryChain, OptionContract
+
+    def call(strike, mid):
+        return OptionContract(type="call", contract_symbol=f"C{strike}", strike=strike,
+                              expiration=0, bid=mid - 0.05, ask=mid + 0.05, mid=mid)
+
+    expiry = ExpiryChain(expiration=0, expiration_iso="2026-08-21",
+                         calls=[call(100.0, 5.0), call(110.0, 4.0)], puts=[])
+    ref = {"contract_symbol": "C100.0"}
+    one = options._debit_spread(expiry, ref, target_price=None, budget=None)
+    many = options._debit_spread(expiry, ref, target_price=None, budget=1000.0)
+    assert one["spreads"] is None, "no budget -> quantity is the caller's problem, and stated as such"
+    assert many["spreads"] == 10, "a $1000 budget buys ten $100 spreads"
+    assert many["cost"] == one["cost"] * 10
+    assert many["max_loss"] == one["max_loss"] * 10
+    assert many["max_profit"] == one["max_profit"] * 10
+    assert many["breakeven"] == one["breakeven"], "breakeven is per-share and must not scale"

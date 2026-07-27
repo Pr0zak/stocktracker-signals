@@ -110,10 +110,16 @@ def _r2(v) -> float | None:
 def assemble(quotes: dict[str, dict], watchlist: list[str], phase: str, *, top: int = 3) -> dict:
     """Turn a quote map into the compact analyst-facing snapshot (pure — easy to unit-test)."""
     wl = [s.upper() for s in (watchlist or [])]
-    indices = [{"name": name, "symbol": s, "pct": _r2((quotes.get(s) or {}).get("pct"))} for s, name in INDICES]
+    # Use the SESSION-appropriate move, exactly as `movers` already does. Reading `pct` straight off
+    # regularMarketChangePercent meant that during PRE/AFTER the indices, sectors and VIX carried the
+    # PREVIOUS regular session's move while the movers beside them carried the current pre/post move —
+    # two different measurement windows in one payload, under one `session` stamp, with nothing
+    # distinguishing them.
+    indices = [{"name": name, "symbol": s, "pct": _r2(_sess_pct(quotes.get(s) or {}, phase))}
+               for s, name in INDICES]
     vix_row = quotes.get(VIX) or {}
-    sectors = [{"name": name, "symbol": s, "pct": _r2((quotes.get(s) or {}).get("pct"))}
-               for s, name in SECTORS if (quotes.get(s) or {}).get("pct") is not None]
+    sectors = [{"name": name, "symbol": s, "pct": _r2(_sess_pct(quotes.get(s) or {}, phase))}
+               for s, name in SECTORS if _sess_pct(quotes.get(s) or {}, phase) is not None]
     sectors.sort(key=lambda x: x["pct"], reverse=True)
     movers = [{"symbol": s, "pct": _r2(_sess_pct(quotes[s], phase))}
               for s in wl if s in quotes and _sess_pct(quotes[s], phase) is not None]
@@ -122,7 +128,7 @@ def assemble(quotes: dict[str, dict], watchlist: list[str], phase: str, *, top: 
         "session": phase,
         "as_of_et": dt.datetime.now(_ET).strftime("%Y-%m-%d %H:%M ET"),
         "indices": indices,
-        "vix": {"level": _r2(vix_row.get("price")), "pct": _r2(vix_row.get("pct"))},
+        "vix": {"level": _r2(vix_row.get("price")), "pct": _r2(_sess_pct(vix_row, phase))},
         "sector_leaders": sectors[:top],
         "sector_laggards": (sectors[-top:][::-1] if len(sectors) > top else sectors[::-1]),
         "watchlist_movers": {

@@ -34,6 +34,14 @@ async def seasonality(client: httpx.AsyncClient, symbol: str) -> dict | None:
             continue
         d = dt.datetime.fromtimestamp(ts[i], dt.timezone.utc)
         bars.append((d.year, d.month, float(c)))
+    # Drop the CURRENT calendar month. Yahoo returns both an in-progress month bar and a trailing
+    # duplicate stub for it (verified: a 2026-07-01 bar and a 2026-07-24 bar with an identical
+    # close), so the unfinished month was counted twice — once as a "completed" month-over-month
+    # return that is really month-to-date, and once as a phantom ~0% observation between the two.
+    # Both land in the current month's avg_pct / hit_rate, which is exactly the figure the analyst
+    # is shown for "this month".
+    now = dt.datetime.now(dt.timezone.utc)
+    bars = [b for b in bars if (b[0], b[1]) < (now.year, now.month)]
     if len(bars) < 24:   # need ~2 years of months to say anything
         return None
 

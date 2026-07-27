@@ -136,8 +136,15 @@ def _build_block(rows: list[dict], months: int) -> dict | None:
         else "mixed" if buys and sells
         else "neutral"
     )
+    # `window_months` is the QUERY window, not proof the feed covers it — the upstream file is
+    # capped at 5000 rows globally, so a busy period could truncate coverage below the requested
+    # window without anything saying so. Measured today the feed spans ~18 months, i.e. the 12-month
+    # claim is currently honest; `oldest_trade_date` makes that checkable rather than assumed.
+    dates = sorted(str(r.get("transaction_date") or "")[:10] for r in recent if r.get("transaction_date"))
     return {
         "window_months": months,
+        "oldest_trade_date": dates[0] if dates else None,
+        "newest_trade_date": dates[-1] if dates else None,
         "trade_count": len(recent),
         "buy_count": len(buys),
         "sell_count": len(sells),

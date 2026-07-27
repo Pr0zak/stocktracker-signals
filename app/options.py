@@ -947,6 +947,7 @@ def _spread_short_leg(
 
 def _debit_spread(
     expiry: ExpiryChain, ref: dict | None, *, target_price: float | None,
+    budget: float | None = None,
 ) -> dict | None:
     """Build the OC-6b debit-call-spread alternative from the leading (balanced) candidate `ref`:
     BUY that call, SELL a higher call. Returns the alternative block, or None when it can't be formed
@@ -969,14 +970,22 @@ def _debit_spread(
     if net_debit <= 0:  # degenerate quotes — a debit spread must cost something
         return None
     width = short_c.strike - long_c.strike
+    per_spread = net_debit * 100.0
+    # Sized on the SAME budget as the long-call candidate. Previously this always quoted a single
+    # spread while `_candidate` scaled cost/max_loss by however many contracts the budget bought —
+    # and both appeared in one body under identical key names, so the alternative looked far cheaper
+    # than the thing it is an alternative TO.
+    n = int(math.floor(budget / per_spread)) if (budget and budget > 0 and per_spread > 0) else 0
+    n = n if n >= 1 else 1
     return {
         "structure": "debit_call_spread",
         "long_strike": long_c.strike,
         "short_strike": short_c.strike,
         "net_debit": net_debit,
-        "cost": round(net_debit * 100.0, 2),
-        "max_profit": round((width - net_debit) * 100.0, 2),
-        "max_loss": round(net_debit * 100.0, 2),
+        "spreads": n if (budget and budget > 0) else None,
+        "cost": round(per_spread * n, 2),
+        "max_profit": round((width - net_debit) * 100.0 * n, 2),
+        "max_loss": round(per_spread * n, 2),
         "breakeven": round(long_c.strike + net_debit, 2),
         "note": (
             f"Debit call spread: buy the {_fmt_strike(long_c.strike)} call and sell the "
@@ -1032,7 +1041,11 @@ def assemble_suggestion(
     )
 
     # The balanced pick drives the liquidity gate (or the first candidate if it de-duped away).
-    ref = next((c for c in candidates if c["profile"] == "balanced"), candidates[0] if candidates else None)
+    # The traffic light must describe the contract the caller is actually LED WITH. build_candidates
+    # orders the requested `style` first, and both the app and the deep-dive read candidates[0] — but
+    # this pinned "balanced" regardless, so asking for aggressive got a go/no-go computed from a
+    # different strike's spread and open interest than the one on screen.
+    ref = candidates[0] if candidates else None
 
     # --- warnings (Part 2) ---
     if earnings_in_window:
@@ -1085,7 +1098,7 @@ def assemble_suggestion(
         light_reason = f"direction reads bullish (score {direction['score']}), but {cautions[0]}"
 
     # --- OC-6b: debit-spread alternative + IV-rank gating ---
-    alternative = _debit_spread(expiry, ref, target_price=target_price)
+    alternative = _debit_spread(expiry, ref, target_price=target_price, budget=budget)
     # Recommend the spread when IV is rich (rank >= ~50) AND a spread is actually available.
     recommend_alternative = bool(iv_rank is not None and iv_rank >= HIGH_IV_RANK and alternative is not None)
 
