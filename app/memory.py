@@ -551,7 +551,18 @@ def symbols_missing_baseline(candidates: Iterable[str], *, min_rows: int = 20) -
                 "SELECT symbol, COUNT(*) c FROM verdicts WHERE origin = 'backfill' GROUP BY symbol"
             ).fetchall()
         have = {r["symbol"]: r["c"] for r in rows}
-        return sorted(s for s in wanted if have.get(s, 0) < min_rows)
+        missing = [s for s in wanted if have.get(s, 0) < min_rows]
+        # Deterministic ALPHABETICAL order let a permanently un-backfillable symbol (delisted, too
+        # little history, a bad ticker) sit at the front of the queue forever, consuming one of the
+        # four nightly slots on every run and starving everything after it. Order by how recently we
+        # last tried, so a symbol that keeps failing drifts to the back instead of blocking the line.
+        attempts = {
+            r["symbol"]: r["ts"]
+            for r in _db().execute(
+                "SELECT symbol, MAX(ts) ts FROM notes WHERE kind = 'seed_attempt' GROUP BY symbol"
+            )
+        }
+        return sorted(missing, key=lambda x: (attempts.get(x, 0.0), x))
     except Exception:  # noqa: BLE001
         log.warning("memory: symbols_missing_baseline failed", exc_info=True)
         return []
@@ -726,6 +737,11 @@ def seed_research() -> int:
 
 
 # ------------------------------------------------------------------------------------ housekeeping
+
+def retention_days() -> int:
+    """How far back rows are kept — the ceiling a backfill range should respect."""
+    return _RETAIN_DAYS
+
 
 def prune(retain_days: int = _RETAIN_DAYS) -> int:
     """Drop rows past the retention window. Returns rows removed."""

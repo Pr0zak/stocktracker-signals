@@ -6,8 +6,12 @@ fine for a "what's the tape doing" read (quotes come back flat) but WRONG for th
 must not place equity fills on a full market closure. Rather than pull in `pandas_market_calendars`
 (which drags in pandas) for ~9 fixed closures a year on rules that rarely change, this computes the
 NYSE full-closure set per year (with the Saturday→Friday / Sunday→Monday observed shift) plus the
-early-close (1pm ET) days. Only `is_trading_day()` is needed by the gate; early closes are harmless at
-15:35 ET (the market is still "open" then).
+early-close (1pm ET) days.
+
+Early closes are NOT harmless for the sandbox: the daily tick runs near the close, and on those three
+days a year the market has been shut for over two hours by then, so a "fill" would be priced off a
+stale quote and stamped as a live trade. `session_end_seconds()` gives the day's real close and
+`tick_gate` uses it instead of assuming 16:00.
 """
 from __future__ import annotations
 
@@ -85,3 +89,51 @@ def is_market_holiday(d: dt.date) -> bool:
 def is_trading_day(d: dt.date) -> bool:
     """True if the US equity market has a regular session on `d` (weekday and not a full holiday)."""
     return d.weekday() < 5 and not is_market_holiday(d)
+
+
+def next_trading_day(d: dt.date) -> dt.date:
+    """The next session strictly after `d`. Used for T+1 settlement dates."""
+    n = d + dt.timedelta(days=1)
+    for _ in range(10):          # a 10-day walk clears any weekend + holiday cluster
+        if is_trading_day(n):
+            return n
+        n += dt.timedelta(days=1)
+    return n
+
+
+# The three recurring 1pm ET early closes. Each is only an early close when it is itself a trading
+# day AND the holiday it precedes actually falls on a weekday — when the holiday shifts to an
+# observed date the eve is either a full closure or a normal session.
+_EARLY_CLOSE_END = 13 * 3600           # 13:00 ET
+_EARLY_AFTER_END = 17 * 3600           # after-hours also ends early on those days
+_REGULAR_END = 16 * 3600
+_REGULAR_AFTER_END = 20 * 3600
+
+
+def early_closes(year: int) -> frozenset[dt.date]:
+    """1pm ET half-days: July 3, the Friday after Thanksgiving, and Christmas Eve."""
+    out: set[dt.date] = set()
+    july4 = dt.date(year, 7, 4)
+    july3 = dt.date(year, 7, 3)
+    if july4.weekday() < 5 and is_trading_day(july3):
+        out.add(july3)
+    thanksgiving = _nth_weekday(year, 11, 3, 4)
+    friday = thanksgiving + dt.timedelta(days=1)
+    if is_trading_day(friday):
+        out.add(friday)
+    dec25 = dt.date(year, 12, 25)
+    dec24 = dt.date(year, 12, 24)
+    if dec25.weekday() < 5 and is_trading_day(dec24):
+        out.add(dec24)
+    return frozenset(out)
+
+
+def is_early_close(d: dt.date) -> bool:
+    return d in early_closes(d.year)
+
+
+def session_end_seconds(d: dt.date) -> tuple[int, int]:
+    """(regular_close, after_hours_close) in ET seconds-of-day for this date."""
+    if is_early_close(d):
+        return _EARLY_CLOSE_END, _EARLY_AFTER_END
+    return _REGULAR_END, _REGULAR_AFTER_END

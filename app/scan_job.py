@@ -227,6 +227,9 @@ async def backfill_memory(symbols: list[str], *, every: int = 3, rng: str = "2y"
         bench_idx = {d: i for i, d in enumerate(bench.dates)} if bench else {}
 
         for sym in symbols:
+            # Stamp the attempt BEFORE deciding whether it worked, so a symbol that can never be
+            # backfilled rotates to the back of the queue instead of consuming a slot every night.
+            memory.add_note("seed_attempt", f"backfill attempt for {sym}", symbol=sym)
             try:
                 s = await fetch_series(client, sym, rng=rng)
             except Exception:  # noqa: BLE001

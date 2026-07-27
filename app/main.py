@@ -1040,6 +1040,15 @@ async def memory_backfill(every: int = 3, rng: str = "2y") -> dict:
     is empty for about a month after deployment. Replayed rows carry `origin="backfill"` and no
     signal — they inform what a PATTERN does, never what the model's calls achieved.
     """
+    # Ranges beyond the retention window record rows that `prune` deletes on the very next scan, so
+    # the endpoint would cheerfully report writing thousands of rows that were already doomed.
+    allowed = {"6mo", "1y", "2y"}
+    if rng not in allowed:
+        raise HTTPException(
+            status_code=422,
+            detail=f"rng must be one of {sorted(allowed)} — retention is "
+                   f"{memory.retention_days()} days, so anything longer is pruned immediately",
+        )
     cfg = settings_store.get()
     syms = list(cfg.get("watchlist", [])) + list(cfg.get("crypto_watchlist", []))
     if not syms:
@@ -1854,9 +1863,10 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
                 "price": round(price, 4),
                 "value": round(price * h.shares, 2),
                 "unrealized_gain_pct": round((price / h.avg_cost - 1) * 100, 1) if h.avg_cost else None,
-                "technicals": {k: summ.get(k) for k in (
-                    "rsi14", "macd_hist", "pct_vs_sma50", "golden_cross",
-                    "rel_strength_3mo_vs_benchmark", "pct_off_52w_high") if summ.get(k) is not None},
+                # Same key set as candidates (_SANDBOX_TECH_KEYS). It was a divergent hardcoded
+                # copy, so held positions — the only source for a SELL's setup — carried fewer
+                # features than candidates did.
+                "technicals": {k: summ.get(k) for k in _SANDBOX_TECH_KEYS if summ.get(k) is not None},
             }
 
     rows = [r for r in await asyncio.gather(*[_price(h) for h in holdings]) if r]
@@ -2113,7 +2123,13 @@ async def scan_run() -> dict:
 _sandbox_lock = asyncio.Lock()
 _SANDBOX_CAND_SEM = asyncio.Semaphore(6)
 
-_SANDBOX_TECH_KEYS = ("rsi14", "macd_hist", "pct_vs_sma50", "golden_cross",
+# The analyst sees these on every position and candidate. pct_vs_sma20 / bollinger_pct_b /
+# stochastic_k were added because memory records sandbox fills from exactly this dict: without them
+# every origin='sandbox' row was missing 3 of 8 features INCLUDING pct_vs_sma20, which is a veto
+# dimension — so sandbox rows could never be excluded from a match on it, and matched more loosely
+# than any other row in the table.
+_SANDBOX_TECH_KEYS = ("rsi14", "macd_hist", "pct_vs_sma20", "pct_vs_sma50", "golden_cross",
+                      "bollinger_pct_b", "stochastic_k",
                       "rel_strength_3mo_vs_benchmark", "pct_off_52w_high")
 
 
@@ -2243,6 +2259,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
 
         # Recurring monthly deposit (DCA) — added once per ET calendar month, BEFORE the decision so the
         # AI can deploy it; the benchmark shadow gets the same cash on the same day.
+        warnings: list[str] = []
         dep = float(settings.get("monthly_deposit") or 0.0)
         month = now.strftime("%Y-%m")
         if dep > 0 and blob.get("last_deposit_month") != month:
@@ -2250,17 +2267,23 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 dspy = (await market_now.fetch_quotes(_http, ["^GSPC"])).get("^GSPC", {}).get("price")
             except Exception:  # noqa: BLE001
                 dspy = None
-            if dspy:
+            if not dspy:
+                # Skip the whole deposit rather than credit cash with no benchmark leg. Crucially the
+                # month cursor is NOT advanced, so it retries tomorrow instead of silently losing the
+                # month — the old code burned the cursor either way and left the shadow permanently
+                # short by one deposit, flattering every return figure measured against it.
+                warnings.append("monthly deposit deferred — no benchmark quote; will retry next tick")
+            else:
                 blob["benchmark"]["shares"] = round(blob["benchmark"]["shares"] + dep / dspy, 6)
                 blob["benchmark"]["cost_basis"] = round(blob["benchmark"]["cost_basis"] + dep, 2)
-            blob["cash"] = round(blob["cash"] + dep, 2)
-            blob["funded_total"] = round(blob["funded_total"] + dep, 2)
-            blob["last_deposit_month"] = month
-            sandbox_store.append_trade({
-                "ts": time.time(), "date": sandbox_job.today_et_str(now), "symbol": "CASH",
-                "side": "deposit", "status": "filled", "shares": 0.0, "price": None,
-                "gross": round(dep, 2), "cash_after": blob["cash"], "source": "recurring",
-                "reason": f"Recurring monthly deposit ${dep:,.0f}"})
+                blob["cash"] = round(blob["cash"] + dep, 2)
+                blob["funded_total"] = round(blob["funded_total"] + dep, 2)
+                blob["last_deposit_month"] = month
+                sandbox_store.append_trade({
+                    "ts": time.time(), "date": sandbox_job.today_et_str(now), "symbol": "CASH",
+                    "side": "deposit", "status": "filled", "shares": 0.0, "price": None,
+                    "gross": round(dep, 2), "cash_after": blob["cash"], "source": "recurring",
+                    "reason": f"Recurring monthly deposit ${dep:,.0f}"})
 
         # Cadence: "weekly" decides at most every 7 days (NAV still marks daily); "daily" always decides.
         from datetime import date as _date
@@ -2301,7 +2324,6 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
             return prices.get(sym.upper())
         spy_price = prices.get("^GSPC")
 
-        warnings: list[str] = []
         weekly_ran = False
         posture = ""
         # Bound on every path — the exit-date and weekly-cadence branches below skip the decision
@@ -2316,7 +2338,6 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
             orders, source = [], "haiku_tick"
             posture = "Weekly cadence — holding until the next scheduled decision."
         else:
-            blob["last_decision_date"] = sandbox_job.today_et_str(now)
             holdings = [Holding(symbol=p["symbol"], shares=p["shares"], avg_cost=p["avg_cost"])
                         for p in blob["positions"]]
             if holdings:
@@ -2342,6 +2363,12 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 usage_store.record(usage, symbol="SANDBOX", kind="sandbox_tick")
                 orders = [o.model_dump() for o in decision.orders]
                 posture = decision.posture
+                # Advanced only once a decision actually happened. Setting it at the TOP of this
+                # branch meant a single transient LLM failure consumed the cadence cursor: on
+                # "weekly" the account then held for another seven days having made no decision at
+                # all, and the log said "holding until the next scheduled decision" as though that
+                # were intentional.
+                blob["last_decision_date"] = sandbox_job.today_et_str(now)
             except Exception as e:  # noqa: BLE001 — a failed decision = no trades, still mark NAV
                 warnings.append(f"decision failed: {e}")
                 orders, posture = [], "No decision (analyst unavailable) — held."
@@ -2356,8 +2383,33 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
             _log.error("sandbox tick ABORTED (cash not conserved): %s", e)
             raise HTTPException(status_code=500, detail=f"sandbox tick aborted (cash not conserved): {e}")
 
+        if source == "exit_date":
+            left = [p["symbol"] for p in new_blob["positions"] if float(p.get("shares") or 0) > 0]
+            if left:
+                # The posture says "flattening to cash" — say so plainly when it did not finish
+                # rather than letting the claim stand unqualified.
+                warnings.append(f"exit-date flatten incomplete — still holding {', '.join(left)}")
+                posture = f"Exit date reached — flattened what could be sold; still holding {', '.join(left)}."
+        # A holding valued from a stale mark is a real caveat about the NAV point about to be
+        # written, so surface it instead of letting an approximation look like a measurement.
+        stale = sandbox_job.stale_marks(new_blob["positions"], price_of)
+        if stale:
+            warnings.append(f"no fresh quote for {', '.join(stale)} — valued at last known mark")
+
+        # The LEDGER is the source of truth and it is saved FIRST. The append-only logs used to be
+        # written before it, so a crash (or the process being killed) between them left
+        # sandbox_trades.jsonl and sandbox_nav.jsonl asserting trades and an equity point that the
+        # ledger never recorded — and being append-only, nothing can retract them. Saving first means
+        # the worst case is a fill that happened but wasn't logged, which is recoverable from the
+        # ledger; the reverse is not.
+        pv = sandbox_job.positions_value(new_blob["positions"], price_of)
+        nav = sandbox_job.nav_row(new_blob, positions_val=pv, spy_price=spy_price)
+        new_blob["last_tick_date"] = sandbox_job.today_et_str(now)
+        sandbox_store.save(new_blob)
+
         for r in filled + skipped:
             sandbox_store.append_trade(r)
+        sandbox_store.append_nav(nav)
         # Why a trade did NOT happen is the harder thing to reconstruct later — the JSONL has it, but
         # only searchable by hand. Recording blocks here (rather than inside sandbox_job, which is
         # deliberately pure) makes "how often does the position cap bind?" a query.
@@ -2398,24 +2450,6 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                          "thesis": r.get("reason")},
                 model=settings_store.get()["scan_model"], origin="sandbox",
             )
-        # A holding valued from a stale mark is a real caveat about the NAV point being written, so
-        # surface it instead of letting an approximation look like a measurement.
-        if source == "exit_date":
-            left = [p["symbol"] for p in new_blob["positions"] if float(p.get("shares") or 0) > 0]
-            if left:
-                # The posture says "flattening to cash" — say so plainly when it did not finish
-                # rather than letting the claim stand unqualified.
-                warnings.append(f"exit-date flatten incomplete — still holding {', '.join(left)}")
-                posture = f"Exit date reached — flattened what could be sold; still holding {', '.join(left)}."
-        stale = sandbox_job.stale_marks(new_blob["positions"], price_of)
-        if stale:
-            warnings.append(f"no fresh quote for {', '.join(stale)} — valued at last known mark")
-        pv = sandbox_job.positions_value(new_blob["positions"], price_of)
-        nav = sandbox_job.nav_row(new_blob, positions_val=pv, spy_price=spy_price)
-        sandbox_store.append_nav(nav)
-        new_blob["last_tick_date"] = sandbox_job.today_et_str(now)
-        sandbox_store.save(new_blob)
-
         return {"status": "ok", "date": nav["date"], "posture": posture,
                 "orders_filled": filled, "orders_skipped": skipped, "nav": nav,
                 "weekly_review_ran": weekly_ran, "warnings": warnings}
@@ -2589,11 +2623,36 @@ async def sandbox_fund_endpoint(req: SandboxFundRequest) -> dict:
             spy = (await market_now.fetch_quotes(_http, ["^GSPC"])).get("^GSPC", {}).get("price")
         except Exception:  # noqa: BLE001
             pass
-        if req.amount > 0 and spy:
+        # A deposit must not be credited without its benchmark leg. The shadow ^GSPC position is the
+        # only thing total_return_pct is measured against, so crediting cash while skipping the
+        # shares makes the sandbox look permanently ahead of a benchmark that was never given the
+        # money — and nothing later reconciles it.
+        if req.amount > 0 and not spy:
+            raise HTTPException(
+                status_code=503,
+                detail="can't price the benchmark right now — deposit not applied, try again shortly",
+            )
+        if req.amount < 0 and round(blob["cash"] + req.amount, 2) < 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"withdrawal exceeds cash on hand (${blob['cash']:,.2f}) — sell positions first",
+            )
+        if req.amount > 0:
             blob["benchmark"]["shares"] = round(blob["benchmark"]["shares"] + req.amount / spy, 6)
             blob["benchmark"]["cost_basis"] = round(blob["benchmark"]["cost_basis"] + req.amount, 2)
+        else:
+            # Symmetry matters: a withdrawal that left funded_total and the shadow untouched made
+            # total_return_pct (= equity/funded - 1) permanently understate, and the benchmark kept
+            # compounding money the account no longer had. Withdraw proportionally from both.
+            take = min(-req.amount, blob["funded_total"])
+            if blob["funded_total"] > 0 and blob["benchmark"]["shares"] > 0:
+                frac = take / blob["funded_total"]
+                blob["benchmark"]["shares"] = round(blob["benchmark"]["shares"] * (1 - frac), 6)
+                blob["benchmark"]["cost_basis"] = round(blob["benchmark"]["cost_basis"] * (1 - frac), 2)
+            blob["funded_total"] = round(blob["funded_total"] - take, 2)
         blob["cash"] = round(blob["cash"] + req.amount, 2)
-        blob["funded_total"] = round(blob["funded_total"] + max(0.0, req.amount), 2)
+        if req.amount > 0:
+            blob["funded_total"] = round(blob["funded_total"] + req.amount, 2)
         if blob.get("created_at") is None:
             blob["created_at"] = time.time()
         sandbox_store.save(blob)

@@ -20,10 +20,9 @@ from . import market_calendar
 
 ET = ZoneInfo("America/New_York")
 
-# Session windows in ET seconds-of-day (mirrors market_now.session_phase, kept local to avoid a cycle).
+# Session open in ET seconds-of-day (mirrors market_now.session_phase, kept local to avoid a cycle).
+# The CLOSE is per-date via market_calendar.session_end_seconds — it moves on 1pm half-days.
 _REG_OPEN = 9 * 3600 + 30 * 60   # 09:30
-_REG_END = 16 * 3600             # 16:00 — regular session close
-_AFTER_END = 20 * 3600           # 20:00 — after-hours close
 
 
 def now_et() -> dt.datetime:
@@ -55,8 +54,12 @@ def tick_gate(blob: dict, *, now: dt.datetime | None = None, force: bool = False
         return False, "market_closed"
     sod = now.hour * 3600 + now.minute * 60 + now.second
     allow_after = bool((blob.get("settings") or {}).get("allow_after_hours", False))
-    in_regular = _REG_OPEN <= sod < _REG_END
-    in_after = _REG_END <= sod < _AFTER_END
+    # The day's REAL close, not a hard-coded 16:00. On the three 1pm-ET half-days a year the market
+    # has been shut for hours by the time the daily tick runs, so a fill would be priced off a stale
+    # quote and stamped as a live trade.
+    reg_end, after_end = market_calendar.session_end_seconds(today)
+    in_regular = _REG_OPEN <= sod < reg_end
+    in_after = reg_end <= sod < after_end
     if not force:
         if in_after and not allow_after:
             return False, "after_hours_disabled"
@@ -218,8 +221,18 @@ def validate_and_fill(
             "entry_low": o.get("entry_low"), "entry_high": o.get("entry_high"),
         })
 
-    sells = [o for o in orders if o.get("side") == "sell"]
-    buys = [o for o in orders if o.get("side") == "buy"]
+    def _side(o: dict) -> str:
+        return str(o.get("side") or "").strip().lower()
+
+    sells = [o for o in orders if _side(o) == "sell"]
+    buys = [o for o in orders if _side(o) == "buy"]
+    # Anything else was previously dropped before any gate ran: no fill, no skip row, nothing in the
+    # trade log or the blocked notes, and `orders_skipped` in the response didn't mention it either.
+    # An order the model proposed and the ledger silently ate is the one case the audit trail must
+    # never miss, so unrecognised sides are recorded as skips.
+    for o in orders:
+        if _side(o) not in ("buy", "sell"):
+            _skip(o, f"unrecognised side {o.get('side')!r}")
 
     # ---- SELLS first ----
     for o in sells:
@@ -260,7 +273,25 @@ def validate_and_fill(
     equity = round(cash + pv_after_sells, 2)
     floor = cash_floor_pct / 100.0 * equity
     # T+1: in a cash account today's sale proceeds are UNSETTLED and can't fund today's buys.
-    buying_power = cash - sell_notional if is_cash_account else cash
+    # T+1 settlement, tracked ON THE LEDGER rather than scoped to this call.
+    #
+    # It used to be `cash - sell_notional`, which only knew about sells made in THIS invocation — so
+    # a second tick the same afternoon (the app's "run tick" button always sends force=true) saw
+    # those proceeds as fully settled and spent them. That is a good-faith violation a real cash
+    # account would block, and the only thing preventing it was that nobody usually ticked twice.
+    today = dt.datetime.fromtimestamp(now_ts, ET).date()
+    unsettled = [
+        u for u in (b.get("unsettled") or [])
+        if str(u.get("settles_on") or "") > today.isoformat()
+    ]
+    if is_cash_account and sell_notional > 0:
+        unsettled.append({
+            "amount": round(sell_notional, 2),
+            "settles_on": market_calendar.next_trading_day(today).isoformat(),
+        })
+    b["unsettled"] = unsettled
+    unsettled_total = sum(float(u.get("amount") or 0.0) for u in unsettled)
+    buying_power = (cash - unsettled_total) if is_cash_account else cash
     # Same marks as the equity figure above — if these two ever diverge, the cap is measured against
     # a different book than the one it is capping.
     group_value: dict[str, float] = {}
@@ -317,11 +348,35 @@ def validate_and_fill(
         room = turnover_budget - traded_notional
         if room <= 0:
             _skip(o, f"turnover cap ({turnover_pct:.0f}% of equity) reached"); continue
-        spend = min(float(o.get("dollars") or 0) or available, available, cap_room, room)
+        # Size from `dollars`, else from an explicit `shares` count, else skip. The old
+        # `float(dollars or 0) or available` fallback silently reinterpreted a zero/absent/null
+        # `dollars` as "spend everything not behind the cash floor" — the largest possible order
+        # from the weakest possible instruction, and `shares` was never consulted on a buy at all.
         fill = px * (1 + slip)
+        want_dollars = float(o.get("dollars") or 0.0)
+        if want_dollars <= 0:
+            want_shares = float(o.get("shares") or 0.0)
+            if want_shares > 0:
+                # Budget at the FILL price, not the raw quote — costing 10 shares at `px` leaves
+                # slippage unfunded, so `spend / fill` lands just under 10 and floors to 9.
+                want_dollars = want_shares * fill
+            else:
+                _skip(o, "buy order specified neither dollars nor shares"); continue
+        spend = min(want_dollars, available, cap_room, room)
         shares = round_shares(sym, spend / fill)
         if shares <= 0:
-            _skip(o, "cash/cap/turnover left no whole share"); continue
+            # Name the constraint that actually bound. "cash/cap/turnover" covered three unrelated
+            # causes, so the blocked-trade log could not answer the one question it exists for —
+            # and a T+1 hold looked identical to simply being out of money.
+            if is_cash_account and unsettled_total > 0.01 and spend >= available - 0.01:
+                why = (f"unsettled proceeds (T+1) — ${unsettled_total:,.0f} frees up next session")
+            elif spend >= cap_room - 0.01:
+                why = f"exposure '{g}' cap left room for less than one share"
+            elif spend >= room - 0.01:
+                why = f"turnover cap ({turnover_pct:.0f}% of equity) left room for less than one share"
+            else:
+                why = "cash floor left room for less than one share"
+            _skip(o, why); continue
         cost = shares * fill
         traded_notional += cost
         cash -= cost

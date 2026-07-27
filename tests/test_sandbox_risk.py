@@ -181,3 +181,117 @@ def test_liquidation_still_respects_shares_actually_held():
         blob, orders, lambda s: 100.0, group_of=_group, source="exit_date", liquidation=True)
     assert filled[0]["shares"] == 10, "cannot sell more than is held, even liquidating"
     assert nb["cash"] > 0
+
+
+# ------------------------------------------------------------------ order handling
+
+def test_a_buy_with_no_size_is_a_no_op_not_max_size():
+    """`dollars or available` turned the weakest possible instruction into the largest order."""
+    from app import sandbox_job
+
+    blob = {"cash": 10_000.0, "positions": [], "settings": _settings(max_turnover_pct=0.0)}
+    order = [{"symbol": "NEW", "side": "buy", "shares": 0, "dollars": 0.0,
+              "conviction": 90, "reason": "x"}]
+    nb, filled, skipped = sandbox_job.validate_and_fill(
+        blob, order, lambda s: 50.0, group_of=_group, source="t")
+    assert filled == []
+    assert nb["cash"] == 10_000.0, "an unsized order spent real cash"
+    assert "neither dollars nor shares" in skipped[0]["skip_reason"]
+
+
+def test_a_buy_sized_only_by_shares_is_honoured():
+    from app import sandbox_job
+
+    blob = {"cash": 10_000.0, "positions": [], "settings": _settings(max_turnover_pct=0.0)}
+    order = [{"symbol": "NEW", "side": "buy", "shares": 10, "dollars": 0.0,
+              "conviction": 90, "reason": "x"}]
+    _, filled, _ = sandbox_job.validate_and_fill(
+        blob, order, lambda s: 50.0, group_of=_group, source="t")
+    assert filled and filled[0]["shares"] == 10
+
+
+def test_an_unrecognised_side_is_audited_not_swallowed():
+    """An order the model proposed and the ledger silently ate is the one case the audit trail
+    must never miss."""
+    from app import sandbox_job
+
+    blob = {"cash": 10_000.0, "positions": [], "settings": _settings()}
+    orders = [{"symbol": "A", "side": "BUY", "shares": 5, "dollars": 0.0, "conviction": 90},
+              {"symbol": "B", "side": "hold", "shares": 5, "dollars": 0.0, "conviction": 90},
+              {"symbol": "C", "side": None, "shares": 5, "dollars": 0.0, "conviction": 90}]
+    _, filled, skipped = sandbox_job.validate_and_fill(
+        blob, orders, lambda s: 50.0, group_of=_group, source="t")
+    assert [f["symbol"] for f in filled] == ["A"], "case should be normalised, not rejected"
+    assert {s["symbol"] for s in skipped} == {"B", "C"}
+    assert all("unrecognised side" in s["skip_reason"] for s in skipped)
+
+
+# ------------------------------------------------------------------ T+1 across ticks
+
+def test_t1_settlement_survives_a_second_tick_the_same_day():
+    """The app's "run tick" button always sends force=true, which re-armed every per-call limit —
+    including the one that knew about today's unsettled proceeds."""
+    from app import sandbox_job
+
+    st = _settings(max_position_pct=50.0, cash_floor_pct=0.0, max_turnover_pct=0.0)
+    blob = {"cash": 5.0, "positions": [{"symbol": "AAPL", "shares": 100, "avg_cost": 50.0}],
+            "settings": st}
+    px = lambda s: 100.0  # noqa: E731
+    sell = {"symbol": "AAPL", "side": "sell", "shares": 100, "dollars": 0.0, "conviction": 90}
+    buy = {"symbol": "MSFT", "side": "buy", "shares": 0, "dollars": 9000.0, "conviction": 90}
+
+    nb1, filled1, _ = sandbox_job.validate_and_fill(
+        blob, [sell, buy], px, group_of=_group, source="t")
+    assert [f["symbol"] for f in filled1] == ["AAPL"]
+    assert nb1["unsettled"] and nb1["unsettled"][0]["amount"] > 9000
+
+    nb2, filled2, skipped2 = sandbox_job.validate_and_fill(nb1, [buy], px, group_of=_group, source="t")
+    assert filled2 == [], "spent unsettled proceeds on a forced same-day re-tick"
+    assert "T+1" in skipped2[0]["skip_reason"]
+
+
+def test_settled_proceeds_are_usable_next_session():
+    from app import sandbox_job
+    import time
+
+    st = _settings(max_position_pct=50.0, cash_floor_pct=0.0, max_turnover_pct=0.0)
+    blob = {"cash": 5.0, "positions": [{"symbol": "AAPL", "shares": 100, "avg_cost": 50.0}],
+            "settings": st}
+    px = lambda s: 100.0  # noqa: E731
+    nb1, _, _ = sandbox_job.validate_and_fill(
+        blob, [{"symbol": "AAPL", "side": "sell", "shares": 100, "dollars": 0.0, "conviction": 90}],
+        px, group_of=_group, source="t")
+    nb2, filled, _ = sandbox_job.validate_and_fill(
+        nb1, [{"symbol": "MSFT", "side": "buy", "shares": 0, "dollars": 4000.0, "conviction": 90}],
+        px, group_of=_group, source="t", now_ts=time.time() + 5 * 86_400)
+    assert filled, "proceeds never became usable"
+    assert nb2["unsettled"] == []
+
+
+# ------------------------------------------------------------------ early closes
+
+def test_early_close_days_are_modelled():
+    import datetime as dt
+
+    from app import market_calendar as mc
+
+    assert mc.early_closes(2025) == frozenset({dt.date(2025, 7, 3), dt.date(2025, 11, 28),
+                                               dt.date(2025, 12, 24)})
+    # 2026: July 4 is a Saturday, so July 3 is a full closure, not a half-day.
+    assert dt.date(2026, 7, 3) not in mc.early_closes(2026)
+    assert mc.session_end_seconds(dt.date(2026, 11, 27)) == (13 * 3600, 17 * 3600)
+    assert mc.session_end_seconds(dt.date(2026, 11, 30)) == (16 * 3600, 20 * 3600)
+
+
+def test_tick_gate_respects_an_early_close():
+    """At 15:35 on a half-day the market has been shut for 2.5 hours — a fill would be priced off a
+    stale quote and stamped as live."""
+    import datetime as dt
+
+    from app import sandbox_job
+
+    blob = {"settings": {"master_enabled": True, "allow_after_hours": False}}
+    half_day = dt.datetime(2026, 11, 27, 15, 35, tzinfo=sandbox_job.ET)
+    normal = dt.datetime(2026, 11, 30, 15, 35, tzinfo=sandbox_job.ET)
+    assert sandbox_job.tick_gate(blob, now=normal) == (True, "ok")
+    assert sandbox_job.tick_gate(blob, now=half_day)[1] == "after_hours_disabled"
