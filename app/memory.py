@@ -102,6 +102,11 @@ CREATE TABLE IF NOT EXISTS verdicts (
     scored_at    REAL
 );
 CREATE INDEX IF NOT EXISTS ix_verdicts_symbol ON verdicts(symbol, ts DESC);
+-- One row per bar per origin. Without this, a `refresh=true` verdict, a manual /scan/run alongside
+-- the timer, or a repeated backfill each inserted ANOTHER row carrying the identical bar, which then
+-- scored to a byte-identical forward return. `n` counted verdict PRODUCTIONS rather than decisions,
+-- and repeated bars got extra weight in every median the analyst is told to trust.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_verdicts_bar ON verdicts(symbol, asof_date, origin);
 CREATE INDEX IF NOT EXISTS ix_verdicts_unscored ON verdicts(scored_at) WHERE scored_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS notes (
@@ -155,6 +160,11 @@ def _migrate(db: sqlite3.Connection) -> None:
     ALTER. Each is guarded individually — a fresh install already has them and would otherwise raise.
     """
     db.executescript(_DROP_FTS)  # retire the unused full-text index (see note above)
+    # Collapse pre-existing duplicate bars (keep the newest row) so the unique index can be built.
+    db.execute(
+        "DELETE FROM verdicts WHERE id NOT IN ("
+        "  SELECT MAX(id) FROM verdicts GROUP BY symbol, asof_date, origin)"
+    )
     # Repair rows written before signals were normalised: "Signal.buy" -> "buy". Left alone they are
     # invisible to every buy filter, so the scorecard would under-count real calls indefinitely.
     db.execute(
@@ -176,16 +186,21 @@ def _migrate(db: sqlite3.Connection) -> None:
 # Each dimension is divided by a fixed, domain-chosen scale so the distance is comparable across
 # names and stable as the table grows. Deriving scales from the data instead would make yesterday's
 # neighbours silently change meaning as new rows land.
-_FEATURES: tuple[tuple[str, float, float], ...] = (
-    # (column,            scale,  weight)
-    ("rsi14",             25.0,   1.0),
-    ("pct_vs_sma20",       6.0,   1.0),
-    ("pct_vs_sma50",      12.0,   1.0),
-    ("macd_hist_pct",      1.5,   0.7),
-    ("bollinger_pct_b",    0.4,   0.7),
-    ("stochastic_k",      30.0,   0.5),
-    ("pct_off_52w_high",  15.0,   1.0),
-    ("rel_strength",       0.12,  0.8),
+# `veto` marks the axes that DEFINE what a setup is: two rows that disagree sharply on any of them
+# are not neighbours, however well the rest line up. It is listed explicitly rather than derived from
+# `weight`, because deriving it silently exempted rel_strength (weight 0.8 < the 1.0 threshold) — the
+# single dimension the module docstring names as the point of the whole exercise. That is verbatim
+# the failure the veto was added to prevent, reintroduced by coupling two unrelated ideas.
+_FEATURES: tuple[tuple[str, float, float, bool], ...] = (
+    # (column,            scale,  weight, veto)
+    ("rsi14",             25.0,   1.0,    True),
+    ("pct_vs_sma20",       6.0,   1.0,    True),
+    ("pct_vs_sma50",      12.0,   1.0,    True),
+    ("macd_hist_pct",      1.5,   0.7,    False),   # a confirmer; allowed to disagree
+    ("bollinger_pct_b",    0.4,   0.7,    False),
+    ("stochastic_k",      30.0,   0.5,    False),
+    ("pct_off_52w_high",  15.0,   1.0,    True),
+    ("rel_strength",       0.12,  0.8,    True),    # weaker weight, but still setup-defining
 )
 # A neighbour further than this (mean weighted units) isn't the same setup in any useful sense.
 _MAX_DISTANCE = 1.15
@@ -194,9 +209,7 @@ _MAX_DISTANCE = 1.15
 # two setups get — still scored 0.94 because MACD/Bollinger/RS matched. So any single core dimension
 # this far apart vetoes the match outright, no matter how well the rest line up.
 _VETO_DISTANCE = 1.5
-# Dimensions the veto applies to: the trend/momentum axes that define what a setup *is*. The
-# lower-weight confirmers (Stochastic, %B, MACD) are allowed to disagree.
-_VETO_WEIGHT = 1.0
+# (which dimensions veto is declared per-feature above, not inferred from weight)
 
 
 def features_from_summary(summary: dict) -> dict[str, float | None]:
@@ -227,12 +240,12 @@ def _distance(a: dict[str, float | None], row: sqlite3.Row) -> float | None:
     total = 0.0
     wsum = 0.0
     used = 0
-    for col, scale, weight in _FEATURES:
+    for col, scale, weight, veto in _FEATURES:
         x, y = a.get(col), row[col]
         if x is None or y is None:
             continue
         d = abs(float(x) - float(y)) / scale
-        if weight >= _VETO_WEIGHT and d > _VETO_DISTANCE:
+        if veto and d > _VETO_DISTANCE:
             return None  # opposite on an axis that defines the setup — not a neighbour at all
         total += weight * d
         wsum += weight
@@ -280,7 +293,9 @@ def record_verdict(
         marks = ",".join("?" for _ in row)
         with _lock:
             db = _db()
-            cur = db.execute(f"INSERT INTO verdicts ({cols}) VALUES ({marks})", list(row.values()))
+            # REPLACE, not IGNORE: a re-run reflects a newer read of the same bar and should win.
+            cur = db.execute(
+                f"INSERT OR REPLACE INTO verdicts ({cols}) VALUES ({marks})", list(row.values()))
             db.commit()
             return cur.lastrowid
     except Exception:  # noqa: BLE001 — memory must never break a verdict
@@ -340,10 +355,15 @@ def similar_setups(symbol: str, summary: dict, *, k: int = 40) -> dict | None:
             (mine if r["symbol"] == sym else others).append((d, r))
 
         out: dict[str, Any] = {}
-        same = _cohort(sorted(mine, key=lambda t: t[0])[:k])
+        # Pass the FULL sorted list; `_cohort` truncates to k for the overall base rate but selects
+        # the model's own rows separately. Truncating first crowded them out entirely: backfill
+        # outnumbers live verdicts by ~140:1 per symbol, so the 40-nearest window was all replayed
+        # setups and `when_model_said_buy` could never reach its minimum sample — and auto-seeding
+        # made it progressively worse every night.
+        same = _cohort(sorted(mine, key=lambda t: t[0]), k=k)
         if same:
             out["this_symbol"] = same
-        near = _cohort(sorted(others, key=lambda t: t[0])[:k])
+        near = _cohort(sorted(others, key=lambda t: t[0]), k=k)
         if near:
             out["analogues"] = near
         return out or None
@@ -352,7 +372,7 @@ def similar_setups(symbol: str, summary: dict, *, k: int = 40) -> dict | None:
         return None
 
 
-def _cohort(pairs: Sequence[tuple[float, sqlite3.Row]]) -> dict | None:
+def _cohort(pairs: Sequence[tuple[float, sqlite3.Row]], *, k: int = 40) -> dict | None:
     """Summarize matched neighbours into a track record, or None if the sample is too thin.
 
     Reports EXCESS return vs the benchmark over the same window wherever the benchmark is known.
@@ -361,8 +381,9 @@ def _cohort(pairs: Sequence[tuple[float, sqlite3.Row]]) -> dict | None:
     """
     if len(pairs) < _MIN_SAMPLES:
         return None
-    r20 = [float(r["fwd_20d"]) for _, r in pairs if r["fwd_20d"] is not None]
-    r5 = [float(r["fwd_5d"]) for _, r in pairs if r["fwd_5d"] is not None]
+    nearest = pairs[:k]                       # base rate: the k closest, whatever their origin
+    r20 = [float(r["fwd_20d"]) for _, r in nearest if r["fwd_20d"] is not None]
+    r5 = [float(r["fwd_5d"]) for _, r in nearest if r["fwd_5d"] is not None]
     if len(r20) < _MIN_SAMPLES:
         return None
     out: dict[str, Any] = {
@@ -372,16 +393,16 @@ def _cohort(pairs: Sequence[tuple[float, sqlite3.Row]]) -> dict | None:
     }
     if len(r5) >= _MIN_SAMPLES:
         out["median_fwd_5d_pct"] = round(_median(r5), 2)
-    ex = _excess(pairs)
+    ex = _excess(nearest)
     if ex:
         out["vs_benchmark"] = ex
     # Only REAL verdicts count here — a replayed setup has no opinion attached, and letting backfill
     # rows in would silently turn "how well does the model call this setup" into "how does this setup
     # drift", which is a different question wearing the same label.
-    said_buy = _directional(pairs, BUY_SIGNALS, bullish=True)
+    said_buy = _directional(pairs, BUY_SIGNALS, bullish=True, k=k)
     if said_buy:
         out["when_model_said_buy"] = said_buy
-    said_sell = _directional(pairs, SELL_SIGNALS, bullish=False)
+    said_sell = _directional(pairs, SELL_SIGNALS, bullish=False, k=k)
     if said_sell:
         out["when_model_said_sell"] = said_sell
     return out
@@ -395,6 +416,7 @@ SELL_SIGNALS = ("sell", "strong_sell", "trim", "reduce")
 
 def _directional(
     pairs: Sequence[tuple[float, sqlite3.Row]], signals: Sequence[str], *, bullish: bool,
+    k: int = 40,
 ) -> dict | None:
     """Score one side of the book. Returns None below the minimum sample.
 
@@ -408,7 +430,7 @@ def _directional(
     rows = [
         (d, r) for d, r in pairs
         if r["origin"] == "model" and (r["signal"] or "").lower() in signals
-    ]
+    ][:k]
     if len(rows) < _MIN_SAMPLES:
         return None
     fwd = [float(r["fwd_20d"]) for _, r in rows if r["fwd_20d"] is not None]
@@ -584,8 +606,13 @@ def score_symbol(
                 bj = bidx.get(r["asof_date"])
                 if bj is not None and bench_closes and bench_closes[bj]:
                     bbase = float(bench_closes[bj])
-                    b5 = _fwd(bench_closes, bj, 5, bbase)
-                    b20 = _fwd(bench_closes, bj, 20, bbase)
+                    # BOTH ends located by date. Stepping 20 *benchmark* bars from the anchor was
+                    # only half the promise in the docstring: when the symbol is missing bars the
+                    # benchmark has (halt, late listing, thin crypto calendar), the two windows end
+                    # on different days and the "excess" compares mismatched periods — precisely the
+                    # case the date-anchoring was introduced to avoid.
+                    b5 = _fwd_to_date(bench_closes, bidx, dates, i, 5, bbase)
+                    b20 = _fwd_to_date(bench_closes, bidx, dates, i, 20, bbase)
                 updates.append((f5, f20, b5, b20, now, r["id"]))
             if updates:
                 db.executemany(
@@ -597,6 +624,32 @@ def score_symbol(
     except Exception:  # noqa: BLE001
         log.warning("memory: score_symbol failed for %s", symbol, exc_info=True)
         return 0
+
+
+def _fwd_to_date(
+    bench_closes: Sequence[float], bidx: dict, dates: Sequence[str], i: int, horizon: int, base: float,
+) -> float | None:
+    """Benchmark return over the SAME calendar window the symbol's `horizon` bars covered.
+
+    Finds the symbol's end date, then looks that date up in the benchmark's own series. Falls back to
+    the nearest earlier benchmark date when the exact one is missing (a holiday the symbol trades but
+    the index does not — crypto against the S&P), and gives up rather than guessing if nothing is
+    close enough.
+    """
+    j = i + horizon
+    if j >= len(dates):
+        return None
+    end = dates[j]
+    bj = bidx.get(end)
+    if bj is None:
+        earlier = [d for d in bidx if d <= end]
+        if not earlier:
+            return None
+        bj = bidx[max(earlier)]
+    px = bench_closes[bj] if bj < len(bench_closes) else None
+    if not px or not base:
+        return None
+    return round((float(px) - base) / base * 100.0, 3)
 
 
 def _fwd(closes: Sequence[float], i: int, horizon: int, base: float) -> float | None:

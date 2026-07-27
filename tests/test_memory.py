@@ -32,6 +32,14 @@ def memory(monkeypatch):
         mem._conn = None
 
 
+_DAYS = [f"2026010{i + 1}" if i < 9 else f"202601{i + 1}" for i in range(40)]
+
+
+def _day(i: int) -> str:
+    """A distinct scorable bar date. Only the first 20 bars leave a full 20-session horizon."""
+    return _DAYS[i % 20]
+
+
 def _summary(rsi: float = 32.0, price: float = 100.0, date: str = "20260101") -> dict:
     """A snapshot with enough dimensions to be recordable and recallable."""
     return {
@@ -69,7 +77,7 @@ def test_real_verdict_object_reaches_the_scorecard(memory):
 
     for i in range(8):
         assert memory.record_verdict(
-            symbol="AAPL", summary=_summary(rsi=30 + i), verdict=dumped, origin="model",
+            symbol="AAPL", summary=_summary(rsi=30 + i, date=_day(i)), verdict=dumped, origin="model",
         )
     _score_all(memory)
 
@@ -100,7 +108,7 @@ def test_legacy_enum_rows_are_repaired(memory):
     v = Verdict(signal=Signal.buy, conviction=70, thesis="t", rationale=[], key_risks=[],
                 invalidation="x", horizon="2w", catalysts=[]).model_dump()
     for i in range(8):
-        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i), verdict=v, origin="model")
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i, date=_day(i)), verdict=v, origin="model")
     _score_all(memory)
 
     db = sqlite3.connect(memory._FILE)
@@ -119,13 +127,13 @@ def test_backfill_rows_never_count_as_model_calls(memory):
     v = Verdict(signal=Signal.buy, conviction=70, thesis="t", rationale=[], key_risks=[],
                 invalidation="x", horizon="2w", catalysts=[]).model_dump()
     for i in range(10):
-        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i), verdict={},
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i, date=_day(i)), verdict={},
                               origin="backfill")
     _score_all(memory)
     assert "buy_calls" not in memory.stats(), "backfill leaked into the model's scorecard"
 
     for i in range(6):
-        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i), verdict=v, origin="model")
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i, date=_day(i)), verdict=v, origin="model")
     _score_all(memory)
     stats = memory.stats()
     assert stats["buy_calls"]["n"] == 6, "model scorecard must count ONLY real verdicts"
@@ -138,8 +146,8 @@ def test_sandbox_fills_scored_separately_from_analyst_calls(memory):
     v = Verdict(signal=Signal.buy, conviction=70, thesis="t", rationale=[], key_risks=[],
                 invalidation="x", horizon="2w", catalysts=[]).model_dump()
     for i in range(6):
-        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i), verdict=v, origin="model")
-        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i), verdict=v, origin="sandbox")
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i, date=_day(i)), verdict=v, origin="model")
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i, date=_day(i)), verdict=v, origin="sandbox")
     _score_all(memory)
     stats = memory.stats()
     assert stats["buy_calls"]["n"] == 6
@@ -150,7 +158,7 @@ def test_opposite_setups_are_not_neighbours(memory):
     """RSI 29 vs RSI 79 is about as different as two setups get; agreeing dimensions must not
     average that away (they did, scoring 0.94 against a 1.15 threshold, before the per-dimension veto)."""
     for i in range(10):
-        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=28 + i * 0.3), verdict={},
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=28 + i * 0.3, date=_day(i)), verdict={},
                               origin="backfill")
     _score_all(memory)
     assert memory.similar_setups("AAPL", _summary(rsi=29)) is not None
@@ -162,7 +170,7 @@ def test_opposite_setups_are_not_neighbours(memory):
 def test_thin_samples_report_nothing(memory):
     """Below the minimum, emit no track record at all rather than a number that reads as evidence."""
     for i in range(3):
-        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i), verdict={},
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i, date=_day(i)), verdict={},
                               origin="backfill")
     _score_all(memory)
     assert memory.similar_setups("AAPL", _summary()) is None
@@ -171,7 +179,7 @@ def test_thin_samples_report_nothing(memory):
 def test_unscored_rows_teach_nothing(memory):
     """A verdict with no realized outcome yet must not contribute to a track record."""
     for i in range(20):
-        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i * 0.2), verdict={},
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i * 0.2, date=_day(i)), verdict={},
                               origin="backfill")
     assert memory.similar_setups("AAPL", _summary()) is None  # nothing scored yet
 
@@ -228,7 +236,7 @@ def test_fts_index_is_gone(memory):
 
 def test_seeding_targets_only_symbols_without_a_baseline(memory):
     for i in range(25):
-        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i * 0.2), verdict={},
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i * 0.2, date=_day(i)), verdict={},
                               origin="backfill")
     memory.record_verdict(symbol="MSFT", summary=_summary(), verdict={}, origin="backfill")
     missing = memory.symbols_missing_baseline(["AAPL", "MSFT", "NVDA"])
@@ -248,7 +256,7 @@ def test_sell_calls_are_scored_with_an_inverted_convention(memory):
                        invalidation="x", horizon="2w", catalysts=[]).model_dump()
 
     for i in range(8):
-        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i), verdict=dump(Signal.sell),
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i, date=_day(i)), verdict=dump(Signal.sell),
                               origin="model")
     # Symbol rises 0.3%/bar while the benchmark rises 0.1%/bar: the name OUTperformed, so these
     # sells were WRONG even though the raw return is positive.
@@ -266,7 +274,7 @@ def test_sell_calls_score_well_when_the_name_underperforms(memory):
     v = Verdict(signal=Signal.sell, conviction=70, thesis="t", rationale=[], key_risks=[],
                 invalidation="x", horizon="2w", catalysts=[]).model_dump()
     for i in range(8):
-        memory.record_verdict(symbol="LOSER", summary={**_summary(rsi=30 + i), "symbol": "LOSER"},
+        memory.record_verdict(symbol="LOSER", summary={**_summary(rsi=30 + i, date=_day(i)), "symbol": "LOSER"},
                               verdict=v, origin="model")
     dates = [f"2026010{i + 1}" if i < 9 else f"202601{i + 1}" for i in range(40)]
     falling = [100.0 * (0.998 ** i) for i in range(40)]        # name falls
@@ -285,7 +293,83 @@ def test_hold_is_scored_as_neither_side(memory):
     v = Verdict(signal=Signal.hold, conviction=50, thesis="t", rationale=[], key_risks=[],
                 invalidation="x", horizon="2w", catalysts=[]).model_dump()
     for i in range(10):
-        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i), verdict=v, origin="model")
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i, date=_day(i)), verdict=v, origin="model")
     _score_all(memory)
     stats = memory.stats()
     assert "buy_calls" not in stats and "sell_calls" not in stats
+
+
+def test_backfill_does_not_crowd_out_the_model_scorecard(memory):
+    """Backfill outnumbers live verdicts ~140:1, so truncating to the k nearest BEFORE filtering by
+    origin made when_model_said_buy structurally unreachable — and worse every night as seeding ran.
+    """
+    from app.analyst import Signal, Verdict
+
+    v = Verdict(signal=Signal.buy, conviction=70, thesis="t", rationale=[], key_risks=[],
+                invalidation="x", horizon="2w", catalysts=[]).model_dump()
+    # 200 near-identical backfill rows, then 6 real buy calls slightly further away.
+    for i in range(200):
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=32 + i * 0.001, date=_day(i)), verdict={},
+                              origin="backfill")
+    for i in range(6):
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=34 + i * 0.1, date=_day(i)), verdict=v,
+                              origin="model")
+    _score_all(memory)
+
+    track = memory.similar_setups("AAPL", _summary(rsi=32))
+    assert track and "this_symbol" in track
+    assert "when_model_said_buy" in track["this_symbol"], \
+        "the model's own calls were crowded out by replayed setups"
+    assert track["this_symbol"]["when_model_said_buy"]["n"] == 6
+
+
+def test_rel_strength_disagreement_vetoes_a_match(memory):
+    """rel_strength is named in the docstring as the point of the exercise, yet its 0.8 weight
+    silently exempted it from the veto — so opposite relative strength still matched."""
+    def snap(rs):
+        return {**_summary(rsi=45.0), "rel_strength_3mo_vs_benchmark": rs}
+
+    for i in range(12):
+        memory.record_verdict(symbol="A", summary={**snap(0.28 + i * 0.005), "as_of_date": _day(i)}, verdict={},
+                              origin="backfill")
+    _score_all(memory, "A")
+    assert memory.similar_setups("A", snap(0.30)) is not None      # same regime matches
+    assert memory.similar_setups("A", snap(-0.30)) is None         # opposite must not
+
+
+def test_the_same_bar_is_recorded_once_per_origin(memory):
+    """A refresh=true verdict, or a manual /scan/run alongside the timer, used to insert ANOTHER row
+    for the identical bar — inflating `n` and double-weighting that bar in every median."""
+    from app.analyst import Signal, Verdict
+
+    v = Verdict(signal=Signal.buy, conviction=70, thesis="t", rationale=[], key_risks=[],
+                invalidation="x", horizon="2w", catalysts=[]).model_dump()
+    for _ in range(5):                                   # same bar, recorded five times
+        memory.record_verdict(symbol="AAPL", summary=_summary(date=_day(0)), verdict=v,
+                              origin="model")
+    assert memory.stats()["by_origin"]["model"] == 1
+
+    # a different origin for the same bar is a genuinely different observation
+    memory.record_verdict(symbol="AAPL", summary=_summary(date=_day(0)), verdict=v, origin="sandbox")
+    assert memory.stats()["by_origin"]["sandbox"] == 1
+    # and a different bar is its own row
+    memory.record_verdict(symbol="AAPL", summary=_summary(date=_day(1)), verdict=v, origin="model")
+    assert memory.stats()["by_origin"]["model"] == 2
+
+
+def test_the_newest_read_of_a_bar_wins(memory):
+    from app.analyst import Signal, Verdict
+
+    def dump(sig, conv):
+        return Verdict(signal=sig, conviction=conv, thesis="t", rationale=[], key_risks=[],
+                       invalidation="x", horizon="2w", catalysts=[]).model_dump()
+
+    memory.record_verdict(symbol="AAPL", summary=_summary(date=_day(0)), verdict=dump(Signal.hold, 40),
+                          origin="model")
+    memory.record_verdict(symbol="AAPL", summary=_summary(date=_day(0)), verdict=dump(Signal.buy, 80),
+                          origin="model")
+    import sqlite3
+    db = sqlite3.connect(memory._FILE)
+    row = db.execute("SELECT signal, conviction FROM verdicts").fetchall()
+    db.close()
+    assert row == [("buy", 80)], "a re-read of the same bar should supersede, not duplicate"
