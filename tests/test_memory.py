@@ -373,3 +373,63 @@ def test_the_newest_read_of_a_bar_wins(memory):
     row = db.execute("SELECT signal, conviction FROM verdicts").fetchall()
     db.close()
     assert row == [("buy", 80)], "a re-read of the same bar should supersede, not duplicate"
+
+
+def test_migration_succeeds_on_a_database_that_already_has_duplicates(memory, monkeypatch):
+    """The exact production failure: the unique index was created in _SCHEMA, which runs BEFORE the
+    dedupe, so opening a real database full of duplicate bars raised IntegrityError — and because
+    _db() had already published the half-built connection, every later call skipped the migration
+    silently and the index was never created at all.
+    """
+    import sqlite3
+
+    from app.analyst import Signal, Verdict
+
+    v = Verdict(signal=Signal.buy, conviction=70, thesis="t", rationale=[], key_risks=[],
+                invalidation="x", horizon="2w", catalysts=[]).model_dump()
+    memory.record_verdict(symbol="AAPL", summary=_summary(date=_day(0)), verdict=v, origin="model")
+
+    # Forge duplicates the way the old code could, bypassing the index.
+    db = sqlite3.connect(memory._FILE)
+    db.execute("DROP INDEX IF EXISTS ux_verdicts_bar")
+    for _ in range(4):
+        db.execute(
+            "INSERT INTO verdicts (symbol, ts, asof_date, signal, origin) VALUES (?,?,?,?,?)",
+            ("AAPL", 1.0, _day(0), "buy", "model"),
+        )
+    db.commit()
+    assert db.execute("SELECT COUNT(*) FROM verdicts").fetchone()[0] == 5
+    db.close()
+
+    memory._conn.close()
+    memory._conn = None          # reopen: schema + migration must both survive this
+
+    stats = memory.stats()
+    assert stats["by_origin"]["model"] == 1, "duplicates were not collapsed"
+
+    db = sqlite3.connect(memory._FILE)
+    names = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    db.close()
+    assert "ux_verdicts_bar" in names, "the unique index was never created"
+
+
+def test_a_failed_open_does_not_poison_later_calls(memory, monkeypatch):
+    """A half-initialised connection must never be published — it made one startup error look like
+    permanent health while silently skipping every migration."""
+    calls = {"n": 0}
+    real_migrate = memory._migrate
+
+    def flaky(db):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+        return real_migrate(db)
+
+    memory._conn = None
+    monkeypatch.setattr(memory, "_migrate", flaky)
+    with pytest.raises(RuntimeError):
+        memory._db()
+    assert memory._conn is None, "a failed open left a live connection behind"
+    # the next attempt must fully initialise
+    assert memory._db() is not None
+    assert calls["n"] == 2

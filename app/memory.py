@@ -102,11 +102,6 @@ CREATE TABLE IF NOT EXISTS verdicts (
     scored_at    REAL
 );
 CREATE INDEX IF NOT EXISTS ix_verdicts_symbol ON verdicts(symbol, ts DESC);
--- One row per bar per origin. Without this, a `refresh=true` verdict, a manual /scan/run alongside
--- the timer, or a repeated backfill each inserted ANOTHER row carrying the identical bar, which then
--- scored to a byte-identical forward return. `n` counted verdict PRODUCTIONS rather than decisions,
--- and repeated bars got extra weight in every median the analyst is told to trust.
-CREATE UNIQUE INDEX IF NOT EXISTS ux_verdicts_bar ON verdicts(symbol, asof_date, origin);
 CREATE INDEX IF NOT EXISTS ix_verdicts_unscored ON verdicts(scored_at) WHERE scored_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS notes (
@@ -137,19 +132,28 @@ def _db() -> sqlite3.Connection:
     global _conn
     if _conn is None:
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # Built LOCALLY and published only once initialisation fully succeeds. Assigning the global
+        # first meant a failure part-way through left a live but un-migrated connection in place —
+        # and since `_conn is None` was then false, every later call skipped schema and migration
+        # silently, forever. The failure surfaced once, at startup, and then looked healthy.
         # check_same_thread=False + the module-level lock: uvicorn runs handlers on a threadpool, and
         # serialising ourselves is simpler to reason about than one connection per thread.
-        _conn = sqlite3.connect(_FILE, check_same_thread=False, timeout=5.0)
-        _conn.row_factory = sqlite3.Row
-        _conn.execute("PRAGMA journal_mode=WAL")
-        _conn.execute("PRAGMA synchronous=NORMAL")
-        _conn.executescript(_SCHEMA)
-        _migrate(_conn)
-        _conn.commit()
+        conn = sqlite3.connect(_FILE, check_same_thread=False, timeout=5.0)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.executescript(_SCHEMA)
+            _migrate(conn)
+            conn.commit()
+        except Exception:
+            conn.close()
+            raise
         try:
             os.chmod(_FILE, 0o600)
         except OSError:
             pass
+        _conn = conn
     return _conn
 
 
@@ -164,6 +168,15 @@ def _migrate(db: sqlite3.Connection) -> None:
     db.execute(
         "DELETE FROM verdicts WHERE id NOT IN ("
         "  SELECT MAX(id) FROM verdicts GROUP BY symbol, asof_date, origin)"
+    )
+    # Created HERE, after the dedupe — never in _SCHEMA, which runs first and would fail against a
+    # database that still has duplicates (exactly what happened on the first deploy of this change).
+    # One row per bar per origin: without it a `refresh=true` verdict, a manual /scan/run alongside
+    # the timer, or a repeated backfill each inserted another row for the identical bar, so `n`
+    # counted verdict PRODUCTIONS rather than decisions and repeated bars skewed every median.
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_verdicts_bar "
+        "ON verdicts(symbol, asof_date, origin)"
     )
     # Repair rows written before signals were normalised: "Signal.buy" -> "buy". Left alone they are
     # invisible to every buy filter, so the scorecard would under-count real calls indefinitely.
