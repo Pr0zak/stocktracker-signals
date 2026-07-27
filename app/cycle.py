@@ -71,6 +71,12 @@ async def _weekly_max(client: httpx.AsyncClient, symbol: str) -> tuple[list[str]
     return dates, closes, vols
 
 
+# How far the located weekly bar may sit past the target date before the cycle is treated as simply
+# not covered by the series. Weekly bars are 7 days apart; a fortnight allows for a gap without
+# admitting a bar from an entirely different cycle.
+_ANALOG_TOLERANCE_DAYS = 14
+
+
 def _cycle_analog(dates: list[str], closes: list[float], cycle_pct: float | None) -> dict | None:
     """Median 12-month-forward return from this same position in each PRIOR completed cycle."""
     if cycle_pct is None or len(closes) < 200:
@@ -80,9 +86,17 @@ def _cycle_analog(dates: list[str], closes: list[float], cycle_pct: float | None
     for a, b in zip(HALVINGS, HALVINGS[1:]):
         span = (b - a).days
         target = date.fromordinal(a.toordinal() + int(span * cycle_pct / 100))
-        # nearest weekly bar at/after the target date
+        # Nearest weekly bar at/after the target date — but it has to actually BE near it. The
+        # series is hard-coded to 10 years (_weekly_max), so for the earliest halving pair the target
+        # predates every bar and this lookup used to return bar 0: the analog then reported the 12
+        # months from the START of the file as if it were the outcome of a cycle that ended before
+        # the file began. Measured on live BTC data that fabricated a 341.4% "best prior cycle" from
+        # a window ~1% into the FOLLOWING cycle. Weekly bars are 7 days apart, so anything further
+        # out than a fortnight means the target simply isn't covered.
         i = next((j for j, d in enumerate(dates) if d >= target.isoformat()), None)
         if i is None or i + 52 >= len(closes):
+            continue
+        if (date.fromisoformat(dates[i]) - target).days > _ANALOG_TOLERANCE_DAYS:
             continue
         fwd.append((closes[i + 52] - closes[i]) / closes[i] * 100)
     if not fwd:
@@ -108,9 +122,35 @@ def _zone(pct_from_wma: float) -> str:
     return "above"
 
 
-def _volume_signal(closes: list[float], volumes: list[float]) -> dict | None:
+def _completed_weeks(dates: list[str], *series: list[float]) -> tuple[list[float], ...]:
+    """Trim any trailing IN-PROGRESS week from parallel weekly series.
+
+    Yahoo's last weekly bar is always the current, unfinished week — and for equities it is a
+    "current price" stub only days old. Its volume is therefore a partial-week figure. Comparing it
+    against an average of complete weeks is not a like-for-like ratio: measured live, AAPL's trailing
+    bar carried 47M against a 14-week average of 248M, giving rvol 0.19. That made `rvol > 2.0`
+    (capitulation / breakout_volume) effectively unreachable and `rvol < 0.5` fire almost every week.
+    Prices are unaffected — the current price is legitimately the latest — so only volume-derived
+    statistics use this.
+    """
+    if not dates:
+        return series
+    today = date.today()
+    cut = len(dates)
+    while cut > 0 and (today - date.fromisoformat(dates[cut - 1])).days < 7:
+        cut -= 1
+    return tuple(s[:cut] for s in series)
+
+
+def _volume_signal(
+    closes: list[float], volumes: list[float], dates: list[str] | None = None,
+) -> dict | None:
     """mungbeans' weekly volume read: relative volume + an up/down-week accumulation ratio →
-    quiet_accumulation / capitulation / breakout_volume / distribution / accumulation / neutral."""
+    quiet_accumulation / capitulation / breakout_volume / distribution / accumulation / neutral.
+
+    Operates on COMPLETED weeks only (see `_completed_weeks`)."""
+    if dates:
+        closes, volumes = _completed_weeks(dates, closes, volumes)
     n = len(volumes)
     if n < 15 or len(closes) < 15:
         return None
@@ -145,6 +185,7 @@ def _volume_signal(closes: list[float], volumes: list[float]) -> dict | None:
 
 def long_term_trend(
     weekly: list[float], daily_closes: list[float], weekly_volumes: list[float] | None = None,
+    weekly_dates: list[str] | None = None,
 ) -> dict | None:
     """Multi-year trend block for ANY symbol (stocks + crypto), computed from max-range weekly bars.
 
@@ -198,7 +239,7 @@ def long_term_trend(
     if len(daily_closes) >= 200:  # Mayer Multiple from the daily series we already have
         lt["mayer_multiple"] = round(daily_closes[-1] / (sum(daily_closes[-200:]) / 200), 2)
     if weekly_volumes is not None:  # weekly accumulation/distribution read
-        vsig = _volume_signal(weekly, weekly_volumes)
+        vsig = _volume_signal(weekly, weekly_volumes, weekly_dates)
         if vsig:
             lt.update(vsig)
     return lt
@@ -329,7 +370,7 @@ async def crypto_context(client: httpx.AsyncClient, symbol: str, daily_closes: l
     out: dict = {}
     try:
         dates, weekly, weekly_vol = await _weekly_max(client, sym)
-        lt = long_term_trend(weekly, daily_closes, weekly_vol)
+        lt = long_term_trend(weekly, daily_closes, weekly_vol, dates)
         if lt:
             out["long_term_trend"] = lt
             if sym.startswith("BTC"):

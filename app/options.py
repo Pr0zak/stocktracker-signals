@@ -75,6 +75,10 @@ class OptionContract:
     bid: float | None = None
     ask: float | None = None
     last_price: float | None = None
+    # Epoch seconds of the last trade. Yahoo returns this on every contract but it used to be parsed
+    # away, which made the staleness of a last-trade-derived price UNKNOWABLE — and every economic
+    # figure in the wheel/covered-call suggestions is derived from that price when bid/ask are 0.
+    last_trade_epoch: int | None = None
     implied_volatility: float | None = None  # Yahoo's IV, as a decimal (0.43 == 43%)
     open_interest: int | None = None
     volume: int | None = None
@@ -214,6 +218,7 @@ def _parse_contract(raw: dict, kind: str) -> OptionContract:
         bid=_f(raw.get("bid")),
         ask=_f(raw.get("ask")),
         last_price=_f(raw.get("lastPrice")),
+        last_trade_epoch=_i(raw.get("lastTradeDate")),
         implied_volatility=_f(raw.get("impliedVolatility")),
         open_interest=_i(raw.get("openInterest")),
         volume=_i(raw.get("volume")),
@@ -487,11 +492,23 @@ def _iter_iv_rows():
             continue
 
 
-def append_iv_history(symbol: str, atm_iv: float | None, *, date_str: str | None = None) -> bool:
+# An ATM implied vol outside this band is a data error, not a market state: 5% is below any listed
+# equity option, 300% is above all but the most distressed single names.
+_IV_MIN_PLAUSIBLE = 0.05
+_IV_MAX_PLAUSIBLE = 3.0
+
+
+def append_iv_history(
+    symbol: str, atm_iv: float | None, *, date_str: str | None = None, dte: int | None = None,
+) -> bool:
     """Best-effort append of one ATM-IV point to data/iv_history.jsonl as {"symbol","date","atm_iv"}.
     One line per symbol per day (a same-day duplicate is skipped). Returns True if a line was written.
     NEVER raises — the nightly scan must not break on IV logging."""
-    if atm_iv is None or atm_iv <= 0:
+    # Plausibility bound. Any positive value was accepted, so Yahoo's placeholder IV for an
+    # unquoted contract (1e-5) or a garbage 900% reading both landed in the history — and because
+    # iv_rank is a min/max percentile, ONE such point permanently pins the scale and every later
+    # rank is measured against it. There is no eviction, so it never washes out.
+    if atm_iv is None or not (_IV_MIN_PLAUSIBLE <= float(atm_iv) <= _IV_MAX_PLAUSIBLE):
         return False
     sym = (symbol or "").upper()
     day = date_str or dt.date.today().isoformat()
@@ -501,10 +518,30 @@ def append_iv_history(symbol: str, atm_iv: float | None, *, date_str: str | None
                 return False
         IV_HISTORY.parent.mkdir(parents=True, exist_ok=True)
         with IV_HISTORY.open("a") as f:
-            f.write(json.dumps({"symbol": sym, "date": day, "atm_iv": round(float(atm_iv), 6)}) + "\n")
+            row = {"symbol": sym, "date": day, "atm_iv": round(float(atm_iv), 6)}
+            if dte is not None:
+                row["dte"] = int(dte)   # implied vol is only comparable at a comparable tenor
+            f.write(json.dumps(row) + "\n")
         return True
     except Exception:  # noqa: BLE001 — logging is best-effort
         return False
+
+
+def load_iv_history_dte(symbol: str, *, window: int = IV_HISTORY_WINDOW) -> int | None:
+    """Median DTE the stored history was measured at, or None when no row records one.
+
+    Implied vol is a term structure: a 37-day ATM IV and a 60-day ATM IV are different quantities.
+    Ranking one against a history of the other produced a percentile that could sit at the opposite
+    end of the scale from the truth, which then flipped the debit-spread-vs-long-call recommendation.
+    """
+    sym = (symbol or "").upper()
+    dtes = [int(r["dte"]) for r in _iter_iv_rows()
+            if r.get("symbol") == sym and isinstance(r.get("dte"), int)]
+    if not dtes:
+        return None
+    dtes = dtes[-window:]
+    dtes.sort()
+    return dtes[len(dtes) // 2]
 
 
 def load_iv_history(symbol: str, *, window: int = IV_HISTORY_WINDOW) -> list[float]:
@@ -518,11 +555,23 @@ def load_iv_history(symbol: str, *, window: int = IV_HISTORY_WINDOW) -> list[flo
     return vals[-window:]
 
 
-def iv_rank(values: list[float], current: float | None = None, *, min_points: int = IV_RANK_MIN_POINTS) -> float | None:
+# How far the live reading's tenor may differ from the history's before the rank is meaningless.
+IV_TENOR_TOLERANCE_DAYS = 12
+
+
+def iv_rank(
+    values: list[float], current: float | None = None, *, min_points: int = IV_RANK_MIN_POINTS,
+    current_dte: int | None = None, history_dte: int | None = None,
+) -> float | None:
     """IV rank = (current - min) / (max - min) * 100 over the historical `values` window, clamped to
     [0, 100]. `current` defaults to the most recent point in `values` (pass the live ATM IV to rank
     today against history). Returns None when there are fewer than `min_points` usable points (rank is
     "still building") or the window is flat (max == min)."""
+    # No rank at all beats a rank computed across mismatched tenors — the number looked authoritative
+    # and drove a recommendation. Only enforced when both tenors are known.
+    if (current_dte is not None and history_dte is not None
+            and abs(current_dte - history_dte) > IV_TENOR_TOLERANCE_DAYS):
+        return None
     vals = [v for v in values if v is not None and v > 0]
     if len(vals) < min_points:
         return None
@@ -664,13 +713,37 @@ def _mmddyy(ts: int) -> str:
     return time.strftime("%m/%d/%y", time.gmtime(int(ts)))
 
 
+# A last trade older than this makes every derived figure (limit, yield, break-even, premium income)
+# a quote of history rather than of the market. Three days spans a normal weekend.
+_STALE_TRADE_SECONDS = 3 * 24 * 3600
+
+
 def _limit_price(c: OptionContract) -> float | None:
     """The limit to quote: contract mid, falling back to last trade when bid/ask are stale/closed."""
+    return _limit_price_with_source(c)[0]
+
+
+def _limit_price_with_source(c: OptionContract) -> tuple[float | None, str | None]:
+    """Same as `_limit_price`, but also says WHERE the number came from: "mid" or "last".
+
+    The fallback to a last trade is deliberate (bid/ask are 0 outside regular hours), but it was
+    silent: a contract that last traded days ago produced a confident limit price, annualised yield
+    and break-even with nothing marking them as derived from a stale print.
+    """
     if c.mid is not None and c.mid > 0:
-        return c.mid
+        return c.mid, "mid"
     if c.last_price is not None and c.last_price > 0:
-        return c.last_price
-    return None
+        return c.last_price, "last"
+    return None, None
+
+
+def stale_trade_age_days(c: OptionContract, now: float) -> float | None:
+    """Age of the last trade in days, when the quote rests on it and it is older than a weekend."""
+    _, src = _limit_price_with_source(c)
+    if src != "last" or not c.last_trade_epoch:
+        return None
+    age = now - float(c.last_trade_epoch)
+    return round(age / 86_400.0, 1) if age > _STALE_TRADE_SECONDS else None
 
 
 # --- expiry selection ---
@@ -1143,12 +1216,21 @@ def select_wheel_expiry(
     return {"ts": chosen["ts"], "iso": chosen["iso"], "dte": chosen["dte_int"]}, warnings
 
 
-def _wheel_rationale(dte: int, low: int, high: int, *, earnings_in_window: bool) -> str:
+def _wheel_rationale(
+    dte: int, low: int, high: int, *, earnings_in_window: bool, earnings_known: bool = True,
+) -> str:
+    """`earnings_known=False` means we have no earnings date at all — the live config often has no
+    Finnhub key, so `earnings_date` is None on every request. Reporting that as "clear of the next
+    earnings date" turned a missing input into a positive assurance about the single risk this
+    strategy is most exposed to. Say nothing rather than say something untrue."""
     if dte < low or dte > high:
         return f"{dte} days out — no expiry landed in the {low}-{high} day window, so this is the closest usable one."
+    base = f"{dte} days out — short-dated, so time decay (theta) works in your favour as the seller"
+    if not earnings_known:
+        return f"{base}. Earnings date unknown — check it yourself before selling."
     if earnings_in_window:
         return f"{dte} days out (short-dated so theta works for the seller); note earnings falls before it."
-    return f"{dte} days out — short-dated, so time decay (theta) works in your favour as the seller, and clear of the next earnings date."
+    return f"{base}, and clear of the next earnings date."
 
 
 # --- cash-secured put suggester ---
@@ -1246,6 +1328,17 @@ def assemble_put_suggestion(
         if cand is None:  # unquotable (no mid, no last) — skip
             continue
         seen.add(pick.contract_symbol)
+        # Same exposure as the covered call: with bid/ask at 0 the whole candidate — limit price,
+        # premium, annualised yield, break-even, collateral — is derived from the last print, which
+        # may be over a week old. Say so on the candidate rather than leaving the numbers to imply
+        # they are current.
+        age = stale_trade_age_days(pick, now)
+        if age:
+            cand["stale_last_trade_days"] = age
+            warnings.append(
+                f"{profile} strike is priced off a last trade {age} days old — its premium and "
+                f"yields are historical, not current"
+            )
         candidates.append(cand)
 
     # Earnings-in-window: does a known earnings date fall between now and the chosen expiry?
@@ -1317,6 +1410,7 @@ def assemble_covered_call(
     chosen: dict,
     target: float | None = None,
     now: float | None = None,
+    earnings_date: str | None = None,
     extra_warnings: list[str] | None = None,
 ) -> dict | None:
     """Build the OC-8 `/covered_call/{symbol}` response body. Returns None when no call is quotable
@@ -1372,7 +1466,22 @@ def assemble_covered_call(
     # not emitted — this service has no ex-dividend DATE source, and the spec says skip rather than
     # fabricate one. Wire it in here if a dividend-calendar feed is added later.
 
-    rationale = _wheel_rationale(dte, CALL_DTE_LOW, CALL_DTE_HIGH, earnings_in_window=False)
+    # Was hardcoded False, so the covered-call rationale asserted "clear of the next earnings date"
+    # on every single response — including when earnings fell inside the window.
+    stale_days = stale_trade_age_days(pick, now)
+    if stale_days:
+        warnings.append(
+            f"priced off a last trade {stale_days} days old — no live bid/ask, so the limit, yield "
+            f"and premium income below are historical, not current"
+        )
+    cc_earn = _parse_iso_date(earnings_date)
+    cc_earn_in_window = bool(cc_earn and _utc_date(now) < cc_earn <= chosen["date"])
+    if cc_earn_in_window:
+        warnings.append(f"earnings on {cc_earn.isoformat()} falls before this expiry — assignment risk is elevated")
+    rationale = _wheel_rationale(
+        dte, CALL_DTE_LOW, CALL_DTE_HIGH,
+        earnings_in_window=cc_earn_in_window, earnings_known=cc_earn is not None,
+    )
     return {
         "symbol": symbol,
         "spot": round(spot, 4) if spot else None,

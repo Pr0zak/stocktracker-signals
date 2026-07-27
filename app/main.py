@@ -1504,7 +1504,10 @@ async def options_endpoint(
     #    assembler stays pure; a missing/short history yields a null rank (noted as "building").
     try:
         options.annotate_expiry(chain)
-        iv_rank = options.iv_rank(options.load_iv_history(chain.symbol), current=chain.expiry.atm_iv)
+        iv_rank = options.iv_rank(
+            options.load_iv_history(chain.symbol), current=chain.expiry.atm_iv,
+            current_dte=int(chosen["dte"]), history_dte=options.load_iv_history_dte(chain.symbol),
+        )
         body = options.assemble_suggestion(
             chain, chain.expiry, summary,
             chosen=chosen, style=style, budget=budget, earnings_date=earnings_date,
@@ -1755,7 +1758,7 @@ async def covered_call_endpoint(
         options.annotate_expiry(chain, now_ts=now)
         body = options.assemble_covered_call(
             chain, chain.expiry, shares=shares, chosen=chosen, target=target,
-            now=now, extra_warnings=warnings,
+            now=now, earnings_date=earnings_date, extra_warnings=warnings,
         )
     except Exception as e:  # noqa: BLE001
         _log.warning("covered_call assembly failed for %s: %s", chain.symbol, e)

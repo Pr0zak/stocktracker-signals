@@ -79,7 +79,7 @@ async def _log_atm_iv(client: httpx.AsyncClient, symbol: str) -> None:
         if chain.expiry is None:
             return
         options.annotate_expiry(chain)
-        options.append_iv_history(chain.symbol, chain.expiry.atm_iv)
+        options.append_iv_history(chain.symbol, chain.expiry.atm_iv, dte=int(chosen["dte"]))
     except Exception:  # noqa: BLE001 — IV logging is best-effort; never break the scan
         pass
 
