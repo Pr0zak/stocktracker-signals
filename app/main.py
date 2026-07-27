@@ -2348,7 +2348,10 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
 
         try:
             new_blob, filled, skipped = sandbox_job.validate_and_fill(
-                blob, orders, price_of, group_of=_exposure_group, source=source, exclude=exclude)
+                blob, orders, price_of, group_of=_exposure_group, source=source, exclude=exclude,
+                # An exit-date flatten is the user's scheduled instruction, not churn, so the
+                # anti-churn caps must not silently leave the account still invested on that date.
+                liquidation=(source == "exit_date"))
         except AssertionError as e:
             _log.error("sandbox tick ABORTED (cash not conserved): %s", e)
             raise HTTPException(status_code=500, detail=f"sandbox tick aborted (cash not conserved): {e}")
@@ -2370,10 +2373,22 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         # gets graded on exactly the same 20-day horizon as everything else. Recorded with the setup
         # that justified it, so "when this thing actually bought this pattern, did it beat the index?"
         # becomes answerable — separately from what it merely said.
-        by_symbol = {c["symbol"]: c for c in candidates}
+        # Held positions AND candidates. `candidate_syms` deliberately excludes anything already
+        # held, so keying only on candidates meant a SELL — which is by definition of a held name —
+        # never matched, and neither did an ADD to an existing position. The sandbox_sells scorecard
+        # could therefore never populate at all, and sandbox_buys silently covered only brand-new
+        # positions. `book["positions"]` carries the same technicals shape for held names.
+        by_symbol: dict[str, dict] = {}
+        for row in list(book.get("positions") or []) + list(candidates):
+            sym = (row.get("symbol") or "").upper()
+            if sym and row.get("technicals"):
+                by_symbol.setdefault(sym, row)
         today_str = sandbox_job.today_et_str(now)
         for r in filled:
-            cand = by_symbol.get(r.get("symbol"))
+            sym = (r.get("symbol") or "").upper()
+            # The book snapshot strips the "-USD" suffix for display, so a BTC-USD fill has to fall
+            # back to the bare ticker or crypto would silently never be recorded.
+            cand = by_symbol.get(sym) or by_symbol.get(sym.removesuffix("-USD"))
             if not cand or r.get("side") not in ("buy", "sell"):
                 continue
             summ = {"price": r.get("price"), "as_of_date": today_str, **(cand.get("technicals") or {})}
@@ -2383,6 +2398,18 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                          "thesis": r.get("reason")},
                 model=settings_store.get()["scan_model"], origin="sandbox",
             )
+        # A holding valued from a stale mark is a real caveat about the NAV point being written, so
+        # surface it instead of letting an approximation look like a measurement.
+        if source == "exit_date":
+            left = [p["symbol"] for p in new_blob["positions"] if float(p.get("shares") or 0) > 0]
+            if left:
+                # The posture says "flattening to cash" — say so plainly when it did not finish
+                # rather than letting the claim stand unqualified.
+                warnings.append(f"exit-date flatten incomplete — still holding {', '.join(left)}")
+                posture = f"Exit date reached — flattened what could be sold; still holding {', '.join(left)}."
+        stale = sandbox_job.stale_marks(new_blob["positions"], price_of)
+        if stale:
+            warnings.append(f"no fresh quote for {', '.join(stale)} — valued at last known mark")
         pv = sandbox_job.positions_value(new_blob["positions"], price_of)
         nav = sandbox_job.nav_row(new_blob, positions_val=pv, spy_price=spy_price)
         sandbox_store.append_nav(nav)

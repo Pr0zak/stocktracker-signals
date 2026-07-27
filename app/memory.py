@@ -568,7 +568,12 @@ def score_symbol(
                 i = idx.get(r["asof_date"])
                 if i is None:
                     continue
-                base = float(r["price"] or 0) or (float(closes[i]) if i < len(closes) else 0)
+                # Anchor on the SERIES' own bar, not the price stored at verdict time. Yahoo
+                # returns SPLIT- AND DIVIDEND-ADJUSTED closes, and the whole series is re-adjusted
+                # retroactively — so a stored raw price divided into a later adjusted close reports
+                # a fabricated return across any split or dividend (a 4:1 split alone shows as -75%).
+                # Both ends must come from the same adjusted series or the number is meaningless.
+                base = float(closes[i]) if i < len(closes) and closes[i] else float(r["price"] or 0)
                 if not base:
                     continue
                 f5 = _fwd(closes, i, 5, base)

@@ -67,12 +67,40 @@ def tick_gate(blob: dict, *, now: dt.datetime | None = None, force: bool = False
     return True, "ok"
 
 
-def positions_value(positions: list[dict], price_of: Callable[[str], float | None]) -> float:
-    """Mark-to-market value of the book; positions with no fresh price contribute their last mark of 0
-    (the caller flags unpriceable symbols separately and simply won't trade them)."""
-    total = 0.0
+def mark_price(p: dict, price_of: Callable[[str], float | None]) -> float | None:
+    """Best available mark for a position: fresh quote, else last known mark, else cost basis.
+
+    Marking an unpriceable holding at ZERO (the old behaviour) was wrong in two directions at once.
+    It wrote an invented drawdown into the append-only NAV log, which nothing can later correct; and
+    because the exposure-cap check used the same marks, the position's group looked EMPTY, so a
+    sibling ticker could buy straight through the cap — a price outage silently disabled a risk
+    limit. A stale mark is an approximation; zero is a fabrication.
+    """
+    px = price_of(p["symbol"])
+    if px and px > 0:
+        return float(px)
+    for key in ("last_price", "avg_cost"):
+        v = p.get(key)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    return None
+
+
+def stale_marks(positions: list[dict], price_of: Callable[[str], float | None]) -> list[str]:
+    """Symbols currently valued from a stale mark, so the caller can surface it rather than hide it."""
+    out: list[str] = []
     for p in positions:
         px = price_of(p["symbol"])
+        if not (px and px > 0) and float(p.get("shares") or 0) > 0:
+            out.append(p["symbol"])
+    return out
+
+
+def positions_value(positions: list[dict], price_of: Callable[[str], float | None]) -> float:
+    """Mark-to-market value of the book, falling back to the last known mark (see `mark_price`)."""
+    total = 0.0
+    for p in positions:
+        px = mark_price(p, price_of)
         if px:
             total += p["shares"] * px
     return round(total, 2)
@@ -114,10 +142,17 @@ def validate_and_fill(
     now_ts: float | None = None,
     source: str = "haiku_tick",
     exclude: set[str] | None = None,
+    liquidation: bool = False,
 ) -> tuple[dict, list[dict], list[dict]]:
     """Apply an analyst order list to the ledger under hard risk limits. Returns (new_blob, filled_rows,
     skipped_rows). Sells run before buys (free cash / cut exposure first). The blob is copied, not mutated
-    in place. Raises AssertionError on a cash-conservation violation — the caller must NOT persist then."""
+    in place. Raises AssertionError on a cash-conservation violation — the caller must NOT persist then.
+
+    `liquidation=True` lifts the anti-CHURN limits (per-tick trade count and the turnover cap) for an
+    exit-date flatten. Those caps exist to stop the strategy trading itself into the ground; a
+    liquidation the user scheduled is not churn, and throttling it left the account still holding most
+    of the book on the very date they asked to be out — while the response said "flattening to cash".
+    Every risk limit that protects the ACCOUNT (cash conservation, shares actually held) still applies."""
     now_ts = now_ts or time.time()
     b = {**blob, "positions": [dict(p) for p in blob.get("positions", [])]}
     s = {**b.get("settings", {})}
@@ -125,11 +160,18 @@ def validate_and_fill(
     cash = cash0
     positions = b["positions"]
 
+    # Stamp a fresh mark on every position we can price, so `mark_price`'s fallback is yesterday's
+    # close rather than a cost basis from months ago if a quote later goes missing.
+    for p in positions:
+        _px = price_of(p["symbol"])
+        if _px and _px > 0:
+            p["last_price"] = round(float(_px), 6)
+
     max_pos_pct = float(s.get("max_position_pct", 20.0))
     cash_floor_pct = float(s.get("cash_floor_pct", 10.0))
     slip = float(s.get("slippage_bps", 5)) / 10_000.0
     min_conv = int(s.get("min_conviction_to_trade", 55))
-    max_trades = int(s.get("max_trades_per_tick", 4))
+    max_trades = len(orders) + 1 if liquidation else int(s.get("max_trades_per_tick", 4))
     max_new = int(s.get("max_new_positions_per_tick", 2))
     allow_crypto = bool(s.get("allow_crypto", False))          # direct spot (BTC-USD)
     allow_crypto_etf = bool(s.get("allow_crypto_etf", True))   # spot-crypto ETFs (IBIT/FBTC/FETH)
@@ -146,7 +188,7 @@ def validate_and_fill(
     recent_loss_sales: dict[str, float] = {k.upper(): v for k, v in (blob.get("recent_loss_sales") or {}).items()}
     # Churn control: the max notional (buys+sells) allowed to change hands this tick, as a % of the
     # starting equity. 0 disables the cap. Computed off the pre-trade book so it's a stable budget.
-    turnover_pct = float(s.get("max_turnover_pct", 0.0) or 0.0)
+    turnover_pct = 0.0 if liquidation else float(s.get("max_turnover_pct", 0.0) or 0.0)
     start_equity = cash0 + positions_value(positions, price_of)
     turnover_budget = (turnover_pct / 100.0 * start_equity) if turnover_pct > 0 else float("inf")
     traded_notional = 0.0
@@ -219,9 +261,11 @@ def validate_and_fill(
     floor = cash_floor_pct / 100.0 * equity
     # T+1: in a cash account today's sale proceeds are UNSETTLED and can't fund today's buys.
     buying_power = cash - sell_notional if is_cash_account else cash
+    # Same marks as the equity figure above — if these two ever diverge, the cap is measured against
+    # a different book than the one it is capping.
     group_value: dict[str, float] = {}
     for p in positions:
-        px = price_of(p["symbol"])
+        px = mark_price(p, price_of)
         if px:
             g = group_of(p["symbol"])
             group_value[g] = group_value.get(g, 0.0) + p["shares"] * px
@@ -297,13 +341,25 @@ def validate_and_fill(
             new_positions += 1
         _fill(o, "buy", shares, fill, 0.0, cash, pos)
 
-    b["cash"] = round(cash, 2)
     # Keep the wash-sale clock on the ledger, pruned to the 30-day window it governs.
     b["recent_loss_sales"] = {k: v for k, v in recent_loss_sales.items() if now_ts - float(v) < 31 * 86_400}
+
     # Cash-conservation invariant (fail-closed): the caller aborts + does not persist on violation.
-    delta = round(cash, 2) - cash0
-    expected = round(sell_notional - buy_notional, 2)
-    assert abs(delta - expected) < 0.01, f"cash not conserved: Δcash={delta} vs {expected}"
+    #
+    # Checked on the RAW accumulators, not on two independently-rounded values. The previous form
+    # compared round(cash,2) - cash0 against round(sell_notional - buy_notional, 2); when the exact
+    # figure sat on a half-cent boundary those were both legal roundings of the SAME number that
+    # differ by exactly 0.01, and the strict `< 0.01` then aborted a perfectly correct tick.
+    # Slippage manufactures that third decimal and real quotes are round numbers, so the boundary is
+    # hit often — measured at 1.6% of ticks, each one a lost trading day, a hole in the equity curve,
+    # and once a month an orphaned deposit row already appended to the append-only log. `cash` and
+    # the notionals accumulate the same floats, so the true invariant is exact to float noise.
+    drift = abs(cash - (cash0 + sell_notional - buy_notional))
+    assert drift < 1e-6, (
+        f"cash not conserved: cash={cash!r} vs cash0+sells-buys="
+        f"{cash0 + sell_notional - buy_notional!r} (drift={drift!r})"
+    )
+    b["cash"] = round(cash, 2)
     return b, filled, skipped
 
 
