@@ -249,13 +249,16 @@ def validate_actions(portfolio: dict, actions: list[dict]) -> tuple[list[dict], 
     is worse than one.
     """
     held = _held(portfolio)
+    # Unpriced holdings live in `unpriced`, NOT in `positions` — so testing membership of `held`
+    # alone dropped them as "not a holding in this book", which is both wrong (they ARE held) and
+    # made the trim/add -> watch downgrade below unreachable.
     unpriced = {u["symbol"].upper() for u in (portfolio.get("unpriced") or [])}
     kept, warnings, seen = [], [], set()
     for a in actions:
         d = dict(a)
         sym = str(d.get("symbol", "")).upper()
         act = str(d.get("action", "")).lower()
-        if sym not in held:
+        if sym not in held and sym not in unpriced:
             warnings.append(f"dropped {sym or '(no symbol)'}: not a holding in this book")
             continue
         if act not in _REVIEW_ACTIONS:

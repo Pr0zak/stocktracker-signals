@@ -145,3 +145,28 @@ def test_an_absent_input_is_named_rather_than_scored_as_a_measured_zero():
     assert measured["value_score"] == absent["value_score"]      # arithmetic unchanged
     assert measured["unmeasured"] == []
     assert absent["unmeasured"] == ["drawdown_z", "rsi_14w", "direction"]
+
+
+def test_a_raw_fmt_wrapped_field_does_not_take_down_the_universe_build():
+    """Yahoo returns some numerics as {"raw":.., "fmt":..}. float() on that dict raises TypeError,
+    and the filter loop sits OUTSIDE _screen's try/except — so one such field killed the whole
+    build_universe gather rather than one screener."""
+    import app.screener as m
+
+    class R:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"finance": {"result": [{"quotes": [
+                {"symbol": "AAA", "quoteType": "EQUITY",
+                 "regularMarketPrice": {"raw": 50.0, "fmt": "50.00"},
+                 "marketCap": {"raw": 5e9, "fmt": "5B"}},
+                {"symbol": "BBB", "quoteType": "EQUITY",
+                 "regularMarketPrice": 1.0, "marketCap": 1e6},      # too small/cheap -> filtered
+            ]}]}}
+
+    class C:
+        async def get(self, *a, **k): return R()
+
+    got = asyncio.run(m._screen(C(), "undervalued_large_caps", 25))
+    assert got == ["AAA"], got

@@ -127,14 +127,25 @@ async def _screen(client: httpx.AsyncClient, scr: str, count: int) -> list[str]:
         quotes = (r.json().get("finance", {}).get("result") or [{}])[0].get("quotes") or []
     except Exception:  # noqa: BLE001 — one dead screener must not kill the whole screen
         return []
+    def _num(v) -> float:
+        # Yahoo returns some numeric fields as {"raw": 123, "fmt": "123"} depending on endpoint and
+        # host. float() on that dict raises TypeError — and this loop sits OUTSIDE the try/except
+        # above, so one such field took down the whole universe build rather than one screener.
+        if isinstance(v, dict):
+            v = v.get("raw")
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
     out = []
     for q in quotes:
+        if not isinstance(q, dict):
+            continue
         sym = (q.get("symbol") or "").upper()
-        price = q.get("regularMarketPrice") or 0.0
-        cap = q.get("marketCap") or 0.0
         if not sym or q.get("quoteType") not in ("EQUITY", "ETF"):
             continue
-        if float(price or 0) < _MIN_PRICE or float(cap or 0) < _MIN_CAP:
+        if _num(q.get("regularMarketPrice")) < _MIN_PRICE or _num(q.get("marketCap")) < _MIN_CAP:
             continue
         out.append(sym)
     return out

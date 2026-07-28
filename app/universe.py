@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -188,7 +189,9 @@ def load() -> dict | None:
 
 def save(blob: dict) -> None:
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = _FILE.with_suffix(".tmp")
+    # A single fixed temp path lets two concurrent builds (the nightly hook plus a manual POST)
+    # interleave their writes and publish a spliced file. Unique per writer.
+    tmp = _FILE.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(blob))
     os.replace(tmp, _FILE)      # atomic: a crash mid-write must not leave a half-file
 

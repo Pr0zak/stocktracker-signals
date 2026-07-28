@@ -1751,6 +1751,8 @@ async def option_quote(
         )
 
     _m = lambda v: round(v, 2) if v is not None else None  # noqa: E731 — money to 2dp, nullable
+    _mid_val = options.mid_price(match.bid, match.ask)
+    _limit_val, _limit_src = options._limit_price_with_source(match)
     return {
         "symbol": chain.symbol,
         "spot": _m(chain.spot),
@@ -1765,8 +1767,12 @@ async def option_quote(
             "bid": _m(match.bid),
             "ask": _m(match.ask),
             "last_price": _m(match.last_price),
-            "mid": _m(options.mid_price(match.bid, match.ask)),
-            "limit_price": _m(options._limit_price(match)),  # re-price: mid, else last trade
+            # limit_price MUST equal mid when the quote rests on the mid. They were computed by two
+            # different routes — mid fresh from bid/ask, limit_price via match.mid which is already
+            # _round(.., 4) — so the second was DOUBLE-rounded and the two could render a cent apart
+            # on the same row of an options ticket. Derive both from one value.
+            "mid": _m(_mid_val),
+            "limit_price": _m(_mid_val) if _limit_src == "mid" else _m(_limit_val),
             "implied_volatility": round(match.implied_volatility, 4) if match.implied_volatility is not None else None,
             "delta": match.delta,   # already 4dp from annotate_expiry
             "theta": match.theta,   # already 4dp from annotate_expiry

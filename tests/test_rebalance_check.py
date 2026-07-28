@@ -241,3 +241,22 @@ def test_unpriced_holdings_belong_in_the_weight_denominator():
 def test_a_fully_priced_book_is_not_marked_approximate():
     kept, derived, warns = validate_plan(book(), [], cash=0.0, max_position_pct=60.0)
     assert derived.get("weights_approximate") is False
+
+
+def test_an_action_on_an_unpriced_holding_is_downgraded_not_dropped():
+    """Unpriced holdings live in `unpriced`, not `positions`, so membership of `held` alone dropped
+    them as "not a holding in this book" — wrong (they ARE held) and it made the trim/add -> watch
+    downgrade below it unreachable."""
+    pf = {"positions": [{"symbol": "AAPL", "shares": 10, "price": 100.0, "value": 1000.0}],
+          "unpriced": [{"symbol": "NVDA", "shares": 5, "value_at_cost": 600.0}]}
+    kept, warns = validate_actions(pf, [{"symbol": "NVDA", "action": "trim", "reason": "heavy"}])
+    assert [k["symbol"] for k in kept] == ["NVDA"]
+    assert kept[0]["action"] == "watch", "no price means no setup to trim on"
+    assert any("downgraded" in w for w in warns)
+    assert not any("not a holding" in w for w in warns)
+
+
+def test_a_symbol_that_really_is_absent_is_still_dropped():
+    pf = {"positions": [{"symbol": "AAPL", "shares": 10, "price": 100.0, "value": 1000.0}]}
+    kept, warns = validate_actions(pf, [{"symbol": "TSLA", "action": "add", "reason": "x"}])
+    assert kept == [] and any("not a holding" in w for w in warns)

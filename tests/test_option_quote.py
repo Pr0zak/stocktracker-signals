@@ -233,6 +233,38 @@ def test_live_option_quote_aapl():
             assert 0.0 <= c["delta"] <= 1.0
         for money in ("bid", "ask", "last_price", "mid", "limit_price"):
             assert c[money] is None or c[money] >= 0.0
-        # limit_price is the re-price: mid when both-sided, else last trade — one of them when quoted.
+        # limit_price is the re-price: mid when both-sided, else last trade — one of them when
+        # quoted. Both come from THIS response, so they must agree exactly; the old
+        # `approx(abs=0.01)` masked a real double-rounding bug (see the offline test below) while
+        # still failing intermittently in live trading when the cent boundary moved. Exact, or the
+        # assertion is measuring neither thing.
         if c["mid"] is not None:
-            assert c["limit_price"] == pytest.approx(c["mid"], abs=0.01)
+            assert c["limit_price"] == c["mid"]
+
+
+def test_mid_and_limit_price_can_never_disagree_on_the_same_row(monkeypatch):
+    """They were computed by two different routes and could render a cent apart.
+
+    `mid` came fresh from bid/ask rounded once to 2dp; `limit_price` came via match.mid, which
+    annotate_expiry has ALREADY rounded to 4dp — so it was double-rounded. Sampled across 200,000
+    prices the two routes disagreed on 10,000 of them (5%). On an options ticket that is one row
+    showing "mid 2.24 / limit 2.23", and limit_price is the number the user types into a broker.
+
+    Caught by a LIVE test failing intermittently, not by the review.
+    """
+    now = time.time()
+    # Bid/ask chosen so the mid lands just past a half-cent boundary, where the two routes diverged.
+    chain = _synthetic_chain(now)
+    for c in chain.expiry.calls + chain.expiry.puts:
+        c.bid, c.ask = 2.2300000001, 2.2400000001      # mid = 2.2350000001
+    _patch_fetch(monkeypatch, chain)
+
+    with TestClient(app) as client:
+        exp = chain.expiry.expiration
+        r = client.get("/option_quote/AAPL",
+                       params={"expiry_ts": exp, "strike": 100.0, "type": "call"})
+        assert r.status_code == 200, r.text
+        c = r.json()["contract"]
+        assert c["mid"] is not None
+        assert c["limit_price"] == c["mid"], (
+            f"same row contradicts itself: mid {c['mid']} vs limit {c['limit_price']}")
