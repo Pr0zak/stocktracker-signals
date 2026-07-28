@@ -126,3 +126,45 @@ def test_the_scan_rebuilds_a_stale_universe_and_survives_a_failure(monkeypatch, 
     except RuntimeError:
         pass  # the hook catches this; proving it raises is the point
     assert hasattr(scan_job, "run_scan")
+
+
+def test_a_partial_fetch_is_marked_incomplete_rather_than_passing_as_a_universe(monkeypatch):
+    """_profile_batch returns {} when every host fails for that batch.
+
+    A rate limit midway silently shrank the universe, which was then SAVED and stamped fresh for a
+    week — the value screen serving a subsample as if it were the whole market.
+    """
+    import asyncio
+
+    async def fake_directory(client):
+        return [{"symbol": f"S{i}", "name": f"Co {i}", "is_etf": False} for i in range(200)]
+
+    calls = {"n": 0}
+
+    async def flaky_batch(client, syms):
+        calls["n"] += 1
+        if calls["n"] % 2 == 0:          # half the batches die
+            return {}
+        return {s: {"cap": 5e9, "price": 50.0, "type": "EQUITY"} for s in syms}
+
+    monkeypatch.setattr(u, "fetch_directory", fake_directory)
+    monkeypatch.setattr(u, "_profile_batch", flaky_batch)
+    blob = asyncio.run(u.build(None))
+    assert blob["complete"] is False
+    assert blob["batch_coverage"] < u.MIN_COVERAGE
+    assert blob["empty_batches"] > 0
+
+
+def test_a_clean_fetch_is_marked_complete(monkeypatch):
+    import asyncio
+
+    async def fake_directory(client):
+        return [{"symbol": f"S{i}", "name": f"Co {i}", "is_etf": False} for i in range(120)]
+
+    async def ok_batch(client, syms):
+        return {s: {"cap": 5e9, "price": 50.0, "type": "EQUITY"} for s in syms}
+
+    monkeypatch.setattr(u, "fetch_directory", fake_directory)
+    monkeypatch.setattr(u, "_profile_batch", ok_batch)
+    blob = asyncio.run(u.build(None))
+    assert blob["complete"] is True and blob["batch_coverage"] == 1.0

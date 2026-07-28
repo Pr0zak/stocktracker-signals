@@ -122,3 +122,26 @@ def test_a_reliable_share_count_still_counts():
     assert any("dilution" in x for x in a["red"])
     b = assess(None, quality(shares_change_pct=-5.0, shares_change_reliable=True), None)
     assert any("buybacks" in x for x in b["green"])
+
+
+def test_confidence_requires_BREADTH_of_evidence_not_just_weight():
+    """The ratio tests are multiplicative, so with zero red evidence both are trivially satisfied.
+
+    A name with four of six inputs unseen and no negatives came back "discount, high confidence" —
+    exactly what this module's docstring promises it will never do.
+    """
+    thin = assess(None, {"roe": 25.0, "high_roe": True, "wide_moat": True, "buffett_quality": True,
+                         "dividend_aristocrat": True, "debt_to_equity": 0.3, "low_debt": True}, None)
+    assert thin["confidence"] != "high", thin
+    assert thin["assessable"] is False, "one observed category is not a basis for a verdict"
+    assert thin["evidence_categories_seen"] == 1
+
+    broad = assess(
+        {"direction": "recovering"},
+        {"roe": 25.0, "high_roe": True, "wide_moat": True, "debt_to_equity": 0.3, "low_debt": True,
+         "fcf_trend": "rising", "fcf_positive_years": 5, "fcf_years": 5,
+         "shares_change_pct": -2.0, "shares_change_reliable": True},
+        {"buy_count_12m": 3, "has_conviction_buy": True},
+    )
+    assert broad["verdict"] == "discount" and broad["confidence"] == "high"
+    assert broad["evidence_categories_seen"] == 5

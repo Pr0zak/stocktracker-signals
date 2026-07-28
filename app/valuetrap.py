@@ -37,6 +37,11 @@ def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> di
     green: list[str] = []
     missing: list[str] = []
     r = g = 0.0
+    # How many of the five evidence CATEGORIES were actually observed. Weight alone is not enough:
+    # the ratio tests below are multiplicative, so with r == 0 they are trivially satisfied and a
+    # name with four of six inputs unseen came back "discount, high confidence" — precisely what
+    # this module's docstring promises it will never do.
+    seen = 0
 
     # ---- cash generation: the single most direct read on whether the business still works
     if quality and quality.get("fcf_trend"):
@@ -54,6 +59,7 @@ def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> di
                 r += 1.0
             else:
                 green.append(f"Free cash flow positive in all {yrs} reported years"); g += 1.0
+        seen += 1
     else:
         missing.append("free cash flow")
 
@@ -66,6 +72,7 @@ def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> di
         missing.append("share count (looks like a stock split)")
         sc = None
     if isinstance(sc, (int, float)):
+        seen += 1
         if sc > _DILUTION_PCT:
             red.append(f"Share count up {sc:.1f}% — dilution"); r += 1.5
         elif sc < _BUYBACK_PCT:
@@ -75,6 +82,9 @@ def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> di
 
     # ---- balance sheet and returns
     if quality:
+        if any(isinstance(quality.get(k), (int, float))
+               for k in ("debt_to_equity", "roe", "net_margin")):
+            seen += 1
         de = quality.get("debt_to_equity")
         if isinstance(de, (int, float)):
             # RATIO, not percent. low_debt is <0.5; treating this as a percentage was a real bug here.
@@ -103,6 +113,7 @@ def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> di
 
     # ---- insider behaviour: the people with the most information voting with their own money
     if insider:
+        seen += 1
         if insider.get("has_conviction_buy"):
             green.append("An insider made a large conviction buy"); g += 1.5
         if insider.get("has_cluster_buy"):
@@ -114,6 +125,7 @@ def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> di
 
     # ---- price behaviour: still falling is not the same as bottoming
     if trend and trend.get("direction"):
+        seen += 1
         d = trend["direction"]
         if d == "deepening":
             red.append("Still falling away from its 200-week line"); r += 1.0
@@ -124,13 +136,18 @@ def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> di
 
     # An "unclear" from genuine balance is a different statement from "we could not see enough", so
     # the caller gets `assessable` rather than having to infer it from an empty-ish verdict.
-    assessable = bool(quality) and (r + g) >= 3.0
+    # BREADTH is load-bearing, not just weight. Three of five categories minimum before any verdict,
+    # and "high" needs four — otherwise one strong signal in an otherwise-blind read is presented
+    # with the same confidence as a genuinely well-evidenced one.
+    assessable = bool(quality) and seen >= 3 and (r + g) >= 3.0
     if not assessable:
         verdict, confidence = "unclear", "low"
     elif r >= g * 1.5:
-        verdict, confidence = _RED, ("high" if r >= g * 2.5 else "medium")
+        verdict = _RED
+        confidence = "high" if (r >= g * 2.5 and seen >= 4) else "medium"
     elif g >= r * 1.5:
-        verdict, confidence = _GREEN, ("high" if g >= r * 2.5 else "medium")
+        verdict = _GREEN
+        confidence = "high" if (g >= r * 2.5 and seen >= 4) else "medium"
     else:
         verdict, confidence = "unclear", "medium"
 
@@ -143,6 +160,7 @@ def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> di
         # Always present, never inferred from silence: what we could not see.
         "missing": missing,
         "weights": {"deterioration": round(r, 1), "discount": round(g, 1)},
+        "evidence_categories_seen": seen,
         "note": ("Whether a name that is cheap versus its own trend still has an intact business. "
                  "Evidence, not a recommendation — and an 'unclear' with a non-empty `missing` "
                  "means the data was unavailable, not that the business looks fine."),

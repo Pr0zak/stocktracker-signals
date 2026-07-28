@@ -1299,6 +1299,14 @@ async def universe_build_endpoint() -> dict:
         raise HTTPException(status_code=502, detail=f"universe build failed: {e}")
     if not blob.get("symbols"):
         raise HTTPException(status_code=502, detail="universe build produced no symbols")
+    # A partial fetch must not overwrite a good universe and then be stamped fresh for a week.
+    if not blob.get("complete"):
+        prev = universe.load()
+        if prev and prev.get("symbols"):
+            raise HTTPException(
+                status_code=502,
+                detail=(f"build covered only {blob.get('batch_coverage')} of quote batches "
+                        f"({blob.get('empty_batches')} failed) — keeping the previous universe"))
     universe.save(blob)
     return {k: v for k, v in blob.items() if k != "detail"}
 
@@ -1364,17 +1372,19 @@ async def value_screener(limit: int = 20, below_line_only: bool = True,
         ctx = await cycle.crypto_context(client, series.symbol, series.closes)
         return ctx.get("long_term_trend")
 
-    ranked, skipped = await screener.screen(
+    ranked, too_short, failed = await screener.screen(
         _http, trend_of, syms, limit=limit, below_line_only=below_line_only)
     payload = {
         "as_of": now,
         "universe_size": len(syms),
         "universe_source": universe_source,
         "universe_stale": bool(cur and universe.is_stale(cur)),
-        "scored": len(syms) - len(skipped),
-        # Named, not silently dropped: a name absent from the ranking because it could not be scored
-        # is different from one that scored badly, and the caller cannot tell them apart otherwise.
-        "skipped": skipped,
+        "scored": len(syms) - len(too_short) - len(failed),
+        # Named, not silently dropped — and split by CAUSE. "Too short" is a fact about the company;
+        # "failed" is a fact about our fetch, and telling the user the first when the second happened
+        # is a confident statement about the wrong thing.
+        "skipped": too_short,
+        "fetch_failed": failed,
         "below_line_only": below_line_only,
         "results": ranked,
         "note": ("How dislocated a name is below its own 200-week trend — context, not a buy signal. "

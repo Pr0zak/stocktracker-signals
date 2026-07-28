@@ -135,8 +135,13 @@ async def build_universe(client: httpx.AsyncClient, *, extra: list[str] | None =
 
 
 async def screen(client: httpx.AsyncClient, trend_of, symbols: list[str], *,
-                 limit: int = 20, below_line_only: bool = True) -> tuple[list[dict], list[str]]:
-    """Score `symbols` concurrently. Returns (ranked rows, symbols that could not be scored).
+                 limit: int = 20, below_line_only: bool = True) -> tuple[list[dict], list[str], list[str]]:
+    """Score `symbols` concurrently. Returns (ranked rows, too_short, failed).
+
+    `too_short` and `failed` are SEPARATE because they are different facts: the first means the name
+    genuinely lacks ~4 years of weekly history, the second means we could not fetch it (a rate limit,
+    a timeout). Collapsing them told the user "not enough history to score AAPL" during a Yahoo rate
+    limit — a confident statement about the company that was really a statement about our network.
 
     `trend_of(client, symbol) -> dict | None` is injected so this is testable without network and so
     the caller owns caching.
@@ -148,13 +153,14 @@ async def screen(client: httpx.AsyncClient, trend_of, symbols: list[str], *,
             try:
                 t = await trend_of(client, sym)
             except Exception:  # noqa: BLE001 — a single bad symbol must not sink the screen
-                return sym, None
+                return sym, None, "failed"
             scored = value_score(t)
             if scored is None:
-                return sym, None
-            return sym, {"symbol": sym, **scored}
+                return sym, None, "too_short"
+            return sym, {"symbol": sym, **scored}, None
 
     results = await asyncio.gather(*[one(s) for s in symbols])
-    rows = [r for _, r in results if r]
-    skipped = [s for s, r in results if r is None]
-    return rank(rows, limit=limit, below_line_only=below_line_only), skipped
+    rows = [r for _, r, _ in results if r]
+    too_short = [s for s, r, why in results if r is None and why == "too_short"]
+    failed = [s for s, r, why in results if r is None and why == "failed"]
+    return rank(rows, limit=limit, below_line_only=below_line_only), too_short, failed

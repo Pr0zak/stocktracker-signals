@@ -37,6 +37,9 @@ DEFAULT_MIN_CAP = 2_000_000_000.0
 DEFAULT_MIN_PRICE = 5.0
 DEFAULT_LIMIT = 600   # top N by market cap — bounded so a full screen stays tractable
 STALE_AFTER_S = 7 * 24 * 3600
+# Below this share of successful quote batches the build is a subsample, not a universe, and must not
+# overwrite a good one — a partial fetch stamped fresh for a week is worse than a slightly old build.
+MIN_COVERAGE = 0.90
 
 
 def parse_directory(text: str) -> list[dict]:
@@ -124,6 +127,13 @@ async def build(client: httpx.AsyncClient, *, min_cap: float = DEFAULT_MIN_CAP,
     batches = [syms[i:i + _BATCH] for i in range(0, len(syms), _BATCH)]
     results = await asyncio.gather(*[one(b) for b in batches])
 
+    # _profile_batch returns {} when every host failed for that batch, so a rate limit or an outage
+    # midway silently shrinks the universe — which then gets SAVED and stamped fresh for a week, and
+    # the value screen serves the subsample as if it were the whole market. Measure coverage and
+    # refuse to publish a build that is materially incomplete.
+    empty_batches = sum(1 for got in results if not got)
+    coverage = 1.0 - (empty_batches / len(batches)) if batches else 0.0
+
     rows: list[dict] = []
     for got in results:
         for sym, p in got.items():
@@ -140,6 +150,9 @@ async def build(client: httpx.AsyncClient, *, min_cap: float = DEFAULT_MIN_CAP,
     rows.sort(key=lambda r: -r["market_cap"])
     return {
         "built_at": time.time(),
+        "batch_coverage": round(coverage, 3),
+        "empty_batches": empty_batches,
+        "complete": coverage >= MIN_COVERAGE,
         "source": "nasdaqtrader.com symbol directory + Yahoo quote market caps",
         "directory_rows": len(directory),
         "passed_filter": len(rows),

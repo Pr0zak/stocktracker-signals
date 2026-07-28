@@ -102,15 +102,34 @@ def test_one_bad_symbol_does_not_sink_the_screen():
             raise RuntimeError("upstream died")
         return trend(pct=-20.0, z=-1.0, rsi=25.0, direction="recovering")
 
-    ranked, skipped = asyncio.run(sc.screen(None, trend_of, ["OK1", "BOOM", "OK2"], limit=10))
+    ranked, too_short, failed = asyncio.run(sc.screen(None, trend_of, ["OK1", "BOOM", "OK2"], limit=10))
     assert {r["symbol"] for r in ranked} == {"OK1", "OK2"}
-    assert skipped == ["BOOM"]
+    assert failed == ["BOOM"] and too_short == []
 
 
 def test_symbols_without_enough_history_are_reported_not_silently_dropped():
     async def trend_of(client, sym):
         return trend(years=1.0) if sym == "NEW" else trend(pct=-15.0)
 
-    ranked, skipped = asyncio.run(sc.screen(None, trend_of, ["NEW", "OLD"], limit=10))
+    ranked, too_short, failed = asyncio.run(sc.screen(None, trend_of, ["NEW", "OLD"], limit=10))
     assert [r["symbol"] for r in ranked] == ["OLD"]
-    assert skipped == ["NEW"], "a symbol we could not score must be named, not vanish"
+    assert too_short == ["NEW"], "a symbol we could not score must be named, not vanish"
+    assert failed == []
+
+
+def test_a_fetch_failure_is_never_reported_as_insufficient_history():
+    """Different facts. "Too short" is about the company; a rate limit is about our network, and
+    telling the user the first when the second happened is a confident claim about the wrong thing.
+    """
+    async def trend_of(client, sym):
+        if sym == "RATELIMITED":
+            raise RuntimeError("429 Too Many Requests")
+        if sym == "NEWLISTING":
+            return {"history_years": 1.0}          # genuinely lacks the 200-week window
+        return {"price_vs_200w_sma_pct": -20.0, "below_line": True}
+
+    ranked, too_short, failed = asyncio.run(
+        sc.screen(None, trend_of, ["OK", "RATELIMITED", "NEWLISTING"], limit=5))
+    assert too_short == ["NEWLISTING"]
+    assert failed == ["RATELIMITED"]
+    assert [r["symbol"] for r in ranked] == ["OK"]
