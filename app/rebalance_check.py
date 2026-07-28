@@ -208,7 +208,14 @@ def _derive(portfolio: dict, moves: list[dict], *, cash: float) -> dict:
         return {"cash_after": round(cash_after, 2), "resulting_top_weight_pct": None,
                 "weights_computable": False}
 
-    total = sum(values.values()) + max(cash_after, 0.0)
+    # Holdings carried at cost live in `unpriced`, NOT in `positions`, so they were missing from the
+    # denominator entirely — which INFLATES every remaining weight (a true 50% position reported as
+    # 100%), producing a false "does not fully rebalance" warning off a book that is half invisible.
+    # They are real money and belong in the total; they are not attributed to any group because an
+    # unpriced row carries no exposure_group to attribute it to.
+    unpriced_value = sum(
+        float(u.get("value_at_cost") or 0.0) for u in (portfolio.get("unpriced") or []))
+    total = sum(values.values()) + unpriced_value + max(cash_after, 0.0)
     if not values or total <= 0:
         return {"cash_after": round(cash_after, 2), "resulting_top_weight_pct": None,
                 "weights_computable": True}
@@ -225,6 +232,8 @@ def _derive(portfolio: dict, moves: list[dict], *, cash: float) -> dict:
     return {"cash_after": round(cash_after, 2),
             "resulting_top_weight_pct": round(100.0 * top_group[1] / total, 1),
             "resulting_top_exposure": top_group[0],
+            # An unpriced leg is in the denominator at cost, so the percentage is an estimate.
+            "weights_approximate": unpriced_value > 0,
             "weights_computable": True}
 
 

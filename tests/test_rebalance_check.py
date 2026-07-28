@@ -221,3 +221,23 @@ def test_the_models_casing_cannot_skip_every_check(sell_act, buy_act):
     # And a $5,000 buy on $0 cash + $600 proceeds must be trimmed or dropped, not waved through.
     buys = [m for m in kept if m["action"] == "buy"]
     assert sum(float(m["dollars"]) for m in buys) <= 600.0 + 1e-6, buys
+
+
+def test_unpriced_holdings_belong_in_the_weight_denominator():
+    """They live in `unpriced`, not `positions`, so they were missing from the total entirely.
+
+    That INFLATES every remaining weight — a true 50% position was reported as 100% — and fires a
+    false "does not fully rebalance" warning off a book that is half invisible.
+    """
+    pf = {"positions": [{"symbol": "AAPL", "shares": 10, "price": 100.0, "value": 1000.0,
+                         "exposure_group": "AAPL"}],
+          "unpriced": [{"symbol": "VXUS", "shares": 10, "value_at_cost": 1000.0}]}
+    moves = [{"symbol": "AAPL", "action": "hold", "shares": 0, "dollars": 0, "reason": "x"}]
+    kept, derived, warns = validate_plan(pf, moves, cash=0.0, max_position_pct=25.0)
+    assert derived["resulting_top_weight_pct"] == 50.0, derived
+    assert derived["weights_approximate"] is True
+
+
+def test_a_fully_priced_book_is_not_marked_approximate():
+    kept, derived, warns = validate_plan(book(), [], cash=0.0, max_position_pct=60.0)
+    assert derived.get("weights_approximate") is False
