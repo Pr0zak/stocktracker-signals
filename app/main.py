@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import gaps, market_calendar, memory, rebalance_check, sandbox_job, sandbox_store
+from . import gaps, market_calendar, memory, rebalance_check, sandbox_job, sandbox_store, screener
 from .analyst import (
     analyze,
     daily_brief,
@@ -1285,6 +1285,60 @@ async def trend(symbol: str) -> dict:
     if not lt or "sma_200w" not in lt:
         raise HTTPException(status_code=404, detail="not enough weekly history for a 200-week trend")
     return {"symbol": series.symbol, "close": round(series.closes[-1], 4), **lt}
+
+
+@app.get("/screener/value")
+async def value_screener(limit: int = 20, below_line_only: bool = True,
+                         include_watchlist: bool = True, refresh: bool = False) -> dict:
+    """MB-15/MB-18 — rank a value-tilted universe by how far below its own 200-week trend each name
+    sits. Free: NO LLM, one weekly-bars call per symbol, price-based only.
+
+    CONTEXT, NOT A BUY SIGNAL. The touch study on this codebase found below-the-line dips
+    UNDERPERFORMED the S&P on 12/24-month forward horizons, so this answers "what is unusually
+    dislocated", not "what should I buy". The score is deliberately separate from the 0-100 momentum
+    score; do not add them together.
+    """
+    assert _http is not None
+    cfg = settings_store.get()
+    limit = max(1, min(50, limit))
+    key = ("value_screen", limit, below_line_only, include_watchlist)
+    now = time.time()
+    hit = _cache.get(key)
+    # Weekly bars change weekly; a long TTL is correct here and keeps the fan-out cheap.
+    if hit and not refresh and now - hit[0] < max(cfg["verdict_ttl_seconds"], 3600):
+        return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
+
+    extra = sorted(settings_store.get().get("watchlist") or []) if include_watchlist else []
+    try:
+        universe = await screener.build_universe(_http, extra=extra)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"universe build failed: {e}")
+    if not universe:
+        raise HTTPException(status_code=502, detail="no candidates could be screened")
+
+    async def trend_of(client, sym: str):
+        series = await fetch_series(client, sym)
+        ctx = await cycle.crypto_context(client, series.symbol, series.closes)
+        return ctx.get("long_term_trend")
+
+    ranked, skipped = await screener.screen(
+        _http, trend_of, universe, limit=limit, below_line_only=below_line_only)
+    payload = {
+        "as_of": now,
+        "universe_size": len(universe),
+        "scored": len(universe) - len(skipped),
+        # Named, not silently dropped: a name absent from the ranking because it could not be scored
+        # is different from one that scored badly, and the caller cannot tell them apart otherwise.
+        "skipped": skipped,
+        "below_line_only": below_line_only,
+        "results": ranked,
+        "note": ("How dislocated a name is below its own 200-week trend — context, not a buy signal. "
+                 "The historical touch study on this codebase found below-the-line dips "
+                 "underperformed the S&P over the following 12-24 months."),
+        "cached": False,
+    }
+    _cache[key] = (now, payload)
+    return payload
 
 
 @app.get("/touches/{symbol}")
