@@ -59,15 +59,29 @@ def value_score(trend: dict | None) -> dict | None:
     # BELOW their trend, and a name 30% above should not earn partial credit for being "less above".
     dislocation = _clip01(-pct / 50.0)
 
+    # An ABSENT input still has to contribute 0 to the arithmetic — there is nothing else to add —
+    # but it must not be REPORTED as a measured 0. A name with no RSI produced a components block
+    # byte-identical to one measured at exactly RSI 50, so the card could not tell "neutral" from
+    # "unknown". Track which inputs were actually present and say so.
+    unmeasured: list[str] = []
+
     z = trend.get("drawdown_z")
     # -2 sigma or worse = 1.0. Positive z (shallower drawdown than usual) = 0.
-    drawdown = _clip01(-float(z) / 2.0) if isinstance(z, (int, float)) else 0.0
+    if isinstance(z, (int, float)):
+        drawdown = _clip01(-float(z) / 2.0)
+    else:
+        drawdown, _ = 0.0, unmeasured.append("drawdown_z")
 
     rsi = trend.get("rsi_14w")
     # 1.0 at RSI 20, 0 at RSI 50.
-    oversold = _clip01((50.0 - float(rsi)) / 30.0) if isinstance(rsi, (int, float)) else 0.0
+    if isinstance(rsi, (int, float)):
+        oversold = _clip01((50.0 - float(rsi)) / 30.0)
+    else:
+        oversold, _ = 0.0, unmeasured.append("rsi_14w")
 
     direction = trend.get("direction")
+    if not direction:
+        unmeasured.append("direction")
     # mungbeans' key nuance: still-falling ("deepening") is a knife, not a discount. Recovering earns
     # the full weight, deepening earns nothing — the difference between the two is the whole point.
     recovering = 1.0 if direction == "recovering" else 0.0
@@ -77,6 +91,9 @@ def value_score(trend: dict | None) -> dict | None:
 
     return {
         "value_score": round(100.0 * score, 1),
+        # Inputs that were not available. Each contributed 0 to the score because it had to, but the
+        # consumer needs to know the score was computed on a partial picture.
+        "unmeasured": unmeasured,
         "components": {
             "dislocation": round(dislocation, 3),
             "drawdown_z": round(drawdown, 3),

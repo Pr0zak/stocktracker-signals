@@ -1342,7 +1342,13 @@ async def value_screener(limit: int = 20, below_line_only: bool = True,
     assert _http is not None
     cfg = settings_store.get()
     limit = max(1, min(50, limit))
-    key = ("value_screen", limit, below_line_only, include_watchlist)
+    # The key must capture EVERY input that changes the answer. It held only the flags, so adding a
+    # watchlist name or rebuilding the universe served the previous ranking as current. The universe
+    # is identified by its build timestamp — cheap, and it changes exactly when the pool does.
+    _u = universe.load()
+    key = ("value_screen", limit, below_line_only, include_watchlist,
+           tuple(sorted(settings_store.get().get("watchlist") or [])) if include_watchlist else (),
+           (_u or {}).get("built_at"))
     now = time.time()
     hit = _cache.get(key)
     # Weekly bars change weekly; a long TTL is correct here and keeps the fan-out cheap.
@@ -1353,7 +1359,7 @@ async def value_screener(limit: int = 20, below_line_only: bool = True,
     # Prefer the CURATED universe (MB-19). The live Yahoo screens are rebuilt server-side on every
     # call, so two runs minutes apart returned different names off a ~58-wide pool — a sampler, not
     # a screen. Fall back to them only when the curated list has not been built yet.
-    cur = universe.load()
+    cur = _u
     universe_source = "curated"
     if cur and cur.get("symbols"):
         pool = list(cur["symbols"])[:max(limit * 10, 150)]

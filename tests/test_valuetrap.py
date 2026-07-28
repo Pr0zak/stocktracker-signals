@@ -145,3 +145,32 @@ def test_confidence_requires_BREADTH_of_evidence_not_just_weight():
     )
     assert broad["verdict"] == "discount" and broad["confidence"] == "high"
     assert broad["evidence_categories_seen"] == 5
+
+
+def test_a_dead_quality_feed_reports_the_metrics_it_could_not_read():
+    """ROE and net margin were read inside `if quality:` without ever recording their absence, so a
+    partial quality feed under-reported what could not be checked."""
+    a = assess({"direction": "recovering"},
+               {"fcf_trend": "rising", "fcf_positive_years": 5, "fcf_years": 5,
+                "shares_change_pct": -2.0, "shares_change_reliable": True, "shares_years": 5,
+                "debt_to_equity": 0.3, "low_debt": True},
+               {"buy_count_12m": 1})
+    assert "return on equity" in a["missing"]
+    assert "net margin" in a["missing"]
+
+
+def test_the_dilution_threshold_is_per_year_not_per_window():
+    """_DILUTION_PCT is documented "y/y" but shares_change_pct spans `shares_years` reports, so
+    2.5% over five years — half a percent a year — was flagged as dilution."""
+    trivial = assess(None, {"shares_change_pct": 2.5, "shares_change_reliable": True,
+                            "shares_years": 5}, None)
+    assert not any("dilution" in x for x in trivial["red"]), trivial["red"]
+
+    real = assess(None, {"shares_change_pct": 15.0, "shares_change_reliable": True,
+                         "shares_years": 5}, None)
+    assert any("dilution" in x for x in real["red"])
+
+    # A single-year window must still behave as before.
+    one_year = assess(None, {"shares_change_pct": 2.5, "shares_change_reliable": True,
+                             "shares_years": 1}, None)
+    assert any("dilution" in x for x in one_year["red"])

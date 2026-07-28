@@ -133,3 +133,15 @@ def test_a_fetch_failure_is_never_reported_as_insufficient_history():
     assert too_short == ["NEWLISTING"]
     assert failed == ["RATELIMITED"]
     assert [r["symbol"] for r in ranked] == ["OK"]
+
+
+def test_an_absent_input_is_named_rather_than_scored_as_a_measured_zero():
+    """A name with no RSI produced a components block byte-identical to one measured at exactly
+    RSI 50 — the card could not tell "neutral" from "unknown". The contribution still has to be 0
+    (there is nothing else to add), but the output has to say the input was not there."""
+    measured = sc.value_score({"price_vs_200w_sma_pct": -20.0, "below_line": True,
+                               "drawdown_z": 0.0, "rsi_14w": 50.0, "direction": "deepening"})
+    absent = sc.value_score({"price_vs_200w_sma_pct": -20.0, "below_line": True})
+    assert measured["value_score"] == absent["value_score"]      # arithmetic unchanged
+    assert measured["unmeasured"] == []
+    assert absent["unmeasured"] == ["drawdown_z", "rsi_14w", "direction"]

@@ -34,10 +34,20 @@ def test_test_issues_and_untraded_rows_are_dropped():
     assert [r["symbol"] for r in out] == ["REAL"]
 
 
-@pytest.mark.parametrize("sym", ["ABC$P", "BRK.A", "TOOLONGX", ""])
+@pytest.mark.parametrize("sym", ["ABC$P", "GME.WS", "XYZ.U", "ABC.R", "TOOLONGX", ""])
 def test_warrants_units_preferreds_and_junk_are_dropped(sym):
     # These have their own price behaviour and no meaningful 200-week trend of the common.
     assert u.parse_directory(doc(row(sym))) == []
+
+
+@pytest.mark.parametrize("sym", ["BRK.A", "BRK.B", "BF.B"])
+def test_dual_class_common_shares_are_KEPT(sym):
+    """A "." is a CLASS separator, not a junk marker.
+
+    Dropping every dotted symbol removed Berkshire Hathaway — the largest name it excluded — and
+    every other dual-class common from the universe, which was never the intent.
+    """
+    assert [r["symbol"] for r in u.parse_directory(doc(row(sym)))] == [sym]
 
 
 def test_the_footer_line_does_not_become_a_symbol():

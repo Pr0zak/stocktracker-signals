@@ -23,8 +23,8 @@ _RED = "deteriorating"
 _GREEN = "discount"
 
 _HIGH_DEBT = 2.0        # debt/equity RATIO (not percent — a units mistake made here before)
-_DILUTION_PCT = 2.0     # share count up >2% y/y
-_BUYBACK_PCT = -1.0     # share count down >1% y/y
+_DILUTION_PCT = 2.0     # share count up >2% PER YEAR (input is annualised first)
+_BUYBACK_PCT = -1.0     # share count down >1% PER YEAR (input is annualised first)
 
 
 def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> dict:
@@ -73,10 +73,18 @@ def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> di
         sc = None
     if isinstance(sc, (int, float)):
         seen += 1
-        if sc > _DILUTION_PCT:
-            red.append(f"Share count up {sc:.1f}% — dilution"); r += 1.5
-        elif sc < _BUYBACK_PCT:
-            green.append(f"Share count down {abs(sc):.1f}% — buybacks"); g += 1.5
+        # The thresholds are PER YEAR but shares_change_pct spans the whole reported window
+        # (fundamentals computes latest/earliest across `shares_years`). Comparing them directly
+        # called 2.5% over five years — half a percent a year, i.e. nothing — "dilution". Annualise
+        # so the threshold means what its comment says.
+        yrs = quality.get("shares_years")
+        yrs = float(yrs) if isinstance(yrs, (int, float)) and yrs and yrs > 0 else 1.0
+        annual = sc / yrs
+        span = f" over {yrs:.0f}y" if yrs > 1 else ""
+        if annual > _DILUTION_PCT:
+            red.append(f"Share count up {sc:.1f}%{span} — dilution"); r += 1.5
+        elif annual < _BUYBACK_PCT:
+            green.append(f"Share count down {abs(sc):.1f}%{span} — buybacks"); g += 1.5
     elif not (quality and quality.get("shares_change_reliable") is False):
         missing.append("share count")
 
@@ -94,6 +102,10 @@ def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> di
                 green.append("Low debt"); g += 1.0
         else:
             missing.append("debt/equity")
+        if not isinstance(quality.get("roe"), (int, float)):
+            missing.append("return on equity")
+        if not isinstance(quality.get("net_margin"), (int, float)):
+            missing.append("net margin")
         roe = quality.get("roe")
         if isinstance(roe, (int, float)):     # PERCENT
             if roe < 0:

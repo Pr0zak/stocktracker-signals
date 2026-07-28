@@ -69,7 +69,16 @@ def parse_directory(text: str) -> list[dict]:
         sym = parts[i_sym].strip().upper()
         if parts[i_traded].strip() != "Y" or parts[i_test].strip() == "Y":
             continue
-        if not sym or "$" in sym or "." in sym or len(sym) > 5:
+        # Structural exclusions. "$" marks preferreds/when-issued in this feed. A "." is a CLASS
+        # separator (BRK.B, BF.A) — dropping every dotted symbol removed Berkshire Hathaway and
+        # every other dual-class common from the universe, which was never the intent; only the
+        # single-letter suffixes that denote warrants/units/rights are excluded.
+        if not sym or "$" in sym:
+            continue
+        base, _, cls = sym.partition(".")
+        if cls and cls not in ("A", "B", "C"):      # W=warrant, U=unit, R=right, WS=when-issued
+            continue
+        if len(base) > 5:
             continue
         rows.append({
             "symbol": sym,
