@@ -1948,6 +1948,7 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
 class PortfolioReviewRequest(BaseModel):
     cash: float = 0.0
     deep: bool = False
+    refresh: bool = False         # bypass the cache — what the Refresh control must actually do
     holdings: list[Holding] = []  # transient — reviewed, never persisted
 
 
@@ -1964,8 +1965,10 @@ async def portfolio_review_endpoint(req: PortfolioReviewRequest) -> dict:
            tuple(sorted((h.symbol.upper(), round(h.shares, 6), round(h.avg_cost, 4)) for h in req.holdings)))
     now = time.time()
     hit = _cache.get(key)
-    if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
-        return {**hit[1], "cached": True}
+    if hit and not req.refresh and now - hit[0] < cfg["verdict_ttl_seconds"]:
+        # Say WHEN, not just that it is cached: these carry concrete share counts priced at the
+        # moment of the original call, and a plan up to the full TTL old read as current.
+        return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
 
     portfolio = await _build_portfolio_snapshot(req.holdings, req.cash)
     try:
@@ -1995,6 +1998,7 @@ async def portfolio_review_endpoint(req: PortfolioReviewRequest) -> dict:
 class RebalanceRequest(BaseModel):
     cash: float = 0.0
     deep: bool = False
+    refresh: bool = False           # bypass the cache — what the Refresh control must actually do
     max_position_pct: float = 25.0  # target largest single-position weight after rebalancing
     holdings: list[Holding] = []    # transient — never persisted
 
@@ -2013,8 +2017,10 @@ async def portfolio_rebalance_endpoint(req: RebalanceRequest) -> dict:
            tuple(sorted((h.symbol.upper(), round(h.shares, 6), round(h.avg_cost, 4)) for h in req.holdings)))
     now = time.time()
     hit = _cache.get(key)
-    if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
-        return {**hit[1], "cached": True}
+    if hit and not req.refresh and now - hit[0] < cfg["verdict_ttl_seconds"]:
+        # Say WHEN, not just that it is cached: these carry concrete share counts priced at the
+        # moment of the original call, and a plan up to the full TTL old read as current.
+        return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
 
     portfolio = await _build_portfolio_snapshot(req.holdings, req.cash)
     try:
