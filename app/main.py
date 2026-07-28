@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import gaps, market_calendar, memory, sandbox_job, sandbox_store
+from . import gaps, market_calendar, memory, rebalance_check, sandbox_job, sandbox_store
 from .analyst import (
     analyze,
     daily_brief,
@@ -2003,8 +2003,19 @@ async def portfolio_rebalance_endpoint(req: RebalanceRequest) -> dict:
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
     usage_store.record(usage, symbol="", kind="rebalance")
+    # The plan is a PROPOSAL; the priced snapshot is authoritative. Nothing used to check that a sell
+    # was of shares actually held, that the buys were affordable, that `dollars` agreed with
+    # shares x price, or that the moves produced the resulting book the plan claimed — and the user
+    # types these straight into a broker. Anything unexecutable is dropped or capped and named.
+    plan_d = plan.model_dump()
+    kept, derived, plan_warnings = rebalance_check.validate_plan(
+        portfolio, plan_d.get("moves") or [], cash=req.cash, max_position_pct=mpp)
+    plan_d["moves"] = kept
+    plan_d["resulting_top_weight_pct"] = derived["resulting_top_weight_pct"]
+    plan_d["cash_after"] = derived["cash_after"]
     payload = {
-        "plan": plan.model_dump(),
+        "plan": plan_d,
+        "plan_warnings": plan_warnings,
         "portfolio": portfolio,
         "max_position_pct": mpp,
         "model": usage["model"],
