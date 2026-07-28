@@ -140,3 +140,36 @@ def test_selling_one_wrapper_reduces_the_whole_exposure():
     # after: FBTC 1000 (BTC), AAPL 1000, cash 1000 -> BTC 33.3%
     assert derived["resulting_top_weight_pct"] == pytest.approx(33.3, abs=0.1)
     assert not any("does not fully rebalance" in w for w in warns)
+
+
+# ---------------------------------------------------------------- review actions
+
+from app.rebalance_check import validate_actions   # noqa: E402
+
+
+def test_review_actions_naming_symbols_the_user_does_not_hold_are_dropped():
+    acts = [{"symbol": "AAPL", "action": "trim", "reason": "heavy"},
+            {"symbol": "TSLA", "action": "add", "reason": "nice setup"}]
+    kept, warns = validate_actions(book(), acts)
+    assert [a["symbol"] for a in kept] == ["AAPL"]
+    assert any("not a holding" in w for w in warns)
+
+
+def test_an_invented_action_string_is_dropped():
+    kept, warns = validate_actions(book(), [{"symbol": "AAPL", "action": "YOLO", "reason": "x"}])
+    assert kept == [] and any("unknown action" in w for w in warns)
+
+
+def test_an_unpriced_holding_cannot_be_trimmed_or_added():
+    # No price means no setup to judge; only hold/watch is honest.
+    pf = {**book(), "unpriced": [{"symbol": "NVDA", "shares": 5.0, "value_at_cost": 600.0}]}
+    kept, warns = validate_actions(pf, [{"symbol": "NVDA", "action": "trim", "reason": "heavy"}])
+    assert kept[0]["action"] == "watch"
+    assert any("downgraded" in w for w in warns)
+
+
+def test_one_action_per_holding():
+    acts = [{"symbol": "AAPL", "action": "trim", "reason": "a"},
+            {"symbol": "AAPL", "action": "add", "reason": "b"}]
+    kept, warns = validate_actions(book(), acts)
+    assert len(kept) == 1 and any("second action" in w for w in warns)

@@ -1973,8 +1973,15 @@ async def portfolio_review_endpoint(req: PortfolioReviewRequest) -> dict:
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
     usage_store.record(usage, symbol="", kind="portfolio")
+    # Same rule as the rebalance path: the book is authoritative, the model is a proposal. An action
+    # naming a symbol the user does not hold, or an action string outside trim/hold/add/watch,
+    # rendered as a per-holding instruction with nothing checking it.
+    review_d = review.model_dump()
+    review_d["actions"], review_warnings = rebalance_check.validate_actions(
+        portfolio, review_d.get("actions") or [])
     payload = {
-        "review": review.model_dump(),
+        "review": review_d,
+        "review_warnings": review_warnings,
         "portfolio": portfolio,
         "model": usage["model"],
         "as_of": now,

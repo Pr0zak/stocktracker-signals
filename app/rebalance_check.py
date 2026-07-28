@@ -206,3 +206,40 @@ def _derive(portfolio: dict, moves: list[dict], *, cash: float) -> dict:
             "resulting_top_weight_pct": round(100.0 * top_group[1] / total, 1),
             "resulting_top_exposure": top_group[0],
             "weights_computable": True}
+
+
+_REVIEW_ACTIONS = ("trim", "hold", "add", "watch")
+
+
+def validate_actions(portfolio: dict, actions: list[dict]) -> tuple[list[dict], list[str]]:
+    """Reconcile /portfolio/review's per-holding action list against the book it was built from.
+
+    Nothing checked these either: the model could name a symbol the user does not hold, or invent an
+    action string outside trim/hold/add/watch, and it rendered as a per-holding instruction. Also
+    drops a second action for a symbol that already has one — two contradictory rows for one position
+    is worse than one.
+    """
+    held = _held(portfolio)
+    unpriced = {u["symbol"].upper() for u in (portfolio.get("unpriced") or [])}
+    kept, warnings, seen = [], [], set()
+    for a in actions:
+        d = dict(a)
+        sym = str(d.get("symbol", "")).upper()
+        act = str(d.get("action", "")).lower()
+        if sym not in held:
+            warnings.append(f"dropped {sym or '(no symbol)'}: not a holding in this book")
+            continue
+        if act not in _REVIEW_ACTIONS:
+            warnings.append(f"dropped {sym}: unknown action {d.get('action')!r}")
+            continue
+        if sym in seen:
+            warnings.append(f"dropped a second action for {sym}")
+            continue
+        # A holding with no live price has no setup to judge; only "hold"/"watch" are honest for it.
+        if sym in unpriced and act in ("trim", "add"):
+            warnings.append(f"{sym}: downgraded {act} to watch — it could not be priced")
+            d["action"] = "watch"
+        seen.add(sym)
+        d["action"] = str(d["action"]).lower()
+        kept.append(d)
+    return kept, warnings
