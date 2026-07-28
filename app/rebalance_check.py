@@ -189,6 +189,20 @@ def _derive(portfolio: dict, moves: list[dict], *, cash: float) -> dict:
                 "weights_computable": False}
 
     total = sum(values.values()) + max(cash_after, 0.0)
-    top = round(100.0 * max(values.values()) / total, 1) if values and total > 0 else None
-    return {"cash_after": round(cash_after, 2), "resulting_top_weight_pct": top,
+    if not values or total <= 0:
+        return {"cash_after": round(cash_after, 2), "resulting_top_weight_pct": None,
+                "weights_computable": True}
+
+    # The cap is per EXPOSURE, so the top weight must be the top GROUP, not the top position. Two
+    # vehicles of one underlying (IBIT + FBTC) each show ~33% while the real exposure is ~67%, and
+    # judging per-position reports a 25% target as met at nearly 3x it.
+    held = _held(portfolio)
+    group_value: dict[str, float] = {}
+    for sym, v in values.items():
+        g = str((held.get(sym) or {}).get("exposure_group") or sym).upper()
+        group_value[g] = group_value.get(g, 0.0) + v
+    top_group = max(group_value.items(), key=lambda kv: kv[1])
+    return {"cash_after": round(cash_after, 2),
+            "resulting_top_weight_pct": round(100.0 * top_group[1] / total, 1),
+            "resulting_top_exposure": top_group[0],
             "weights_computable": True}

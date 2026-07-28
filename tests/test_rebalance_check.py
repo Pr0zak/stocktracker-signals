@@ -114,3 +114,29 @@ def test_a_plan_that_misses_its_own_target_says_so():
     kept, derived, warns = validate_plan(book(), moves, cash=0.0, max_position_pct=25.0)
     assert derived["resulting_top_weight_pct"] == 50.0
     assert any("does not fully rebalance" in w for w in warns)
+
+
+def _btc_book():
+    # One exposure, two wrappers: each row looks like 33%, the real BTC exposure is 67%.
+    return {"positions": [
+        {"symbol": "IBIT", "shares": 10.0, "price": 100.0, "value": 1000.0, "exposure_group": "BTC"},
+        {"symbol": "FBTC", "shares": 10.0, "price": 100.0, "value": 1000.0, "exposure_group": "BTC"},
+        {"symbol": "AAPL", "shares": 10.0, "price": 100.0, "value": 1000.0, "exposure_group": "AAPL"},
+    ]}
+
+
+def test_the_cap_is_judged_on_combined_exposure_not_per_position():
+    moves = [{"symbol": "AAPL", "action": "hold", "shares": 0.0, "dollars": 0.0, "reason": "keep"}]
+    kept, derived, warns = validate_plan(_btc_book(), moves, cash=0.0, max_position_pct=25.0)
+    # Per position the top is 33.3%; per exposure it is 66.7% — nearly 3x the cap.
+    assert derived["resulting_top_weight_pct"] == pytest.approx(66.7, abs=0.1)
+    assert derived["resulting_top_exposure"] == "BTC"
+    assert any("does not fully rebalance" in w for w in warns)
+
+
+def test_selling_one_wrapper_reduces_the_whole_exposure():
+    moves = [{"symbol": "IBIT", "action": "sell", "shares": 10.0, "dollars": 1000.0, "reason": "trim"}]
+    kept, derived, warns = validate_plan(_btc_book(), moves, cash=0.0, max_position_pct=40.0)
+    # after: FBTC 1000 (BTC), AAPL 1000, cash 1000 -> BTC 33.3%
+    assert derived["resulting_top_weight_pct"] == pytest.approx(33.3, abs=0.1)
+    assert not any("does not fully rebalance" in w for w in warns)

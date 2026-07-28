@@ -665,7 +665,7 @@ Return a structured review:
 - health: ONE sentence on the book's overall posture (diversified vs concentrated, momentum tilt, cash level).
 - concentration: flag genuine risks — any single exposure over ~20-25% of the book (SUM the weights of an \
 exposure_group before judging — e.g. BTC + FBTC together), several holdings that are clearly the same \
-theme/sector, or a very low cash buffer. If `equivalent_exposures` is non-empty, flag that the user holds \
+theme/sector, or a very low cash buffer. `exposure_weights` gives the COMBINED weight of each exposure group, already summed for you — judge concentration and any per-position cap against THOSE numbers, not the per-position weight_pct, because two vehicles of one underlying (IBIT+FBTC) show as two small rows while the real exposure is their sum. If `equivalent_exposures` is non-empty, flag that the user holds \
 redundant vehicles for the same thing and suggest consolidating into the cheaper/more-liquid one. Empty \
 list if it's reasonably balanced. Be specific ("BTC exposure is 40% of the book across BTC + FBTC").
 - actions: EXACTLY ONE entry per holding, action ∈ trim | hold | add | watch, with a one-sentence reason \

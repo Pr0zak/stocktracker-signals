@@ -1913,6 +1913,17 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
     for r in rows:
         _by_group.setdefault(r["exposure_group"], []).append(r["symbol"])
     equivalent = {g: syms for g, syms in _by_group.items() if len(syms) > 1}
+    # The cap is defined per EXPOSURE, but every weight above is per POSITION. Holding IBIT + FBTC
+    # shows two 33.3% rows while the real BTC exposure is 66.6% — so a 25% cap reads as satisfied at
+    # nearly 3x. equivalent_exposures named the pair but gave no combined number, and the prompt
+    # asked the model to sum it mentally. Compute it here instead; arithmetic is not the model's job.
+    group_value: dict[str, float] = {}
+    for r in rows:
+        group_value[r["exposure_group"]] = group_value.get(r["exposure_group"], 0.0) + r["value"]
+    exposure_weights = ({} if unvalued else
+                        {g: round(100.0 * v / total_value, 1)
+                         for g, v in sorted(group_value.items(), key=lambda kv: -kv[1])}
+                        if total_value else {})
     out = {
         "cash": round(cash, 2),
         "cash_pct": (None if unvalued else
@@ -1920,6 +1931,7 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
         "total_value": round(total_value, 2),
         "positions": sorted(rows, key=lambda r: r["value"], reverse=True),
         "equivalent_exposures": equivalent,
+        "exposure_weights": exposure_weights,
     }
     if unpriced:
         out["unpriced"] = [{"symbol": r["symbol"], "shares": r["shares"],
