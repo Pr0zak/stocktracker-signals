@@ -1,0 +1,86 @@
+"""MB-19 — the curated universe.
+
+Parsing is the part that decides what a screen can ever see, so it is tested against the real file's
+shape: pipe-delimited, a header row, a trailing footer, and columns whose meaning is positional.
+"""
+import time
+
+import pytest
+
+from app import universe as u
+
+HEADER = ("Nasdaq Traded|Symbol|Security Name|Listing Exchange|Market Category|ETF|"
+          "Round Lot Size|Test Issue|Financial Status|CQS Symbol|NASDAQ Symbol|NextShares")
+
+
+def row(sym, name="Some Co Common Stock", traded="Y", etf="N", test="N"):
+    return f"{traded}|{sym}|{name}|N| |{etf}|100|{test}||{sym}|{sym}|N"
+
+
+def doc(*rows):
+    return "\n".join([HEADER, *rows, "File Creation Time: 0728202612:00|||||||||||"])
+
+
+def test_ordinary_common_stock_is_kept_with_its_flags():
+    out = u.parse_directory(doc(row("AAPL", "Apple Inc. Common Stock"),
+                                row("SPY", "SPDR S&P 500 ETF Trust", etf="Y")))
+    assert [r["symbol"] for r in out] == ["AAPL", "SPY"]
+    assert out[0]["is_etf"] is False and out[1]["is_etf"] is True
+    assert out[0]["name"] == "Apple Inc. Common Stock"
+
+
+def test_test_issues_and_untraded_rows_are_dropped():
+    out = u.parse_directory(doc(row("ZVZZT", test="Y"), row("DEAD", traded="N"), row("REAL")))
+    assert [r["symbol"] for r in out] == ["REAL"]
+
+
+@pytest.mark.parametrize("sym", ["ABC$P", "BRK.A", "TOOLONGX", ""])
+def test_warrants_units_preferreds_and_junk_are_dropped(sym):
+    # These have their own price behaviour and no meaningful 200-week trend of the common.
+    assert u.parse_directory(doc(row(sym))) == []
+
+
+def test_the_footer_line_does_not_become_a_symbol():
+    out = u.parse_directory(doc(row("AAPL")))
+    assert [r["symbol"] for r in out] == ["AAPL"]
+
+
+def test_an_empty_or_headerless_document_yields_nothing_rather_than_crashing():
+    assert u.parse_directory("") == []
+    assert u.parse_directory("not a directory at all") == []
+
+
+def test_columns_are_located_by_NAME_not_by_position():
+    # Positional parsing silently mis-reads if Nasdaq ever inserts a column. Reorder and re-check.
+    header = ("Symbol|Nasdaq Traded|ETF|Test Issue|Security Name|Listing Exchange|"
+              "Market Category|Round Lot Size|Financial Status|CQS Symbol|NASDAQ Symbol|NextShares")
+    line = "AAPL|Y|N|N|Apple Inc. Common Stock|Q| |100||AAPL|AAPL|N"
+    out = u.parse_directory("\n".join([header, line]))
+    assert out == [{"symbol": "AAPL", "name": "Apple Inc. Common Stock", "is_etf": False}]
+
+
+# ---------------------------------------------------------------- persistence / staleness
+
+def test_a_never_built_universe_is_stale():
+    assert u.is_stale(None) is True
+    assert u.is_stale({}) is True
+
+
+def test_freshness_is_measured_from_the_build_time():
+    now = 1_800_000_000.0
+    assert u.is_stale({"built_at": now - 3600}, now=now) is False
+    assert u.is_stale({"built_at": now - (8 * 24 * 3600)}, now=now) is True
+
+
+def test_save_and_load_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setattr(u, "_DATA_DIR", tmp_path)
+    monkeypatch.setattr(u, "_FILE", tmp_path / "universe.json")
+    blob = {"built_at": time.time(), "symbols": ["AAPL", "MSFT"], "detail": []}
+    u.save(blob)
+    assert u.load()["symbols"] == ["AAPL", "MSFT"]
+
+
+def test_a_corrupt_file_reads_as_not_built_rather_than_raising(tmp_path, monkeypatch):
+    monkeypatch.setattr(u, "_FILE", tmp_path / "universe.json")
+    (tmp_path / "universe.json").write_text("{ not json")
+    assert u.load() is None

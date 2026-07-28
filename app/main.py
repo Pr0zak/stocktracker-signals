@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import gaps, market_calendar, memory, rebalance_check, sandbox_job, sandbox_store, screener, valuetrap
+from . import gaps, market_calendar, memory, rebalance_check, sandbox_job, sandbox_store, screener, universe, valuetrap
 from .analyst import (
     analyze,
     daily_brief,
@@ -1287,6 +1287,39 @@ async def trend(symbol: str) -> dict:
     return {"symbol": series.symbol, "close": round(series.closes[-1], 4), **lt}
 
 
+@app.post("/universe/build")
+async def universe_build_endpoint() -> dict:
+    """MB-19 — (re)build the curated ticker universe from the Nasdaq Trader symbol directory plus
+    batched Yahoo market caps, and persist it. A few hundred HTTP calls, so this is deliberately an
+    explicit POST rather than something a read path can trigger."""
+    assert _http is not None
+    try:
+        blob = await universe.build(_http)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"universe build failed: {e}")
+    if not blob.get("symbols"):
+        raise HTTPException(status_code=502, detail="universe build produced no symbols")
+    universe.save(blob)
+    return {k: v for k, v in blob.items() if k != "detail"}
+
+
+@app.get("/universe")
+async def universe_endpoint(limit: int = 25) -> dict:
+    """What the curated universe currently holds, and whether it needs rebuilding."""
+    blob = universe.load()
+    if not blob:
+        raise HTTPException(status_code=404, detail="universe not built yet — POST /universe/build")
+    return {
+        "built_at": blob.get("built_at"),
+        "stale": universe.is_stale(blob),
+        "source": blob.get("source"),
+        "directory_rows": blob.get("directory_rows"),
+        "passed_filter": blob.get("passed_filter"),
+        "size": len(blob.get("symbols") or []),
+        "sample": (blob.get("detail") or [])[:max(0, min(100, limit))],
+    }
+
+
 @app.get("/screener/value")
 async def value_screener(limit: int = 20, below_line_only: bool = True,
                          include_watchlist: bool = True, refresh: bool = False) -> dict:
@@ -1309,11 +1342,21 @@ async def value_screener(limit: int = 20, below_line_only: bool = True,
         return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
 
     extra = sorted(settings_store.get().get("watchlist") or []) if include_watchlist else []
-    try:
-        universe = await screener.build_universe(_http, extra=extra)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"universe build failed: {e}")
-    if not universe:
+    # Prefer the CURATED universe (MB-19). The live Yahoo screens are rebuilt server-side on every
+    # call, so two runs minutes apart returned different names off a ~58-wide pool — a sampler, not
+    # a screen. Fall back to them only when the curated list has not been built yet.
+    cur = universe.load()
+    universe_source = "curated"
+    if cur and cur.get("symbols"):
+        pool = list(cur["symbols"])[:max(limit * 10, 150)]
+        syms = pool + [s for s in extra if s not in pool]
+    else:
+        universe_source = "yahoo_screens"
+        try:
+            syms = await screener.build_universe(_http, extra=extra)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"universe build failed: {e}")
+    if not syms:
         raise HTTPException(status_code=502, detail="no candidates could be screened")
 
     async def trend_of(client, sym: str):
@@ -1322,11 +1365,13 @@ async def value_screener(limit: int = 20, below_line_only: bool = True,
         return ctx.get("long_term_trend")
 
     ranked, skipped = await screener.screen(
-        _http, trend_of, universe, limit=limit, below_line_only=below_line_only)
+        _http, trend_of, syms, limit=limit, below_line_only=below_line_only)
     payload = {
         "as_of": now,
-        "universe_size": len(universe),
-        "scored": len(universe) - len(skipped),
+        "universe_size": len(syms),
+        "universe_source": universe_source,
+        "universe_stale": bool(cur and universe.is_stale(cur)),
+        "scored": len(syms) - len(skipped),
         # Named, not silently dropped: a name absent from the ranking because it could not be scored
         # is different from one that scored badly, and the caller cannot tell them apart otherwise.
         "skipped": skipped,
