@@ -123,8 +123,44 @@ def validate_plan(
         spend += d
         affordable.append(m)
 
-    derived = _derive(portfolio, affordable, cash=cash)
-    return affordable, derived, warnings
+    # One symbol, one instruction. A live plan came back with both "sell AAPL 4" and "hold AAPL" —
+    # rendered as two rows telling the user opposite things about the same position. Keep the
+    # actionable move and drop the redundant hold; genuinely conflicting buy+sell is dropped whole
+    # because we cannot tell which the model meant.
+    deduped: list[dict] = []
+    by_sym: dict[str, list[dict]] = {}
+    for m in affordable:
+        by_sym.setdefault(m["symbol"].upper(), []).append(m)
+    for sym, group in by_sym.items():
+        if len(group) == 1:
+            deduped.append(group[0])
+            continue
+        acting = [m for m in group if m["action"] in ("buy", "sell")]
+        kinds = {m["action"] for m in acting}
+        if len(acting) == 1:
+            warnings.append(f"{sym}: dropped a redundant hold alongside a {acting[0]['action']}")
+            deduped.append(acting[0])
+        elif not acting:
+            deduped.append(group[0])
+        elif kinds == {"buy", "sell"}:
+            warnings.append(f"dropped {sym}: the plan both bought and sold it")
+        else:
+            warnings.append(f"{sym}: merged {len(acting)} {acting[0]['action']} moves into one")
+            merged = dict(acting[0])
+            merged["shares"] = round(sum(float(m["shares"]) for m in acting), 6)
+            merged["dollars"] = round(sum(float(m["dollars"]) for m in acting), 2)
+            deduped.append(merged)
+
+    derived = _derive(portfolio, deduped, cash=cash)
+    # The whole promise of the feature is "bring the largest weight to max_position_pct". If the
+    # plan does not get there, say so — silently printing a 36.7% outcome under a 25% target reads
+    # as success.
+    top = derived.get("resulting_top_weight_pct")
+    if isinstance(top, (int, float)) and top > max_position_pct + 0.5:
+        warnings.append(
+            f"this plan still leaves the largest position at {top:.1f}%, above the "
+            f"{max_position_pct:.0f}% target — it does not fully rebalance the book")
+    return deduped, derived, warnings
 
 
 def _derive(portfolio: dict, moves: list[dict], *, cash: float) -> dict:

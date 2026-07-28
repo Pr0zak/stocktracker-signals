@@ -74,10 +74,43 @@ def test_an_unweightable_book_reports_no_top_weight():
 
 
 def test_a_clean_plan_passes_through_unchanged_and_silent():
+    # max_position_pct=60 is ACHIEVABLE on this two-position book. At 25 it is not — no plan over two
+    # holdings can put the top weight under 25% — so the target-miss warning would correctly fire and
+    # this would not be testing the silent path at all.
     moves = [
         {"symbol": "AAPL", "action": "sell", "shares": 2.0, "dollars": 200.0, "reason": "trim"},
         {"symbol": "NVDA", "action": "buy", "shares": 1.0, "dollars": 200.0, "reason": "add"},
     ]
-    kept, derived, warns = validate_plan(book(), moves, cash=0.0, max_position_pct=25.0)
+    kept, derived, warns = validate_plan(book(), moves, cash=0.0, max_position_pct=60.0)
     assert warns == []
     assert [m["shares"] for m in kept] == [2.0, 1.0]
+
+
+def test_one_symbol_gets_one_instruction():
+    # A live plan returned both "sell AAPL 4" and "hold AAPL" — two rows saying opposite things
+    # about the same position.
+    moves = [
+        {"symbol": "AAPL", "action": "sell", "shares": 4.0, "dollars": 400.0, "reason": "trim"},
+        {"symbol": "AAPL", "action": "hold", "shares": 0.0, "dollars": 0.0, "reason": "keep"},
+    ]
+    kept, derived, warns = validate_plan(book(), moves, cash=0.0, max_position_pct=25.0)
+    assert [m["action"] for m in kept] == ["sell"]
+    assert any("redundant hold" in w for w in warns)
+
+
+def test_a_plan_that_both_buys_and_sells_one_symbol_is_dropped():
+    moves = [
+        {"symbol": "AAPL", "action": "sell", "shares": 2.0, "dollars": 200.0, "reason": "trim"},
+        {"symbol": "AAPL", "action": "buy", "shares": 2.0, "dollars": 200.0, "reason": "add"},
+    ]
+    kept, derived, warns = validate_plan(book(), moves, cash=1000.0, max_position_pct=25.0)
+    assert not any(m["symbol"] == "AAPL" for m in kept)
+    assert any("both bought and sold" in w for w in warns)
+
+
+def test_a_plan_that_misses_its_own_target_says_so():
+    # Two equal $1000 positions, no cash: doing nothing leaves the top weight at 50%, not 25%.
+    moves = [{"symbol": "AAPL", "action": "hold", "shares": 0.0, "dollars": 0.0, "reason": "keep"}]
+    kept, derived, warns = validate_plan(book(), moves, cash=0.0, max_position_pct=25.0)
+    assert derived["resulting_top_weight_pct"] == 50.0
+    assert any("does not fully rebalance" in w for w in warns)
