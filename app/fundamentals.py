@@ -93,7 +93,8 @@ def compact(data: dict | None) -> dict | None:
         return None
     keep = ("roe", "gross_margin", "net_margin", "debt_to_equity",
             "high_roe", "low_debt", "wide_moat", "buffett_quality", "dividend_aristocrat",
-            "fcf_trend", "fcf_positive_years", "fcf_years", "shares_change_pct")
+            "fcf_trend", "fcf_positive_years", "fcf_years", "shares_change_pct",
+            "shares_change_reliable", "shares_change_note")
     slim = {k: data[k] for k in keep if data.get(k) is not None}
     return slim or None
 
@@ -157,8 +158,20 @@ async def fetch_financials(client: httpx.AsyncClient, symbol: str) -> dict | Non
                 block["fcf_positive_years"] = sum(1 for _, v in fcf if v > 0)
                 block["fcf_years"] = len(fcf)
             if len(shares) >= 2 and shares[0][1] > 0:
-                block["shares_change_pct"] = round((shares[-1][1] / shares[0][1] - 1) * 100, 1)
+                pct = round((shares[-1][1] / shares[0][1] - 1) * 100, 1)
+                block["shares_change_pct"] = pct
                 block["shares_years"] = len(shares)
+                # These are RAW reported share counts, so a stock SPLIT looks exactly like massive
+                # dilution: SMCI's 10-for-1 read as "+1074% — dilution", the single worst red flag
+                # available, for a corporate action that dilutes nobody. A reverse split does the
+                # same in the opposite direction. Organic change stays well inside this band over a
+                # ~5-year window, so outside it we cannot tell the two apart — say so rather than
+                # assert the wrong one.
+                block["shares_change_reliable"] = -50.0 < pct < 100.0
+                if not block["shares_change_reliable"]:
+                    block["shares_change_note"] = (
+                        "share count changed by an amount consistent with a stock split, not "
+                        "organic dilution or buybacks — treat as unknown")
             out = block or None
         except Exception:  # noqa: BLE001 — fundamentals are enrichment, never a blocker
             out = None

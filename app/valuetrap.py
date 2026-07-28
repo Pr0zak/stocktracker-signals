@@ -59,12 +59,18 @@ def assess(trend: dict | None, quality: dict | None, insider: dict | None) -> di
 
     # ---- share count: dilution to stay alive vs buying back from strength
     sc = quality.get("shares_change_pct") if quality else None
+    # A raw share count cannot tell a split from dilution; when fundamentals flags the number as
+    # unreliable it must not become evidence in either direction. Counting a 10-for-1 split as the
+    # worst available red flag is worse than having no share data at all.
+    if quality and quality.get("shares_change_reliable") is False:
+        missing.append("share count (looks like a stock split)")
+        sc = None
     if isinstance(sc, (int, float)):
         if sc > _DILUTION_PCT:
             red.append(f"Share count up {sc:.1f}% — dilution"); r += 1.5
         elif sc < _BUYBACK_PCT:
             green.append(f"Share count down {abs(sc):.1f}% — buybacks"); g += 1.5
-    else:
+    elif not (quality and quality.get("shares_change_reliable") is False):
         missing.append("share count")
 
     # ---- balance sheet and returns

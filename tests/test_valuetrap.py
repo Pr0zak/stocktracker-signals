@@ -106,3 +106,19 @@ def test_dilution_counts_against_and_buybacks_count_for(pct, expect_red):
 def test_the_note_states_what_an_unclear_verdict_means():
     a = assess(None, None, None)
     assert "not that the business looks fine" in a["note"]
+
+
+def test_a_stock_split_is_not_counted_as_dilution():
+    """SMCI's 10-for-1 read as '+1074% — dilution': the worst available red flag, for a corporate
+    action that dilutes nobody. Raw reported share counts cannot distinguish the two, so when
+    fundamentals marks the number unreliable it must not become evidence either way."""
+    a = assess(None, quality(shares_change_pct=1074.4, shares_change_reliable=False), None)
+    assert not any("dilution" in x for x in a["red"]), a["red"]
+    assert any("split" in x for x in a["missing"])
+
+
+def test_a_reliable_share_count_still_counts():
+    a = assess(None, quality(shares_change_pct=8.0, shares_change_reliable=True), None)
+    assert any("dilution" in x for x in a["red"])
+    b = assess(None, quality(shares_change_pct=-5.0, shares_change_reliable=True), None)
+    assert any("buybacks" in x for x in b["green"])
