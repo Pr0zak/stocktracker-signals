@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import gaps, market_calendar, memory, rebalance_check, sandbox_job, sandbox_store, screener
+from . import gaps, market_calendar, memory, rebalance_check, sandbox_job, sandbox_store, screener, valuetrap
 from .analyst import (
     analyze,
     daily_brief,
@@ -1476,6 +1476,52 @@ async def quality_endpoint(symbol: str) -> dict:
     if data is None and funda is None:
         raise HTTPException(status_code=404, detail="no quality data for this symbol")
     return {"symbol": sym, **(data or {}), **(funda or {})}
+
+
+@app.get("/valuetrap/{symbol}")
+async def valuetrap_endpoint(symbol: str) -> dict:
+    """MB-17 — is this cheap name a DISCOUNT or is it DETERIORATING?
+
+    The 200-week screen says what is unusually cheap versus its own trend; this says whether the
+    business behind it is still intact. Composes three feeds already fetched elsewhere (quality/FCF,
+    insider buying, trend direction) and reasons over them. Free — NO LLM.
+
+    Evidence, not a recommendation. An "unclear" verdict with a non-empty `missing` means the data
+    was unavailable, NOT that the business looks fine — the two are reported separately via
+    `assessable` so a caller cannot confuse them.
+    """
+    assert _http is not None
+    sym = symbol.upper()
+
+    # Each feed is best-effort and independently optional: a missing one becomes an entry in
+    # `missing`, which is materially different from it having come back clean.
+    q = None
+    try:
+        base = await fundamentals.fetch_quality(_http, sym)
+        fin = await fundamentals.fetch_financials(_http, sym)
+        if base or fin:
+            q = {**(base or {}), **(fin or {})}
+    except Exception:  # noqa: BLE001
+        q = None
+    try:
+        ins = await insider.insider_buying(_http, sym)
+    except Exception:  # noqa: BLE001
+        ins = None
+    lt = None
+    try:
+        series = await fetch_series(_http, sym)
+        ctx = await cycle.crypto_context(_http, series.symbol, series.closes)
+        lt = ctx.get("long_term_trend")
+    except Exception:  # noqa: BLE001
+        lt = None
+
+    out = valuetrap.assess(lt, q, ins)
+    return {
+        "symbol": sym,
+        "price_vs_200w_sma_pct": (lt or {}).get("price_vs_200w_sma_pct"),
+        "below_line": (lt or {}).get("below_line"),
+        **out,
+    }
 
 
 @app.get("/options/{symbol}")
