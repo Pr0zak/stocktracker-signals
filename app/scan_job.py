@@ -293,6 +293,20 @@ async def run_scan() -> dict:
     prev = _prev_state()
 
     async with httpx.AsyncClient() as client:
+        # MB-19: the curated universe expires after a week and nothing else rebuilds it. Without
+        # this the value screen keeps quietly serving a months-old symbol list — the same "stale
+        # data presented as current" failure the rest of this codebase has had to keep fixing.
+        # Best-effort: a failed rebuild must never take the nightly scan down with it.
+        try:
+            from . import universe as _universe
+            if _universe.is_stale(_universe.load()):
+                blob = await _universe.build(client)
+                if blob.get("symbols"):
+                    _universe.save(blob)
+                    log.info("universe rebuilt: %s symbols", len(blob["symbols"]))
+        except Exception as e:  # noqa: BLE001
+            log.warning("universe rebuild skipped: %s", e)
+
         bench: list[float] | None = None
         if stocks:
             try:

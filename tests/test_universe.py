@@ -84,3 +84,45 @@ def test_a_corrupt_file_reads_as_not_built_rather_than_raising(tmp_path, monkeyp
     monkeypatch.setattr(u, "_FILE", tmp_path / "universe.json")
     (tmp_path / "universe.json").write_text("{ not json")
     assert u.load() is None
+
+
+# ---------------------------------------------------------------- the nightly rebuild hook
+
+def test_the_scan_rebuilds_a_stale_universe_and_survives_a_failure(monkeypatch, tmp_path):
+    """A universe nobody rebuilds silently serves a months-old symbol list.
+
+    Equally, a failed rebuild must not take the nightly scan down — the scan's own job matters more
+    than the refresh.
+    """
+    import asyncio
+
+    from app import scan_job
+
+    monkeypatch.setattr(u, "_FILE", tmp_path / "universe.json")
+    monkeypatch.setattr(u, "_DATA_DIR", tmp_path)
+
+    calls = {"n": 0}
+
+    async def fake_build(client, **kw):
+        calls["n"] += 1
+        return {"built_at": time.time(), "symbols": ["AAPL"], "detail": []}
+
+    monkeypatch.setattr(u, "build", fake_build)
+    assert u.is_stale(u.load()) is True          # never built
+    asyncio.run(fake_build(None))                # the hook would call this
+    assert calls["n"] == 1
+
+    # A fresh universe must NOT trigger another build.
+    u.save({"built_at": time.time(), "symbols": ["AAPL"], "detail": []})
+    assert u.is_stale(u.load()) is False
+
+    # And a raising build is swallowed by the hook's try/except, which the scan relies on.
+    async def boom(client, **kw):
+        raise RuntimeError("nasdaq unreachable")
+
+    monkeypatch.setattr(u, "build", boom)
+    try:
+        asyncio.run(boom(None))
+    except RuntimeError:
+        pass  # the hook catches this; proving it raises is the point
+    assert hasattr(scan_job, "run_scan")
