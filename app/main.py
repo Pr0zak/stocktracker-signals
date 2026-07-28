@@ -1859,8 +1859,10 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
             try:
                 series = await fetch_series(_http, sym)
                 summ = summarize(series, None if crypto else bench)
-            except Exception:  # noqa: BLE001 — an unpriceable holding is dropped, not fatal
-                return None
+            except Exception:  # noqa: BLE001 — priced at cost below rather than dropped
+                return {"symbol": sym.removesuffix("-USD"), "_unpriced": True,
+                        "shares": h.shares, "avg_cost": h.avg_cost,
+                        "value": round((h.avg_cost or 0.0) * h.shares, 2)}
             price = summ["price"]
             return {
                 "symbol": sym.removesuffix("-USD"),
@@ -1876,10 +1878,21 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
                 "technicals": {k: summ.get(k) for k in _SANDBOX_TECH_KEYS if summ.get(k) is not None},
             }
 
-    rows = [r for r in await asyncio.gather(*[_price(h) for h in holdings]) if r]
+    all_rows = [r for r in await asyncio.gather(*[_price(h) for h in holdings]) if r]
+    # A holding we could not price used to be DROPPED. That silently shrank total_value, which
+    # inflated every surviving weight_pct AND cash_pct — measured: one unpriceable holding of two
+    # equal ones took the other from a true 33.3% to a reported 50.0%, and made a 33% cash account
+    # look 50% cash. The analyst sizes against exactly these numbers, on the real /portfolio/review
+    # and /rebalance as well as the sandbox. So carry it at cost so the denominator stays honest,
+    # keep it OUT of `positions` (it has no live price or technicals to make a decision on), and
+    # name it in `unpriced` so the caller and the prompt both know the book is partial.
+    unpriced = [r for r in all_rows if r.get("_unpriced")]
+    rows = [r for r in all_rows if not r.get("_unpriced")]
     if not rows:
+        # Nothing priced at all: fail loudly rather than serve a book valued entirely at cost basis,
+        # which would render as "0% gain on everything" and read as real.
         raise HTTPException(status_code=502, detail="couldn't price any holdings")
-    total_value = sum(r["value"] for r in rows) + max(cash, 0.0)
+    total_value = sum(r["value"] for r in all_rows) + max(cash, 0.0)
     for r in rows:
         r["weight_pct"] = round(100.0 * r["value"] / total_value, 1) if total_value else None
     # Groups the user holds more than one vehicle of — the SAME underlying exposure via redundant
@@ -1889,13 +1902,17 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
     for r in rows:
         _by_group.setdefault(r["exposure_group"], []).append(r["symbol"])
     equivalent = {g: syms for g, syms in _by_group.items() if len(syms) > 1}
-    return {
+    out = {
         "cash": round(cash, 2),
         "cash_pct": round(100.0 * max(cash, 0.0) / total_value, 1) if total_value else 0.0,
         "total_value": round(total_value, 2),
         "positions": sorted(rows, key=lambda r: r["value"], reverse=True),
         "equivalent_exposures": equivalent,
     }
+    if unpriced:
+        out["unpriced"] = [{"symbol": r["symbol"], "shares": r["shares"],
+                            "value_at_cost": r["value"]} for r in unpriced]
+    return out
 
 
 class PortfolioReviewRequest(BaseModel):
@@ -2351,8 +2368,21 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 try:
                     book = await _build_portfolio_snapshot(holdings, blob["cash"])
                 except Exception as e:  # noqa: BLE001
-                    warnings.append(f"book snapshot failed: {e}")
-                    book = {"total_value": blob["cash"], "cash_pct": 100.0, "positions": []}
+                    # NEVER claim 100% cash while the ledger holds shares. That substitution told the
+                    # weekly strategy review the account was entirely in cash — and that note then
+                    # persists for SEVEN DAYS, steering every daily tick under it. Mark the real
+                    # positions at cost instead: a rough denominator beats a false one.
+                    warnings.append(f"book snapshot failed, positions marked at cost: {e}")
+                    at_cost = [{"symbol": h.symbol.upper(), "exposure_group": _exposure_group(h.symbol),
+                                "shares": h.shares, "avg_cost": h.avg_cost,
+                                "value": round((h.avg_cost or 0.0) * h.shares, 2),
+                                "technicals": {}} for h in holdings]
+                    tv = sum(r["value"] for r in at_cost) + max(blob["cash"], 0.0)
+                    for r in at_cost:
+                        r["weight_pct"] = round(100.0 * r["value"] / tv, 1) if tv else None
+                    book = {"total_value": round(tv, 2), "cash": round(blob["cash"], 2),
+                            "cash_pct": round(100.0 * max(blob["cash"], 0.0) / tv, 1) if tv else 0.0,
+                            "positions": at_cost, "priced_at_cost": True}
             else:
                 book = {"total_value": blob["cash"], "cash_pct": 100.0, "positions": []}
             weekly_ran = await _maybe_weekly_review(blob, book, settings)
