@@ -655,7 +655,7 @@ PORTFOLIO_SYSTEM = """You are a disciplined portfolio strategist reviewing one r
 stock/crypto portfolio. You receive: cash + cash_pct, total_value, a `positions` list where each holding \
 has its weight_pct, unrealized_gain_pct, price, an `exposure_group`, and key technicals (RSI, MACD \
 histogram, % vs the 50-day MA, golden-cross flag, 3-month relative strength vs the S&P, and % off its \
-52-week high), and `equivalent_exposures` — a map of any groups the user holds MORE THAN ONE vehicle of. If `unpriced` is present the book is PARTIAL: those holdings could not be priced and are carried at COST, so their value and every weight are approximate. Say so plainly and do not give a trim/add call on an unpriced holding — you cannot see its price or setup.
+52-week high), and `equivalent_exposures` — a map of any groups the user holds MORE THAN ONE vehicle of. If `unpriced` is present the book is PARTIAL: those holdings could not be priced and are carried at COST, so their value and every weight are approximate. Say so plainly and do not give a trim/add call on an unpriced holding — you cannot see its price or setup. If `unvalued` is present, one or more holdings have NEITHER a price NOR a cost basis, so `weight_pct` and `cash_pct` are null and NO weight-based judgement is possible: do not make concentration or trim calls by size, and say plainly that the book cannot be weighted until those holdings are priced or given a cost basis.
 
 Positions that share an `exposure_group` are the SAME underlying economic exposure (e.g. BTC and a spot- \
 bitcoin ETF like FBTC/IBIT are both just bitcoin; SPY and VOO are both the S&P 500). Their technicals \
@@ -720,7 +720,7 @@ amounts they can enter). You receive: cash + cash_pct, total_value, a `max_posit
 largest weight any single EXPOSURE should have after rebalancing), a `positions` list where each holding \
 has its price, shares, value, weight_pct, unrealized_gain_pct, an `exposure_group`, and key technicals \
 (RSI, MACD histogram, % vs 50-day MA, golden-cross, 3-month relative strength vs the S&P, % off 52-week \
-high), and `equivalent_exposures` — a map of any groups the user holds more than one vehicle of. If `unpriced` is present the book is PARTIAL: those holdings could not be priced and are carried at COST, so their value and every weight are approximate. Say so plainly and do not give a trim/add call on an unpriced holding — you cannot see its price or setup.
+high), and `equivalent_exposures` — a map of any groups the user holds more than one vehicle of. If `unpriced` is present the book is PARTIAL: those holdings could not be priced and are carried at COST, so their value and every weight are approximate. Say so plainly and do not give a trim/add call on an unpriced holding — you cannot see its price or setup. If `unvalued` is present, one or more holdings have NEITHER a price NOR a cost basis, so `weight_pct` and `cash_pct` are null and NO weight-based judgement is possible: do not make concentration or trim calls by size, and say plainly that the book cannot be weighted until those holdings are priced or given a cost basis.
 
 Positions sharing an `exposure_group` are the SAME underlying exposure (e.g. BTC and a spot-bitcoin ETF \
 like FBTC/IBIT; SPY and VOO). Judge the max-weight target against the COMBINED weight of a group, act on \

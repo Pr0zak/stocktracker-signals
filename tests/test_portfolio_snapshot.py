@@ -103,3 +103,34 @@ def test_the_happy_path_is_unchanged(priced):
     assert book["total_value"] == 2000.0
     assert book["cash_pct"] == 50.0
     assert not book.get("unpriced")
+
+
+def test_a_holding_with_no_cost_basis_is_not_valued_at_zero(priced):
+    """avg_cost can legitimately be 0 — the user never entered a basis.
+
+    Valuing at cost is then valuing at ZERO, which reproduces the exact weight inflation the
+    carry-at-cost fallback exists to prevent: measured 33.3% -> 50.0%. A book containing a holding
+    with neither a price nor a basis cannot be weighted at all, so it reports no weights rather than
+    confident wrong ones.
+    """
+    priced.add("VXUS")
+    holdings = [m.Holding(symbol="AAPL", shares=10, avg_cost=90.0),
+                m.Holding(symbol="VXUS", shares=10, avg_cost=0.0)]   # no basis, unpriceable
+    book = _run(m._build_portfolio_snapshot(holdings, cash=1000.0))
+
+    assert book["unvalued"] == ["VXUS"]
+    assert book["weights_approximate"] is True
+    aapl = next(p for p in book["positions"] if p["symbol"] == "AAPL")
+    assert aapl["weight_pct"] is None, (
+        f"AAPL reported {aapl['weight_pct']}% off a denominator missing a whole position")
+    assert book["cash_pct"] is None
+
+
+def test_a_priceable_book_still_reports_real_weights(priced):
+    # The suppression must be narrow: only an UNVALUED holding kills the weights.
+    holdings = [m.Holding(symbol="AAPL", shares=10, avg_cost=90.0),
+                m.Holding(symbol="VXUS", shares=10, avg_cost=0.0)]   # no basis but priceable
+    book = _run(m._build_portfolio_snapshot(holdings, cash=1000.0))
+    assert all(p["weight_pct"] is not None for p in book["positions"])
+    assert book["cash_pct"] == pytest.approx(33.3, abs=0.2)
+    assert not book.get("unvalued")

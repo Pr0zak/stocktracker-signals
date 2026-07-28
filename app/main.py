@@ -1859,10 +1859,15 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
             try:
                 series = await fetch_series(_http, sym)
                 summ = summarize(series, None if crypto else bench)
-            except Exception:  # noqa: BLE001 — priced at cost below rather than dropped
+            except Exception:  # noqa: BLE001 — carried at cost below rather than dropped
+                # avg_cost can legitimately be 0 (the user never entered a basis). Valuing at cost
+                # would then be valuing at ZERO, which reproduces the very weight-inflation this
+                # fallback exists to prevent — measured: 33.3% -> 50.0%. Such a holding is UNVALUED,
+                # and a book containing one cannot yield trustworthy weights at all.
+                basis = (h.avg_cost or 0.0) * h.shares
                 return {"symbol": sym.removesuffix("-USD"), "_unpriced": True,
                         "shares": h.shares, "avg_cost": h.avg_cost,
-                        "value": round((h.avg_cost or 0.0) * h.shares, 2)}
+                        "value": round(basis, 2) if basis > 0 else None}
             price = summ["price"]
             return {
                 "symbol": sym.removesuffix("-USD"),
@@ -1887,14 +1892,20 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
     # keep it OUT of `positions` (it has no live price or technicals to make a decision on), and
     # name it in `unpriced` so the caller and the prompt both know the book is partial.
     unpriced = [r for r in all_rows if r.get("_unpriced")]
+    unvalued = [r for r in unpriced if r.get("value") is None]
     rows = [r for r in all_rows if not r.get("_unpriced")]
     if not rows:
         # Nothing priced at all: fail loudly rather than serve a book valued entirely at cost basis,
         # which would render as "0% gain on everything" and read as real.
         raise HTTPException(status_code=502, detail="couldn't price any holdings")
-    total_value = sum(r["value"] for r in all_rows) + max(cash, 0.0)
+    total_value = sum(r["value"] or 0.0 for r in all_rows) + max(cash, 0.0)
+    # An unvalued holding means the DENOMINATOR is missing a position outright, so no weight in this
+    # book is computable. Emit none at all rather than a confident wrong one — measured, a single
+    # unvalued holding of two equal ones reports the other at 50.0% when the truth is 33.3%, and a
+    # caveat under a wrong number is still a wrong number on a screen that drives real sells.
     for r in rows:
-        r["weight_pct"] = round(100.0 * r["value"] / total_value, 1) if total_value else None
+        r["weight_pct"] = (None if unvalued else
+                           round(100.0 * r["value"] / total_value, 1) if total_value else None)
     # Groups the user holds more than one vehicle of — the SAME underlying exposure via redundant
     # tickers (e.g. BTC + FBTC). Surfaced so the analyst combines their weight + gives a consistent
     # stance instead of independent per-ticker calls.
@@ -1904,7 +1915,8 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
     equivalent = {g: syms for g, syms in _by_group.items() if len(syms) > 1}
     out = {
         "cash": round(cash, 2),
-        "cash_pct": round(100.0 * max(cash, 0.0) / total_value, 1) if total_value else 0.0,
+        "cash_pct": (None if unvalued else
+                     round(100.0 * max(cash, 0.0) / total_value, 1) if total_value else 0.0),
         "total_value": round(total_value, 2),
         "positions": sorted(rows, key=lambda r: r["value"], reverse=True),
         "equivalent_exposures": equivalent,
@@ -1912,6 +1924,12 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
     if unpriced:
         out["unpriced"] = [{"symbol": r["symbol"], "shares": r["shares"],
                             "value_at_cost": r["value"]} for r in unpriced]
+        # Weights are computed over a denominator we know is incomplete. Say so, at two strengths:
+        # carried-at-cost is a rough mark; unvalued means the denominator is missing that holding
+        # entirely and no weight in this book can be trusted.
+        out["weights_approximate"] = True
+        if unvalued:
+            out["unvalued"] = [r["symbol"] for r in unvalued]
     return out
 
 
