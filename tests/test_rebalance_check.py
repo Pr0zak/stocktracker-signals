@@ -173,3 +173,51 @@ def test_one_action_per_holding():
             {"symbol": "AAPL", "action": "add", "reason": "b"}]
     kept, warns = validate_actions(book(), acts)
     assert len(kept) == 1 and any("second action" in w for w in warns)
+
+
+# ---------------------------------------------------------------- ordering regressions
+# All three reproduced against the original ordering (validate -> merge -> drop, never re-checked).
+
+def test_two_sells_of_one_symbol_cannot_exceed_the_shares_held():
+    """The merge used to run AFTER the cap and simply SUM the shares.
+
+    Each 5-share sell passed the 6-share cap individually, then merged to 10 — an instruction to
+    sell 4 shares that do not exist, typed straight into a broker as a short.
+    """
+    b = {"positions": [{"symbol": "AAPL", "shares": 6.0, "price": 100.0, "value": 600.0}]}
+    moves = [{"symbol": "AAPL", "action": "sell", "shares": 5.0, "dollars": 500.0, "reason": "a"},
+             {"symbol": "AAPL", "action": "sell", "shares": 5.0, "dollars": 500.0, "reason": "b"}]
+    kept, derived, warns = validate_plan(b, moves, cash=0.0, max_position_pct=25.0)
+    assert kept[0]["shares"] == 6.0, f"instructed a short: {kept}"
+    assert kept[0]["dollars"] == 600.0
+    assert any("only 6" in w for w in warns)
+
+
+def test_a_buy_is_not_funded_by_proceeds_from_a_sell_that_was_dropped():
+    """Affordability used to be computed BEFORE dedupe could drop the sell that funded it."""
+    b = {"positions": [{"symbol": "AAPL", "shares": 100.0, "price": 100.0, "value": 10000.0},
+                       {"symbol": "MSFT", "shares": 10.0, "price": 50.0, "value": 500.0}]}
+    moves = [{"symbol": "AAPL", "action": "sell", "shares": 50.0, "dollars": 5000.0, "reason": "a"},
+             {"symbol": "AAPL", "action": "buy", "shares": 10.0, "dollars": 1000.0, "reason": "b"},
+             {"symbol": "MSFT", "action": "buy", "shares": 100.0, "dollars": 5000.0, "reason": "c"}]
+    kept, derived, warns = validate_plan(b, moves, cash=0.0, max_position_pct=25.0)
+    assert not any(m["action"] == "buy" for m in kept), f"unfunded buy survived: {kept}"
+    assert derived["cash_after"] >= 0.0, "a plan cannot spend cash that does not exist"
+
+
+@pytest.mark.parametrize("sell_act,buy_act", [("SELL", "Buy"), ("Sell", "BUY"), (" sell ", " buy ")])
+def test_the_models_casing_cannot_skip_every_check(sell_act, buy_act):
+    """action was lower-cased into a local for the whitelist but never on the dict, so every branch
+    after it compared the raw string and matched nothing — no cap, no affordability, and _derive
+    returned the BEFORE state as the after state."""
+    b = {"positions": [{"symbol": "AAPL", "shares": 6.0, "price": 100.0, "value": 600.0},
+                       {"symbol": "MSFT", "shares": 10.0, "price": 50.0, "value": 500.0}]}
+    moves = [{"symbol": "AAPL", "action": sell_act, "shares": 6.0, "dollars": 600.0, "reason": "a"},
+             {"symbol": "MSFT", "action": buy_act, "shares": 100.0, "dollars": 5000.0, "reason": "b"}]
+    kept, derived, warns = validate_plan(b, moves, cash=0.0, max_position_pct=25.0)
+    assert all(m["action"] in ("buy", "sell", "hold") for m in kept), kept
+    # Selling all of AAPL must be reflected: it cannot still be the top exposure afterwards.
+    assert derived["resulting_top_exposure"] != "AAPL", derived
+    # And a $5,000 buy on $0 cash + $600 proceeds must be trimmed or dropped, not waved through.
+    buys = [m for m in kept if m["action"] == "buy"]
+    assert sum(float(m["dollars"]) for m in buys) <= 600.0 + 1e-6, buys

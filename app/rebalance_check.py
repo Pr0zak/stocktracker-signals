@@ -21,6 +21,53 @@ def _held(portfolio: dict) -> dict[str, dict]:
     return {str(p.get("symbol", "")).upper(): p for p in (portfolio.get("positions") or [])}
 
 
+def _normalise(moves: list[dict]) -> tuple[list[dict], list[str]]:
+    """Canonical symbol + action, and ONE move per symbol, before anything is validated.
+
+    Ordering is the whole point. This used to run AFTER validation, which defeated it twice over:
+    two sells of one symbol were each capped at shares-held and then SUMMED, producing an
+    instruction to sell more than is owned (a short); and the model's raw casing was compared
+    downstream, so a "SELL" passed the whitelist and then matched no branch at all, skipping every
+    check. Both are reproducible. Merge first, then validate once, so each guarantee holds on the
+    row that is actually emitted.
+    """
+    warnings: list[str] = []
+    by_sym: dict[str, list[dict]] = {}
+    for mv in moves:
+        m = dict(mv)
+        m["symbol"] = str(m.get("symbol", "")).strip().upper()
+        m["action"] = str(m.get("action", "")).strip().lower()
+        by_sym.setdefault(m["symbol"], []).append(m)
+
+    out: list[dict] = []
+    for sym, group in by_sym.items():
+        acting = [m for m in group if m["action"] in ("buy", "sell")]
+        if not acting:
+            out.append(group[0])
+            continue
+        kinds = {m["action"] for m in acting}
+        if kinds == {"buy", "sell"}:
+            warnings.append(f"dropped {sym}: the plan both bought and sold it")
+            continue
+        if len(group) > len(acting):
+            warnings.append(f"{sym}: dropped a redundant hold alongside a {acting[0]['action']}")
+        if len(acting) == 1:
+            out.append(acting[0])
+            continue
+        warnings.append(f"{sym}: merged {len(acting)} {acting[0]['action']} moves into one")
+        merged = dict(acting[0])
+
+        def _f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+        merged["shares"] = sum(_f(m.get("shares")) for m in acting)
+        merged["dollars"] = sum(_f(m.get("dollars")) for m in acting)
+        out.append(merged)
+    return out, warnings
+
+
 def validate_plan(
     portfolio: dict,
     moves: list[dict],
@@ -36,13 +83,13 @@ def validate_plan(
     a shorter honest plan than a longer one containing an instruction that cannot be filled.
     """
     held = _held(portfolio)
-    warnings: list[str] = []
+    # 1. Canonicalise and merge FIRST, so every check below sees the row that will be emitted.
+    merged, warnings = _normalise(moves)
     kept: list[dict] = []
 
-    for mv in moves:
-        m = dict(mv)
-        sym = str(m.get("symbol", "")).upper()
-        action = str(m.get("action", "")).lower()
+    # 2. Validate each final row.
+    for m in merged:
+        sym, action = m["symbol"], m["action"]
         pos = held.get(sym)
 
         if action not in ("buy", "sell", "hold"):
@@ -56,9 +103,8 @@ def validate_plan(
             kept.append(m)
             continue
 
-        shares = m.get("shares")
         try:
-            shares = float(shares)
+            shares = float(m.get("shares"))
         except (TypeError, ValueError):
             warnings.append(f"dropped {sym}: share count {m.get('shares')!r} is not a number")
             continue
@@ -98,7 +144,9 @@ def validate_plan(
                 m["dollars"] = round(got, 2)
         kept.append(m)
 
-    # Affordability: buys may only spend the cash on hand plus what the sells actually raise.
+    # 3. Affordability LAST, over the surviving set only. Computing it earlier meant a buy could be
+    #    funded by proceeds from a sell that was afterwards dropped — reproduced as a $4,000 buy
+    #    against $0 cash, with cash_after honestly reporting -$4,000 and no warning on the buy.
     proceeds = sum(float(m["dollars"]) for m in kept if m["action"] == "sell")
     budget = max(cash, 0.0) + proceeds
     spend = 0.0
@@ -110,7 +158,7 @@ def validate_plan(
         d = float(m["dollars"])
         if spend + d > budget + 1e-6:
             room = max(0.0, budget - spend)
-            price = held[m["symbol"].upper()].get("price")
+            price = held[m["symbol"]].get("price")
             if room < 1.0 or not (isinstance(price, (int, float)) and price > 0):
                 warnings.append(
                     f"dropped buy {m['symbol']}: ${d:,.0f} but only ${room:,.0f} would be left")
@@ -123,35 +171,7 @@ def validate_plan(
         spend += d
         affordable.append(m)
 
-    # One symbol, one instruction. A live plan came back with both "sell AAPL 4" and "hold AAPL" —
-    # rendered as two rows telling the user opposite things about the same position. Keep the
-    # actionable move and drop the redundant hold; genuinely conflicting buy+sell is dropped whole
-    # because we cannot tell which the model meant.
-    deduped: list[dict] = []
-    by_sym: dict[str, list[dict]] = {}
-    for m in affordable:
-        by_sym.setdefault(m["symbol"].upper(), []).append(m)
-    for sym, group in by_sym.items():
-        if len(group) == 1:
-            deduped.append(group[0])
-            continue
-        acting = [m for m in group if m["action"] in ("buy", "sell")]
-        kinds = {m["action"] for m in acting}
-        if len(acting) == 1:
-            warnings.append(f"{sym}: dropped a redundant hold alongside a {acting[0]['action']}")
-            deduped.append(acting[0])
-        elif not acting:
-            deduped.append(group[0])
-        elif kinds == {"buy", "sell"}:
-            warnings.append(f"dropped {sym}: the plan both bought and sold it")
-        else:
-            warnings.append(f"{sym}: merged {len(acting)} {acting[0]['action']} moves into one")
-            merged = dict(acting[0])
-            merged["shares"] = round(sum(float(m["shares"]) for m in acting), 6)
-            merged["dollars"] = round(sum(float(m["dollars"]) for m in acting), 2)
-            deduped.append(merged)
-
-    derived = _derive(portfolio, deduped, cash=cash)
+    derived = _derive(portfolio, affordable, cash=cash)
     # The whole promise of the feature is "bring the largest weight to max_position_pct". If the
     # plan does not get there, say so — silently printing a 36.7% outcome under a 25% target reads
     # as success.
@@ -160,7 +180,7 @@ def validate_plan(
         warnings.append(
             f"this plan still leaves the largest position at {top:.1f}%, above the "
             f"{max_position_pct:.0f}% target — it does not fully rebalance the book")
-    return deduped, derived, warnings
+    return affordable, derived, warnings
 
 
 def _derive(portfolio: dict, moves: list[dict], *, cash: float) -> dict:
