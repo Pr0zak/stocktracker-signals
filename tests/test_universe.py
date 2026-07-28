@@ -40,14 +40,14 @@ def test_warrants_units_preferreds_and_junk_are_dropped(sym):
     assert u.parse_directory(doc(row(sym))) == []
 
 
-@pytest.mark.parametrize("sym", ["BRK.A", "BRK.B", "BF.B"])
-def test_dual_class_common_shares_are_KEPT(sym):
-    """A "." is a CLASS separator, not a junk marker.
-
-    Dropping every dotted symbol removed Berkshire Hathaway — the largest name it excluded — and
-    every other dual-class common from the universe, which was never the intent.
+@pytest.mark.parametrize("nasdaq,yahoo", [("BRK.A", "BRK-A"), ("BRK.B", "BRK-B"), ("BF.B", "BF-B")])
+def test_dual_class_shares_are_kept_AND_written_the_way_yahoo_needs(nasdaq, yahoo):
+    """A "." is a CLASS separator, not a junk marker — dropping dotted symbols removed Berkshire
+    Hathaway entirely. But admitting them is only half of it: Nasdaq writes BRK.B, Yahoo writes
+    BRK-B, and queried with the dot Yahoo returns marketCap None (typing BF.B as MUTUALFUND), so the
+    cap filter dropped it again. Verified live against Yahoo before making this change.
     """
-    assert [r["symbol"] for r in u.parse_directory(doc(row(sym)))] == [sym]
+    assert [r["symbol"] for r in u.parse_directory(doc(row(nasdaq)))] == [yahoo]
 
 
 def test_the_footer_line_does_not_become_a_symbol():

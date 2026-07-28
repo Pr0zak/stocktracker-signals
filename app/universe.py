@@ -80,6 +80,13 @@ def parse_directory(text: str) -> list[dict]:
             continue
         if len(base) > 5:
             continue
+        # Nasdaq writes a share class with a DOT (BRK.B); Yahoo — which every downstream consumer
+        # here uses for quotes and weekly bars — writes it with a HYPHEN (BRK-B). Queried with the
+        # dot, Yahoo returns the symbol but with marketCap None (and types BF.B as MUTUALFUND), so
+        # the cap filter dropped it silently: admitting dotted symbols to the parser achieved
+        # nothing on its own. Store the form the fetchers actually need.
+        if cls:
+            sym = f"{base}-{cls}"
         rows.append({
             "symbol": sym,
             "name": parts[i_name].strip(),
