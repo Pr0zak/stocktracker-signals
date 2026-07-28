@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 import time
+import datetime as _dt
 
 import pytest
 from fastapi.testclient import TestClient
@@ -39,6 +40,18 @@ CC_CAND_KEYS = {"contract_symbol", "strike", "limit_price", "premium_income", "p
                 "delta", "theta", "iv", "open_interest", "spread_pct", "order_ticket"}
 PUT_TICKET_RE = re.compile(r"^SELL \d+ \S+ \d{2}/\d{2}/\d{2} [\d.]+ P @ \d+\.\d{2} LMT$")
 CC_TICKET_RE = re.compile(r"^SELL \d+ \S+ \d{2}/\d{2}/\d{2} [\d.]+ C @ \d+\.\d{2} LMT$")
+
+
+# A PINNED clock. These tests derive expiries from `now` and assert exact DTEs, while the code
+# measures DTE to the 16:00 ET close (see options.expiry_epoch) — so with `now = _NOW` the
+# same assertion is true or false depending on the hour the suite runs. Measured: 6 tests here and
+# in test_wheel.py passed from 09:00-23:00 UTC and failed from 00:00-08:00 UTC, which made a green
+# run meaningless in exactly the window an unattended job would use.
+#
+# Mid-session (10:00 ET) on a date whose whole +/-120-day horizon stays inside EDT, so no DST step
+# can move an expiry across a window boundary either.
+_NOW = _dt.datetime(2026, 6, 15, 14, 0, tzinfo=_dt.timezone.utc).timestamp()
+
 
 
 # ======================================================================================
@@ -85,14 +98,14 @@ def _bare_chain(dtes, *, now, spot=103.0):
 
 
 def test_select_wheel_expiry_prefers_target():
-    now = time.time()
+    now = _NOW
     chosen, warns = o.select_wheel_expiry(_bare_chain([7, 21, 35, 45, 90], now=now),
                                           low=25, high=50, target=35, now=now)
     assert chosen is not None and chosen["dte"] == 35 and warns == []
 
 
 def test_select_wheel_expiry_skips_earnings_straddle():
-    now = time.time()
+    now = _NOW
     # 28/35/45 are all in the 25-50 window; earnings at day 30 straddles 35 & 45 but NOT 28.
     earn = time.strftime("%Y-%m-%d", time.gmtime(now + 30 * 86400))
     chosen, warns = o.select_wheel_expiry(_bare_chain([21, 28, 35, 45], now=now),
@@ -102,7 +115,7 @@ def test_select_wheel_expiry_skips_earnings_straddle():
 
 
 def test_select_wheel_expiry_falls_back_and_warns():
-    now = time.time()
+    now = _NOW
     chosen, warns = o.select_wheel_expiry(_bare_chain([7, 14, 120], now=now),
                                           low=25, high=50, target=35, now=now)
     assert chosen["dte"] == 14  # nearest >= WHEEL_MIN_DTE (14) to the 35 target
@@ -110,7 +123,7 @@ def test_select_wheel_expiry_falls_back_and_warns():
 
 
 def test_select_wheel_expiry_none_when_all_past():
-    now = time.time()
+    now = _NOW
     assert o.select_wheel_expiry(_bare_chain([-5, -1], now=now), low=25, high=50, target=35, now=now)[0] is None
 
 
@@ -129,7 +142,7 @@ def _assemble_puts(now, *, cash, style="aggressive", earnings_date=None, iv=0.40
 
 
 def test_puts_three_profiles_ordered_by_assignment_prob():
-    now = time.time()
+    now = _NOW
     body = _assemble_puts(now, cash=30_000.0, style="aggressive")
     assert set(body) == PUT_TOP_KEYS, f"top-level key drift: {set(body) ^ PUT_TOP_KEYS}"
     cands = body["candidates"]
@@ -155,7 +168,7 @@ def test_puts_three_profiles_ordered_by_assignment_prob():
 def test_puts_sizing_invariant_consistent():
     """net_cost, cash_to_reserve, contracts and premium_income are internally consistent, and no
     figure reads $0 while a SELL-n ticket exists (the OC-1 sizing invariant)."""
-    now = time.time()
+    now = _NOW
     cash = 30_000.0
     body = _assemble_puts(now, cash=cash, style="aggressive")
     for c in body["candidates"]:
@@ -178,7 +191,7 @@ def test_puts_sizing_invariant_consistent():
 def test_puts_cash_below_one_contract_warns_and_sizes_to_one():
     """Cash that can't secure even the cheapest strike -> contracts falls back to 1 (NOT 0), and a
     'below ... reserve' warning fires (never a silent $0)."""
-    now = time.time()
+    now = _NOW
     body = _assemble_puts(now, cash=5_000.0, style="aggressive")  # < the ~$9,300 cheapest reserve
     for c in body["candidates"]:
         assert c["strike"] * 100 > 5_000.0        # precondition: can't secure one contract
@@ -188,7 +201,7 @@ def test_puts_cash_below_one_contract_warns_and_sizes_to_one():
 
 
 def test_puts_earnings_in_window_populates_block_and_warns():
-    now = time.time()
+    now = _NOW
     earn = time.strftime("%Y-%m-%d", time.gmtime(now + 20 * 86400))  # before the ~35 DTE expiry
     body = _assemble_puts(now, cash=30_000.0, earnings_date=earn)
     assert body["earnings"] == {"date": earn, "in_window": True}
@@ -196,13 +209,13 @@ def test_puts_earnings_in_window_populates_block_and_warns():
 
 
 def test_puts_high_iv_is_noted():
-    now = time.time()
+    now = _NOW
     body = _assemble_puts(now, cash=30_000.0, iv=0.95)  # >= HIGH_IV (0.80)
     assert any("IV is elevated" in w for w in body["warnings"])
 
 
 def test_puts_note_and_not_advice():
-    now = time.time()
+    now = _NOW
     body = _assemble_puts(now, cash=30_000.0)
     assert "cash-secured" in body["note"].lower()
     assert "not investment advice" in body["note"].lower()
@@ -221,7 +234,7 @@ def _assemble_cc(now, *, shares, target=None, iv=0.40, oi=800):
 
 
 def test_covered_call_default_delta_pick_and_shape():
-    now = time.time()
+    now = _NOW
     body = _assemble_cc(now, shares=300)
     assert set(body) == CC_TOP_KEYS, f"top-level key drift: {set(body) ^ CC_TOP_KEYS}"
     assert body["shares"] == 300 and body["contracts"] == 3
@@ -240,7 +253,7 @@ def test_covered_call_default_delta_pick_and_shape():
 
 
 def test_covered_call_target_picks_nearest_strike_at_or_above():
-    now = time.time()
+    now = _NOW
     body = _assemble_cc(now, shares=200, target=115.0)
     assert body["contracts"] == 2
     assert body["candidate"]["strike"] == 115.0     # exact strike at the target
@@ -249,14 +262,14 @@ def test_covered_call_target_picks_nearest_strike_at_or_above():
 
 
 def test_covered_call_target_above_all_strikes_falls_back_and_warns():
-    now = time.time()
+    now = _NOW
     body = _assemble_cc(now, shares=100, target=500.0)  # above every listed strike
     assert body["contracts"] == 1
     assert any("above every listed strike" in w for w in body["warnings"])
 
 
 def test_covered_call_note_and_not_advice():
-    now = time.time()
+    now = _NOW
     body = _assemble_cc(now, shares=100)
     assert "covered call" in body["note"].lower()
     assert "not investment advice" in body["note"].lower()
@@ -294,6 +307,9 @@ def test_puts_bad_cash_returns_422_offline():
 
 
 def test_puts_route_happy_path(monkeypatch):
+    # LIVE clock on purpose: the route recomputes DTE against real time, so a pinned-past
+    # chain reads as already expired (400 "no suitable expiration"). The exact-DTE assertions
+    # that needed pinning live in the select_* tests above, not here.
     now = time.time()
     _patch_fetch(monkeypatch, _wheel_chain(now))
     with TestClient(app) as client:
@@ -322,6 +338,9 @@ def test_covered_call_crypto_returns_400_not_500():
 
 
 def test_covered_call_route_happy_path(monkeypatch):
+    # LIVE clock on purpose: the route recomputes DTE against real time, so a pinned-past
+    # chain reads as already expired (400 "no suitable expiration"). The exact-DTE assertions
+    # that needed pinning live in the select_* tests above, not here.
     now = time.time()
     _patch_fetch(monkeypatch, _wheel_chain(now))
     with TestClient(app) as client:

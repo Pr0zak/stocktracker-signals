@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import time
+import datetime as _dt
 
 import pytest
 from fastapi.testclient import TestClient
@@ -34,6 +35,18 @@ CAND_KEYS = {
     "expected_move", "order_ticket",
 }
 TICKET_RE = re.compile(r"^BUY \d+ \S+ \d{2}/\d{2}/\d{2} [\d.]+ C @ \d+\.\d{2} LMT$")
+
+
+# A PINNED clock. These tests derive expiries from `now` and assert exact DTEs, while the code
+# measures DTE to the 16:00 ET close (see options.expiry_epoch) — so with `now = _NOW` the
+# same assertion is true or false depending on the hour the suite runs. Measured: 6 tests here and
+# in test_wheel.py passed from 09:00-23:00 UTC and failed from 00:00-08:00 UTC, which made a green
+# run meaningless in exactly the window an unattended job would use.
+#
+# Mid-session (10:00 ET) on a date whose whole +/-120-day horizon stays inside EDT, so no DST step
+# can move an expiry across a window boundary either.
+_NOW = _dt.datetime(2026, 6, 15, 14, 0, tzinfo=_dt.timezone.utc).timestamp()
+
 
 
 # ======================================================================================
@@ -74,13 +87,13 @@ def _bare_chain(dtes, *, now, spot=100.0, quote_delayed=False):
 
 
 def test_select_expiry_prefers_60():
-    now = time.time()
+    now = _NOW
     chosen, warns = o.select_expiry(_bare_chain([7, 30, 60, 75, 120], now=now), now=now)
     assert chosen is not None and chosen["dte"] == 60 and warns == []
 
 
 def test_select_expiry_skips_earnings_straddle():
-    now = time.time()
+    now = _NOW
     # 50/60/75 are all in the 45-90 window; earnings at day 55 straddles 60 & 75 but NOT 50.
     earn = time.strftime("%Y-%m-%d", time.gmtime(now + 55 * 86400))
     chosen, warns = o.select_expiry(_bare_chain([30, 50, 60, 75], now=now), now=now, earnings_date=earn)
@@ -89,7 +102,7 @@ def test_select_expiry_skips_earnings_straddle():
 
 
 def test_select_expiry_target_date_forces_later_and_warns():
-    now = time.time()
+    now = _NOW
     tgt = time.strftime("%Y-%m-%d", time.gmtime(now + 80 * 86400))
     chosen, warns = o.select_expiry(_bare_chain([7, 30, 60, 75, 120], now=now), now=now, target_date=tgt)
     assert chosen["dte"] == 120  # only the 120-DTE expiry clears the target (+buffer)
@@ -97,7 +110,7 @@ def test_select_expiry_target_date_forces_later_and_warns():
 
 
 def test_select_expiry_none_when_nothing_expires_in_time():
-    now = time.time()
+    now = _NOW
     # all in the past -> nothing to pick
     assert o.select_expiry(_bare_chain([-5, -1], now=now), now=now)[0] is None
 
@@ -134,7 +147,7 @@ def _assert_candidate_shape(c, spot):
 
 
 def test_assemble_green_when_bullish_and_clean():
-    now = time.time()
+    now = _NOW
     chain = _synthetic_annotated_chain(now, oi=800)
     summary = {"golden_cross": True, "pct_vs_sma20": 3.1, "pct_vs_sma50": 6.2, "macd_hist": 0.5,
                "rel_strength_3mo_vs_benchmark": 0.04, "rsi14": 61.0, "pct_off_52w_high": -2.0}
@@ -153,7 +166,7 @@ def test_assemble_green_when_bullish_and_clean():
 
 
 def test_assemble_red_when_not_bullish():
-    now = time.time()
+    now = _NOW
     chain = _synthetic_annotated_chain(now)
     summary = {"golden_cross": False, "pct_vs_sma20": -4.0, "pct_vs_sma50": -6.0, "macd_hist": -1.0,
                "rel_strength_3mo_vs_benchmark": -0.05, "rsi14": 38.0, "pct_off_52w_high": -35.0}
@@ -166,7 +179,7 @@ def test_assemble_red_when_not_bullish():
 
 
 def test_assemble_yellow_on_earnings_in_window():
-    now = time.time()
+    now = _NOW
     chain = _synthetic_annotated_chain(now, oi=800)
     summary = {"golden_cross": True, "pct_vs_sma20": 3.1, "pct_vs_sma50": 6.2, "macd_hist": 0.5,
                "rel_strength_3mo_vs_benchmark": 0.04, "rsi14": 61.0, "pct_off_52w_high": -2.0}
@@ -179,7 +192,7 @@ def test_assemble_yellow_on_earnings_in_window():
 
 
 def test_assemble_budget_sizes_contracts():
-    now = time.time()
+    now = _NOW
     chain = _synthetic_annotated_chain(now)
     summary = {"golden_cross": True, "macd_hist": 0.5, "rel_strength_3mo_vs_benchmark": 0.04}
     chosen, _ = o.select_expiry(chain, now=now)
@@ -192,7 +205,7 @@ def test_assemble_budget_sizes_contracts():
 
 
 def test_assemble_no_budget_leaves_contracts_none():
-    now = time.time()
+    now = _NOW
     chain = _synthetic_annotated_chain(now)
     summary = {"golden_cross": True, "macd_hist": 0.5}
     chosen, _ = o.select_expiry(chain, now=now)
@@ -233,7 +246,7 @@ def _ticket_qty(c):
 def test_f1_max_loss_equals_cost_times_ticket_quantity():
     """F1: the invariant max_loss == cost × (the quantity on the order ticket) holds for all three
     budget regimes, and `contracts` is NEVER 0 while a BUY-n ticket exists."""
-    now = time.time()
+    now = _NOW
     chain = _synthetic_annotated_chain(now)
     chosen, _ = o.select_expiry(chain, now=now)
 
@@ -269,7 +282,7 @@ def test_f1_max_loss_equals_cost_times_ticket_quantity():
 def test_f4_boundary_dte_window_matches_display():
     """F4: an expiry at 44.6 DTE displays as 45 (in-window); the window classification must use that
     SAME int, so no 'outside 45-90' warning fires and the rationale calls it in the sweet spot."""
-    now = time.time()
+    now = _NOW
     # select_expiry side: displayed int is 45, and NO fallback/out-of-window warning.
     chosen, warns = o.select_expiry(_bare_chain([44.6], now=now), now=now)
     assert chosen["dte"] == 45
@@ -287,7 +300,7 @@ def test_f4_boundary_dte_window_matches_display():
 def test_f5_red_reason_no_candidates_even_when_bullish():
     """F5: with a bullish direction but ZERO quotable contracts, the red light must cite the missing
     contracts, not the (false) 'wait/sell' directional reason."""
-    now = time.time()
+    now = _NOW
     exp_ts = int(now + 60 * 86400)
     chain = _bare_chain([60], now=now, spot=100.0)
     # No IV -> annotate can't compute delta -> nothing selectable -> zero candidates.
@@ -311,7 +324,7 @@ def test_f5_red_reason_no_candidates_even_when_bullish():
 def test_f10_requested_style_dropped_when_unquotable_warns():
     """F10: when the requested style's strike is unquotable and gets dropped, warn that we're showing
     a different profile first (rather than silently violating style-first)."""
-    now = time.time()
+    now = _NOW
     chain = _synthetic_annotated_chain(now)
     # Blank the quotes on whatever contract the SAFER profile would pick, then re-derive: it now has
     # no mid and no last -> no limit price -> build_candidates drops it.
