@@ -1890,6 +1890,7 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
             return {
                 "symbol": sym.removesuffix("-USD"),
                 "exposure_group": _exposure_group(sym),
+                "currency": (summ.get("currency") or "USD").upper(),
                 "shares": h.shares,
                 "avg_cost": h.avg_cost,
                 "price": round(price, 4),
@@ -1935,6 +1936,13 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
     # shows two 33.3% rows while the real BTC exposure is 66.6% — so a 25% cap reads as satisfied at
     # nearly 3x. equivalent_exposures named the pair but gave no combined number, and the prompt
     # asked the model to sum it mentally. Compute it here instead; arithmetic is not the model's job.
+    # No FX rates here, so `value = price * shares` was summed across currencies one-for-one: a GBP
+    # holding entered the USD total at face value and every weight computed off that total was wrong.
+    # The APP already refuses to present such a sum without a caveat; the backend fed the analyst the
+    # bare number. Name the mismatch, as with `unpriced` — a total we know is meaningless must say so.
+    currencies = {r.get("currency", "USD") for r in rows}
+    mixed = sorted(c for c in currencies if c != "USD") if len(currencies) > 1 else []
+
     group_value: dict[str, float] = {}
     for r in rows:
         group_value[r["exposure_group"]] = group_value.get(r["exposure_group"], 0.0) + r["value"]
@@ -1951,6 +1959,8 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
         "equivalent_exposures": equivalent,
         "exposure_weights": exposure_weights,
     }
+    if mixed:
+        out["mixed_currencies"] = mixed
     if unpriced:
         out["unpriced"] = [{"symbol": r["symbol"], "shares": r["shares"],
                             "value_at_cost": r["value"]} for r in unpriced]

@@ -152,3 +152,36 @@ def test_the_same_symbol_sent_twice_becomes_one_position(priced):
     assert pos["avg_cost"] == pytest.approx(100.0)     # (10*90 + 5*120) / 15
     assert pos["weight_pct"] == 100.0
     assert not book.get("equivalent_exposures")
+
+
+def test_mixed_currencies_are_named_not_silently_summed(priced, monkeypatch):
+    """No FX rates here, so a GBP holding entered the USD total at face value.
+
+    The app already refuses to present such a sum without a caveat; the backend handed the analyst
+    the bare number and every weight computed off it.
+    """
+    def by_symbol(series, bench):
+        return {"price": 100.0, "rsi14": 50.0, "currency": series.cur}
+    seen = {}
+
+    class S:
+        closes = [100.0] * 60
+        cur = "USD"
+
+    async def fetch(http, sym, *a, **k):
+        s = S()
+        s.cur = "GBP" if sym.upper() == "VOD" else "USD"
+        return s
+
+    monkeypatch.setattr(m, "fetch_series", fetch)
+    monkeypatch.setattr(m, "summarize", by_symbol)
+    holdings = [m.Holding(symbol="AAPL", shares=10, avg_cost=90.0),
+                m.Holding(symbol="VOD", shares=10, avg_cost=80.0)]
+    book = _run(m._build_portfolio_snapshot(holdings, cash=0.0))
+    assert book["mixed_currencies"] == ["GBP"]
+
+
+def test_a_single_currency_book_says_nothing(priced):
+    holdings = [m.Holding(symbol="AAPL", shares=10, avg_cost=90.0)]
+    book = _run(m._build_portfolio_snapshot(holdings, cash=0.0))
+    assert not book.get("mixed_currencies")
