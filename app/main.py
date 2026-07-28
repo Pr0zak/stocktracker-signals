@@ -1845,6 +1845,24 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
     unrealized gain, key technicals) sorted by value, priced concurrently against one S&P fetch for
     relative strength. Unpriceable holdings are dropped; raises 502 if none can be priced."""
     assert _http is not None
+    # One position per symbol. The same ticker sent twice produced two independent rows (66.7% and
+    # 33.3% of one book), an equivalent_exposures entry of {"AAPL": ["AAPL", "AAPL"]} telling the
+    # analyst to consolidate AAPL into AAPL, and a cap judged against half the real position. Merge
+    # on shares, cost-weighting the basis.
+    if len({h.symbol.upper() for h in holdings}) != len(holdings):
+        merged: dict[str, Holding] = {}
+        for h in holdings:
+            k = h.symbol.upper()
+            if k in merged:
+                prev = merged[k]
+                tot = (prev.shares or 0.0) + (h.shares or 0.0)
+                basis = (prev.avg_cost or 0.0) * (prev.shares or 0.0) + (h.avg_cost or 0.0) * (h.shares or 0.0)
+                merged[k] = Holding(symbol=k, shares=tot,
+                                    avg_cost=(basis / tot) if tot else 0.0)
+            else:
+                merged[k] = Holding(symbol=k, shares=h.shares, avg_cost=h.avg_cost)
+        holdings = list(merged.values())
+
     try:  # fetch the S&P once for all equity relative-strength calcs
         bench = (await fetch_series(_http, "^GSPC")).closes
     except Exception:  # noqa: BLE001 — relative strength just gets skipped

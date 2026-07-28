@@ -134,3 +134,21 @@ def test_a_priceable_book_still_reports_real_weights(priced):
     assert all(p["weight_pct"] is not None for p in book["positions"])
     assert book["cash_pct"] == pytest.approx(33.3, abs=0.2)
     assert not book.get("unvalued")
+
+
+def test_the_same_symbol_sent_twice_becomes_one_position(priced):
+    """Two rows for one ticker made the book diversified against itself.
+
+    It produced AAPL at 66.7% and AAPL at 33.3% of the same book, an equivalent_exposures entry of
+    {"AAPL": ["AAPL", "AAPL"]} (advice to consolidate AAPL into AAPL), and a per-exposure cap judged
+    against half the real position.
+    """
+    holdings = [m.Holding(symbol="AAPL", shares=10, avg_cost=90.0),
+                m.Holding(symbol="AAPL", shares=5, avg_cost=120.0)]
+    book = _run(m._build_portfolio_snapshot(holdings, cash=0.0))
+    assert len(book["positions"]) == 1
+    pos = book["positions"][0]
+    assert pos["shares"] == 15.0
+    assert pos["avg_cost"] == pytest.approx(100.0)     # (10*90 + 5*120) / 15
+    assert pos["weight_pct"] == 100.0
+    assert not book.get("equivalent_exposures")
