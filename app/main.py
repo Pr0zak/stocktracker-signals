@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import gaps, market_calendar, memory, rebalance_check, sandbox_job, sandbox_store, screener, universe, valuetrap
+from . import gaps, market_calendar, memory, rebalance_check, sandbox_job, sandbox_store, screener, smartmoney, universe, valuetrap
 from .analyst import (
     analyze,
     daily_brief,
@@ -1429,6 +1429,66 @@ async def insider_endpoint(symbol: str) -> dict:
     if data is None:
         raise HTTPException(status_code=404, detail="no insider data (set a Finnhub key in settings)")
     return {"symbol": symbol.upper(), **data}
+
+
+@app.get("/smart_money")
+async def smart_money_endpoint(limit: int = 20, months: int = 12, refresh: bool = False) -> dict:
+    """Theme C — where informed money has been BUYING across the watchlist, in one view.
+
+    Composes the two existing per-symbol feeds (SEC Form 4 insider purchases, congressional STOCK Act
+    disclosures) into a cross-sectional ranking. Free — NO LLM.
+
+    Weighting is deliberate: an insider buy outranks a congressional one, because insiders disclose
+    within two business days and spend their own money, while congressional filings lag up to ~45
+    days and report AMOUNT RANGES rather than figures. Insider SALES are not scored at all — people
+    sell for tax, diversification and houses.
+
+    Corroborating context, never a reason on its own. A feed that could not be read is reported
+    separately from one that came back empty.
+    """
+    assert _http is not None
+    cfg = settings_store.get()
+    limit = max(1, min(50, limit))
+    watch = sorted({s.upper() for s in (cfg.get("watchlist") or [])})
+    if not watch:
+        raise HTTPException(status_code=422, detail="no watchlist symbols configured")
+
+    key = ("smart_money", limit, months, tuple(watch))
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and not refresh and now - hit[0] < max(cfg["verdict_ttl_seconds"], 3600):
+        return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
+
+    async def insider_of(sym: str):
+        return await insider.insider_buying(_http, sym)
+
+    async def congress_of(sym: str):
+        return await congress.congress_trades(_http, sym, months=months)
+
+    ranked, no_evidence, failed = await smartmoney.sweep(
+        watch, insider_of, congress_of, limit=limit)
+
+    # insider_buying returns None (not raises) when no Finnhub key is set, which would otherwise
+    # render as "nobody is buying" across the entire watchlist.
+    key_set = bool(cfg.get("finnhub_api_key"))
+    payload = {
+        "as_of": now,
+        "watchlist_size": len(watch),
+        "results": ranked,
+        # Names we looked at and found nothing for — distinct from ones we could not look at.
+        "no_evidence": no_evidence,
+        "fetch_failed": failed,
+        "insider_feed_configured": key_set,
+        "note": ("Where insiders and members of Congress have been buying names you follow. "
+                 "Insider buys are disclosed within two business days; congressional filings lag up "
+                 "to ~45 days and report amount ranges. Corroborating context, not a buy signal."),
+        "cached": False,
+    }
+    if not key_set:
+        payload["warning"] = ("No Finnhub key configured, so insider filings were not consulted — "
+                              "this ranking is congressional disclosures only.")
+    _cache[key] = (now, payload)
+    return payload
 
 
 @app.get("/congress/{symbol}")

@@ -176,6 +176,15 @@ def test_live_chain_smoke():
     ]
     assert quoted, "expected calls with IV + a quote"
 
+    # Greeks are UNDEFINED on an expired contract. Yahoo keeps the day's expiry in the list after
+    # the close, so from ~16:00 ET on an expiry date the default expiry has dte <= 0 and every delta
+    # is None — the suite went red every such evening for no product reason. The live paths are
+    # unaffected: select_expiry targets the 45-90 day window and picks a real contract (verified: it
+    # chose 52 DTE while the default was expired). This test documents itself as SKIPPING rather
+    # than failing when live data cannot support it; that contract is now actually honoured.
+    if chain.expiry.dte_days is None or chain.expiry.dte_days <= 0:
+        pytest.skip(f"default expiry has expired (dte={chain.expiry.dte_days}) — greeks undefined")
+
     # --- annotate + greeks sanity ---
     expiry = annotate_expiry(chain)
     call_deltas = [c.delta for c in expiry.calls if c.delta is not None]
