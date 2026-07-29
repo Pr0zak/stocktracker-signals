@@ -1297,16 +1297,11 @@ async def universe_build_endpoint() -> dict:
         blob = await universe.build(_http)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"universe build failed: {e}")
-    if not blob.get("symbols"):
-        raise HTTPException(status_code=502, detail="universe build produced no symbols")
-    # A partial fetch must not overwrite a good universe and then be stamped fresh for a week.
-    if not blob.get("complete"):
-        prev = universe.load()
-        if prev and prev.get("symbols"):
-            raise HTTPException(
-                status_code=502,
-                detail=(f"build covered only {blob.get('batch_coverage')} of quote batches "
-                        f"({blob.get('empty_batches')} failed) — keeping the previous universe"))
+    # Same decision as the nightly hook, made in one place so the two cannot drift apart — the
+    # coverage guard used to live here only, leaving the unattended path unprotected.
+    ok, why = universe.publish(blob, previous=universe.load())
+    if not ok:
+        raise HTTPException(status_code=502, detail=why)
     universe.save(blob)
     return {k: v for k, v in blob.items() if k != "detail"}
 

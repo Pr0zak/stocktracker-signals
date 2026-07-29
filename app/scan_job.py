@@ -299,11 +299,23 @@ async def run_scan() -> dict:
         # Best-effort: a failed rebuild must never take the nightly scan down with it.
         try:
             from . import universe as _universe
-            if _universe.is_stale(_universe.load()):
+            _prev = _universe.load()
+            if not _universe.is_stale(_prev):
+                # ALWAYS log an outcome. Logging only on rebuild meant the common case left no
+                # trace, so "the hook ran and correctly did nothing" was indistinguishable from
+                # "the hook never ran" — no way to tell a working guard from an absent one.
+                log.info("universe fresh, no rebuild needed (%s symbols)",
+                         len((_prev or {}).get("symbols") or []))
+            else:
                 blob = await _universe.build(client)
-                if blob.get("symbols"):
+                ok, why = _universe.publish(blob, previous=_prev)
+                if ok:
                     _universe.save(blob)
-                    log.info("universe rebuilt: %s symbols", len(blob["symbols"]))
+                    log.info("universe %s", why)
+                else:
+                    # A partial build must not overwrite a good universe and be stamped fresh for a
+                    # week — the guard was in the endpoint only, i.e. everywhere except here.
+                    log.warning("universe NOT replaced — %s", why)
         except Exception as e:  # noqa: BLE001
             log.warning("universe rebuild skipped: %s", e)
 

@@ -178,3 +178,44 @@ def test_a_clean_fetch_is_marked_complete(monkeypatch):
     monkeypatch.setattr(u, "_profile_batch", ok_batch)
     blob = asyncio.run(u.build(None))
     assert blob["complete"] is True and blob["batch_coverage"] == 1.0
+
+
+# ---------------------------------------------------------------- publish (shared by both callers)
+
+def test_a_partial_build_never_replaces_a_good_universe():
+    """The coverage guard lived in the ENDPOINT only, so the nightly hook — the unattended path,
+    the one nobody watches — would persist a half-fetched universe and stamp it fresh for a week."""
+    partial = {"symbols": ["A"], "complete": False, "batch_coverage": 0.4, "empty_batches": 30}
+    good = {"symbols": ["A", "B", "C"]}
+    ok, why = u.publish(partial, previous=good)
+    assert ok is False
+    assert "keeping the previous" in why
+
+
+def test_a_partial_build_IS_accepted_when_there_is_nothing_to_fall_back_on():
+    partial = {"symbols": ["A"], "complete": False, "batch_coverage": 0.4, "empty_batches": 30}
+    ok, why = u.publish(partial, previous=None)
+    assert ok is True
+    assert "PARTIAL" in why, "accepting it is fine; doing so silently is not"
+
+
+def test_a_complete_build_is_accepted():
+    ok, why = u.publish({"symbols": ["A", "B"], "complete": True, "passed_filter": 2}, previous=None)
+    assert ok is True and "rebuilt:" in why
+
+
+def test_an_empty_build_is_always_refused():
+    for prev in (None, {"symbols": ["A"]}):
+        ok, why = u.publish({"symbols": [], "complete": True}, previous=prev)
+        assert ok is False and "no symbols" in why
+
+
+def test_publish_always_gives_a_reason_so_every_caller_can_log_an_outcome():
+    """Logging only on a successful rebuild left the common case (universe still fresh) with no
+    trace at all, so a working guard and an absent one looked identical in the journal."""
+    for blob, prev in (({"symbols": [], "complete": True}, None),
+                       ({"symbols": ["A"], "complete": True, "passed_filter": 1}, None),
+                       ({"symbols": ["A"], "complete": False, "batch_coverage": 0.5}, {"symbols": ["A", "B"]}),
+                       ({"symbols": ["A"], "complete": False, "batch_coverage": 0.5}, None)):
+        ok, why = u.publish(blob, previous=prev)
+        assert isinstance(why, str) and why, (blob, prev)

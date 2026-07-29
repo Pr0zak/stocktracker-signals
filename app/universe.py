@@ -200,3 +200,25 @@ def is_stale(blob: dict | None, *, now: float | None = None) -> bool:
     if not blob or not blob.get("built_at"):
         return True
     return (now or time.time()) - float(blob["built_at"]) > STALE_AFTER_S
+
+
+def publish(blob: dict, *, previous: dict | None = None) -> tuple[bool, str]:
+    """Decide whether a fresh build may REPLACE the stored universe, and say why.
+
+    Shared by POST /universe/build and the nightly scan hook. It lived only in the endpoint, so the
+    UNATTENDED path — the one that matters most, because nobody is watching it — would happily
+    persist a half-fetched universe and stamp it fresh for a week. Exactly backwards.
+
+    Returns (ok_to_save, reason). `reason` is always non-empty so every caller can log an outcome.
+    """
+    if not blob.get("symbols"):
+        return False, "build produced no symbols"
+    if blob.get("complete"):
+        return True, (f"rebuilt: {len(blob['symbols'])} symbols "
+                      f"from {blob.get('passed_filter')} that passed the filter")
+    if previous and previous.get("symbols"):
+        return False, (f"refused: coverage {blob.get('batch_coverage')} "
+                       f"({blob.get('empty_batches')} batches failed) — keeping the previous universe")
+    # No usable previous universe: a partial one beats none, but say so loudly.
+    return True, (f"rebuilt PARTIAL: coverage {blob.get('batch_coverage')}, "
+                  f"{len(blob['symbols'])} symbols — no previous universe to fall back on")
