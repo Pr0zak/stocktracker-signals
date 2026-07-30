@@ -1368,7 +1368,12 @@ async def heatmap_endpoint(mode: str = "market", limit: int = 80, refresh: bool 
         quotes = await market_now.fetch_quotes(_http, syms)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"quote fetch failed: {e}")
-    tiles, unpriced = heatmap.market_tiles(uni, quotes, limit=limit)
+    phase = None
+    try:
+        phase = market_now.session_phase()
+    except Exception:  # noqa: BLE001 — no phase just means we fall back to the regular-session move
+        phase = None
+    tiles, unpriced = heatmap.market_tiles(uni, quotes, limit=limit, phase=phase)
     if not tiles:
         raise HTTPException(status_code=502, detail="no tiles could be priced")
 
@@ -1381,7 +1386,9 @@ async def heatmap_endpoint(mode: str = "market", limit: int = 80, refresh: bool 
         "universe_built_at": uni.get("built_at"),
         "universe_stale": universe.is_stale(uni),
         "scale": "price",
-        "note": "Sized by market cap, coloured by today's move.",
+        "session": phase,
+        "note": ("Sized by market cap, coloured by the move for the session in progress"
+                 + (f" ({phase})." if phase else ".")),
         "cached": False,
     }
     _cache[key] = (now, payload)

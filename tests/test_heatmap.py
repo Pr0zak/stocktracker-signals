@@ -73,3 +73,45 @@ def test_empty_and_missing_inputs_do_not_raise():
     assert h.market_tiles(None, {}, limit=5) == ([], [])
     assert h.signal_tiles(None, limit=5) == ([], [])
     assert h.signal_tiles({"results": []}, limit=5) == ([], [])
+
+
+def test_every_dip_tier_the_scanner_emits_is_ranked():
+    """A tier missing from DIP_RANK scores 0, which renders in the same grey as "no opinion" — the
+    map silently withholding a signal it actually has. `oversold` was missing.
+    """
+    import inspect, re
+    from app import scan_job
+    emitted = set(re.findall(r'"(mega_dip|below_line|oversold|pullback_10|pullback_5)"',
+                             inspect.getsource(scan_job)))
+    assert emitted, "could not find the tier vocabulary — this test has drifted from scan_job"
+    missing = emitted - set(h.DIP_RANK)
+    assert not missing, f"tiers the scanner emits but the heat map cannot colour: {sorted(missing)}"
+
+
+def test_oversold_outranks_a_shallow_pullback_and_ranks_below_a_mega_dip():
+    scan = {"results": [
+        {"symbol": "A", "pct_off_52w_high": -30.0, "dip": "mega_dip"},
+        {"symbol": "B", "pct_off_52w_high": -12.0, "dip": "oversold"},
+        {"symbol": "C", "pct_off_52w_high": -6.0, "dip": "pullback_5"},
+    ]}
+    by = {t["symbol"]: t for t in h.signal_tiles(scan, limit=10)[0]}
+    assert by["A"]["value"] > by["B"]["value"] > by["C"]["value"] > 0
+
+
+def test_outside_regular_hours_the_move_is_the_session_actually_in_progress():
+    """`pct` is regularMarketChangePercent, so pre-market it carries YESTERDAY's close-to-close move.
+    A name down 8% pre-market rendered GREEN because it closed up yesterday, under a legend reading
+    "today's move". market_now already solved this for indices and movers; this applies the same rule.
+    """
+    uni = {"detail": [{"symbol": "AAPL", "market_cap": 4e12, "name": "Apple"}]}
+    q = {"AAPL": {"price": 300.0, "pct": 2.0, "pre_pct": -8.0, "post_pct": -1.5}}
+    assert h.market_tiles(uni, q, limit=5, phase="PRE")[0][0]["value"] == -8.0
+    assert h.market_tiles(uni, q, limit=5, phase="POST")[0][0]["value"] == -1.5
+    assert h.market_tiles(uni, q, limit=5, phase="REGULAR")[0][0]["value"] == 2.0
+
+
+def test_a_missing_session_figure_falls_back_rather_than_dropping_the_tile():
+    uni = {"detail": [{"symbol": "AAPL", "market_cap": 4e12, "name": "Apple"}]}
+    q = {"AAPL": {"price": 300.0, "pct": 2.0}}          # no pre_pct at all
+    tiles, unpriced = h.market_tiles(uni, q, limit=5, phase="PRE")
+    assert tiles[0]["value"] == 2.0 and unpriced == []
