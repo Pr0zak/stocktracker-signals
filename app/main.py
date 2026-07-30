@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import gaps, market_calendar, memory, rebalance_check, sandbox_job, sandbox_store, screener, smartmoney, universe, valuetrap
+from . import gaps, market_calendar, memory, rebalance_check, heatmap, sandbox_job, sandbox_store, screener, smartmoney, universe, valuetrap
 from .analyst import (
     analyze,
     daily_brief,
@@ -1321,6 +1321,71 @@ async def universe_endpoint(limit: int = 25) -> dict:
         "size": len(blob.get("symbols") or []),
         "sample": (blob.get("detail") or [])[:max(0, min(100, limit))],
     }
+
+
+@app.get("/heatmap")
+async def heatmap_endpoint(mode: str = "market", limit: int = 80, refresh: bool = False) -> dict:
+    """Tile data for the market heat map. Free — NO LLM.
+
+    `mode=market` sizes by market cap and colours by today's move; `mode=signals` sizes by distance
+    below the 52-week high and colours by the dip tier the nightly scan assigned. The two use
+    DIFFERENT colour scales and each tile says which, so a dip tier can never render as a green day.
+
+    No rectangles are computed here — the server does not know the viewport. The squarified layout
+    runs on the device against the real width.
+    """
+    assert _http is not None
+    if mode not in ("market", "signals"):
+        raise HTTPException(status_code=422, detail="mode must be 'market' or 'signals'")
+    limit = max(1, min(200, limit))
+    cfg = settings_store.get()
+    now = time.time()
+
+    if mode == "signals":
+        # Straight off the nightly scan — no fetching, so no cache needed.
+        scan = json.loads(LATEST.read_text()) if LATEST.exists() else None
+        tiles, skipped = heatmap.signal_tiles(scan, limit=limit)
+        return {
+            "mode": "signals", "as_of": (scan or {}).get("generated_at"), "tiles": tiles,
+            "skipped": skipped, "scale": "signal",
+            "note": ("Sized by how far below its 52-week high, coloured by this system's own dip "
+                     "tier — not by price. Context, not a buy signal."),
+            "cached": False,
+        }
+
+    key = ("heatmap_market", limit)
+    hit = _cache.get(key)
+    # Quotes move, so this TTL is short on purpose — a heat map showing a stale move is worse than
+    # one that takes a second to load.
+    if hit and not refresh and now - hit[0] < 60:
+        return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
+
+    uni = universe.load()
+    if not uni or not uni.get("detail"):
+        raise HTTPException(status_code=404, detail="universe not built yet — POST /universe/build")
+    syms = [r["symbol"] for r in uni["detail"][:limit]]
+    try:
+        quotes = await market_now.fetch_quotes(_http, syms)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"quote fetch failed: {e}")
+    tiles, unpriced = heatmap.market_tiles(uni, quotes, limit=limit)
+    if not tiles:
+        raise HTTPException(status_code=502, detail="no tiles could be priced")
+
+    up = sum(1 for t in tiles if t["value"] > 0)
+    payload = {
+        "mode": "market", "as_of": now, "tiles": tiles,
+        # Named, never silently dropped: unpriceable is a fact about our fetch, not about the stock.
+        "unpriced": unpriced,
+        "advancing": up, "declining": len(tiles) - up,
+        "universe_built_at": uni.get("built_at"),
+        "universe_stale": universe.is_stale(uni),
+        "scale": "price",
+        "note": "Sized by market cap, coloured by today's move.",
+        "cached": False,
+    }
+    _cache[key] = (now, payload)
+    return payload
 
 
 @app.get("/screener/value")
