@@ -19,7 +19,7 @@ from pathlib import Path
 
 import httpx
 
-from . import cycle, market_calendar, memory, options, settings_store, shorts, usage_store
+from . import cycle, macro, market_calendar, memory, options, settings_store, shorts, usage_store
 from .analyst import analyze
 from .market import Series, fetch_series, summarize
 from .news import fetch_context
@@ -125,6 +125,15 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
         track = memory.similar_setups(series.symbol, summary)
         if track:
             summary["track_record"] = track
+    except Exception:  # noqa: BLE001 — enrichment, never a blocker
+        pass
+    # Market-wide exogenous backdrop (NEWS-4). Read from the stored blob — no fetch, no model call
+    # here; the macro job owns refreshing it. Shared by every symbol in the scan, and omitted
+    # entirely when there is no usable read.
+    try:
+        mac = macro.compact(macro.load_state(), limit=3)
+        if mac:
+            summary["macro"] = mac
     except Exception:  # noqa: BLE001 — enrichment, never a blocker
         pass
     verdict, usage = await analyze(summary, deep=False)

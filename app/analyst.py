@@ -13,7 +13,8 @@ from enum import Enum
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel
 
-from . import llm_cli, settings_store
+# Aliased: `sandbox_decision` takes a parameter named `macro`, which would shadow a plain import.
+from . import llm_cli, macro as macro_store, settings_store
 
 log = logging.getLogger("uvicorn.error")
 
@@ -163,6 +164,16 @@ and momentum do not support. Mention it in at most ONE rationale bullet, and onl
 changes the read.
 - If the snapshot includes `recent_news` (headlines) or `next_earnings` (a date), use them to \
 populate `catalysts` and sharpen `key_risks` — but do NOT invent news beyond what is provided.
+- If the snapshot includes a `macro` block, that is the MARKET-WIDE backdrop (wars, sanctions, energy \
+and shipping disruption, central-bank moves, tariffs), graded from a news feed and shared by every \
+name — it is NOT specific to this asset. Use it in two narrow ways: (a) fold a genuinely relevant \
+catalyst into `key_risks`, and (b) let a high `risk_level` with severe risk_off catalysts pull \
+conviction DOWN a little on new buys. It carries the most weight when a catalyst's `affected` sectors \
+or `tickers` actually cover THIS name — a crude-oil shock reaches a refiner or an airline, and you \
+should say so; it does not reach an unrelated software company, and stretching it to fit is worse \
+than ignoring it. Never let the macro backdrop alone create a buy or sell call, and never let it \
+override what price and momentum say. If `stale` is true the read is old — weight it down. The \
+ABSENCE of a `macro` block means the backdrop is UNKNOWN, not calm: say nothing about news either way.
 - If the snapshot includes a `position` block, the user ALREADY HOLDS this asset (shares, average \
 cost, position value, unrealized gain %). Frame the verdict as an action ON THAT POSITION: read \
 "buy" as ADD, "sell" as TRIM / reduce, "hold" as keep-as-is, and say which in the thesis. Weigh the \
@@ -585,6 +596,142 @@ async def market_regime(snapshot: dict, *, deep: bool = False) -> tuple[MarketRe
 
 
 # ======================================================================================
+# Macro / geopolitical catalysts (NEWS) — grade market-wide headlines for what could actually move
+# the tape, so the price-derived signals aren't the only input when the world changes.
+# ======================================================================================
+
+class MacroCatalyst(BaseModel):
+    key: str             # stable kebab-case slug identifying the SITUATION, reused across days
+    title: str           # short label, headline-style
+    category: str        # geopolitics | monetary | fiscal | trade | energy | other
+    severity: int        # 0-100: how much this could move BROAD markets
+    direction: str       # risk_off | risk_on | mixed
+    horizon: str         # days | weeks | months
+    affected: list[str] = []   # sectors / regions / commodities, plain words
+    tickers: list[str] = []    # tickers with a REAL direct link; empty is correct when there isn't one
+    confidence: int      # 0-100 in the read itself
+    why: str             # one sentence grounded in the headlines
+
+
+class MacroRead(BaseModel):
+    risk_level: str          # low | elevated | high
+    headline: str = ""       # ONE short line — the backdrop in a glance
+    bullets: list[str] = []  # 3-5 short bullets; replaced a paragraph that read as a wall of text
+    catalysts: list[MacroCatalyst] = []
+
+
+MACRO_SYSTEM = """You read market-wide news and identify what could actually MOVE markets. You receive \
+a list of recent headlines (with source, date and summary) from a general financial wire feed — mostly \
+Reuters, CNBC and Bloomberg.
+
+Your job is TRIAGE, not summary. Most of the feed is routine company and market chatter that moves \
+nothing broad: single-stock earnings reactions, analyst calls, box-office numbers, deal gossip, "here's \
+a stock to buy" segments. Ignore all of it. You are looking ONLY for the exogenous events that change \
+the backdrop for a whole market, sector or commodity: shooting wars and military escalation, attacks on \
+shipping lanes or energy infrastructure, sanctions, central-bank decisions and inflation surprises, \
+tariffs and trade restrictions, sovereign or banking stress, major regulatory shifts, energy supply \
+shocks.
+
+Return a `MacroRead`:
+- risk_level: exactly one of "low", "elevated", or "high" — the overall exogenous-risk backdrop these \
+headlines describe. "high" means something is actively disrupting markets NOW, not that a bad thing \
+could conceivably happen.
+- headline: ONE short line, under 90 characters, that captures the backdrop at a glance (e.g. "Iran \
+war is repricing energy; oil +7%, Hormuz shipping disrupted"). No trailing period needed.
+- bullets: 3-5 SHORT bullets, each ONE line under 90 characters, covering the concrete facts that \
+matter — what happened, what moved, and what it hits. Lead each with the fact, not a preamble: \
+"Oil +7% after US strikes on Iranian targets", not "It is worth noting that oil has risen". No \
+markdown, no bullet characters, no sentences that run past the line. This is read on a phone.
+- catalysts: usually 0-5 distinct SITUATIONS, most market-moving first. An empty list is a perfectly \
+good answer on a quiet news day — do NOT manufacture a catalyst to fill the list.
+
+For each catalyst:
+- key: a stable kebab-case slug for the SITUATION, not the individual headline — "iran-war", \
+"red-sea-shipping", "fed-rate-path", "china-tariffs". You will be run repeatedly as a story develops, \
+and the same ongoing situation MUST get the same key every time so it is tracked as one thing rather \
+than re-counted daily. When you are given `existing_keys`, those are the situations already being \
+tracked: if a headline belongs to one of them, REUSE THAT EXACT KEY — do not invent a near-duplicate. \
+Coining "iran-war-widens" when "iran-war-escalation" is already tracked splits one war into two \
+entries and is a bug, not a nuance. Only mint a new key for a genuinely NEW situation.
+- title: a short label a person would recognise.
+- category: one of geopolitics, monetary, fiscal, trade, energy, other.
+- severity 0-100: how much this could move BROAD markets. Reserve 70+ for things that genuinely reprice \
+indices or a major commodity. A regional story with no market transmission is under 30 even if it is \
+serious news in human terms — you are grading market impact, not importance.
+- direction: "risk_off" (equities down / havens up), "risk_on", or "mixed" when it cuts both ways \
+(e.g. an oil shock lifts energy and hurts everything else).
+- horizon: days, weeks, or months — how long the market effect plausibly persists.
+- affected: the sectors, regions or commodities that actually transmit it (e.g. "crude oil", "European \
+equities", "airlines", "shipping", "defense"). Be specific and short.
+- tickers: ONLY tickers with a real, direct, mechanical link. An oil shock genuinely reaches XOM, CVX \
+and airline names; it does not reach a software company because sentiment is bad. Leave this EMPTY \
+rather than reaching — a spurious ticker link is worse than none, because downstream it attaches this \
+risk to a position for no reason. Use the CURRENT US-listed symbol and nothing else: no foreign \
+listings, no company names, no retired tickers (Shell is SHEL, not RDS.A or SHELL). If you are not \
+certain a symbol is exactly right and still trading, omit it.
+- confidence 0-100: how confident you are in the read given what the headlines actually say.
+- why: ONE short line under 110 characters, grounded in the headlines — the single most load-bearing \
+fact, not a list of every related item. "US strikes hit dozens of Iranian targets; oil +7%" is right; \
+a semicolon-chained inventory of six headlines is not.
+
+Ground everything in the supplied headlines. NEVER invent an event, a number, or a market reaction that \
+is not in the text. If the feed genuinely contains nothing market-moving, return risk_level "low", an \
+empty catalyst list, and say so in the summary. Plain text, no markdown."""
+
+
+async def macro_read(
+    articles: list[dict], *, existing: list[dict] | None = None, deep: bool = False,
+) -> tuple[MacroRead, dict]:
+    """Grade a batch of market-wide headlines into standing macro catalysts (NEWS-2).
+
+    Runs on the CHEAP scan model by default: this is triage over a headline list, which Haiku does
+    well, and it runs several times a day. Honors the api/cli provider toggle via _parse().
+
+    `existing` is the currently-tracked catalysts (key + title). Passing them is what keeps an ongoing
+    story as ONE entry: left to itself the model re-coins a near-identical slug on each run
+    ("iran-war-escalation" then "iran-war-widens"), and the merge then stacks the same war twice.
+    """
+    prompt = (
+        f"Recent market-wide headlines ({len(articles)} items, newest first):\n"
+        + json.dumps(articles, indent=2, default=str)
+    )
+    if existing:
+        prompt += (
+            "\n\nexisting_keys — situations already being tracked. Reuse the exact key for any "
+            "headline that belongs to one of these; mint a new key only for a genuinely new "
+            "situation:\n"
+            + json.dumps(existing, indent=2, default=str)
+        )
+    prompt += (
+        "\n\nReturn the MacroRead. Most of these headlines are noise — select only what moves markets."
+    )
+    read, usage = await _parse(MACRO_SYSTEM, prompt, MacroRead, deep=deep, max_tokens=3072)
+    read.risk_level = (read.risk_level or "").strip().lower() or "low"
+    # Models like to re-add the bullet glyph the prompt just asked them to omit, and occasionally
+    # ignore the length ceiling. Strip and cap here so the UI never has to defend against either.
+    # A RUNAWAY GUARD, not a formatter. The prompt asks for under 90 characters and the model lands
+    # around 95-110; capping at that boundary chopped ordinary bullets mid-thought ("BAE Systems
+    # raises…"), which reads worse than the extra few words. Leave headroom so normal output survives
+    # intact and only an actual paragraph gets cut.
+    read.headline = macro_store.one_line(read.headline, 140)
+    read.bullets = [b for b in (macro_store.one_line(x, 140) for x in read.bullets) if b][:5]
+    for c in read.catalysts:
+        c.severity = max(0, min(100, c.severity))
+        c.confidence = max(0, min(100, c.confidence))
+        c.key = (c.key or "").strip().lower()
+        # Format-filter the ticker links. The model reaches here — the first live run emitted "RDS.A"
+        # (retired 2022) and "SHELL" (never a US symbol) alongside the correct XOM/CVX. Downstream,
+        # macro.affected_symbols only matches against symbols the caller actually knows, so a wrong
+        # ticker is inert rather than a false claim on some stock's page.
+        c.tickers = macro_store.sanitize_tickers(c.tickers)
+        c.why = macro_store.one_line(c.why, 150)
+        c.title = macro_store.one_line(c.title, 70)
+    # A catalyst with no slug can't be tracked across runs, which is the whole point of the merge.
+    read.catalysts = [c for c in read.catalysts if c.key]
+    return read, usage
+
+
+# ======================================================================================
 # News → move correlation (AIE-4) — line the stock's notable recent daily moves up against dated
 # headlines and judge which move was news-driven and which happened on flows/technicals alone.
 # ======================================================================================
@@ -801,15 +948,21 @@ spot-bitcoin ETF like FBTC/IBIT are both bitcoin; SPY/VOO are the S&P). Judge we
 COMBINED exposure, act on ONE vehicle per group, and NEVER sell one to buy its equivalent. When a group \
 offers BOTH a spot-crypto ETF (IBIT/FBTC/FETH) and direct spot crypto (a "-USD" symbol), PREFER THE ETF \
 — direct spot carries wider spreads, trading fees and custody friction for the same exposure. Only use \
-direct spot if the ETF isn't in the candidate list.
+direct spot if the ETF isn't in the candidate list. When `settings.preferred_btc_etf` names a fund, \
+buy THAT one for bitcoin exposure: every spot-bitcoin ETF holds the same asset, so the choice is the \
+user's call about custody and fees, not an investment judgement for you to make. The server reroutes a \
+buy onto it regardless, so ordering a different one just makes the log harder to read.
 
 Return a `SandboxDecision`:
 - posture: ONE sentence — what today's plan does and why (e.g. "Trim extended NVDA, start a half-position \
 in a strong-RS healthcare name, hold the rest").
 - orders: a SMALL list (usually 0-4) of concrete orders. For each: symbol, side (buy|sell), an approximate \
 `dollars` notional and `shares` (whole for stocks, fractional for crypto — the server re-sizes to the \
-available cash, so approximate is fine), a 0-100 `conviction`, and a one-sentence `reason` grounded in \
-ITS numbers. For every BUY also give an ENTRY ZONE (`entry_low`/`entry_high`) — the price range actually \
+available cash, so approximate is fine), a 0-100 `conviction`, and a `reason` grounded in ITS numbers. \
+Keep the reason to ONE short sentence under 140 characters — it is read on a phone, in a list. Give \
+the one or two numbers that actually drove the decision, not an inventory of every metric you were \
+shown. "Golden cross, RSI 53, filling the 25% SP500 target" is right; a semicolon-chained recital of \
+six indicators is not. For every BUY also give an ENTRY ZONE (`entry_low`/`entry_high`) — the price range actually \
 worth paying, based on the name's own levels (e.g. near the 50-day MA, the base of the recent range, or \
 a modest premium to the last price for a strong trend). The server executes the buy ONLY if the market \
 sits at or below `entry_high`, otherwise it waits for another day — so set a zone you'd genuinely be \
@@ -859,6 +1012,42 @@ setup's measured excess is negative. It must never manufacture a buy on its own.
 watchlist the user chose — a strong-looking edge there can be regime luck, not skill, so it may adjust \
 conviction by a little and must never override the conviction floor, position caps, or the strategy note.
 
+A `long_term` block gives the MULTI-YEAR position of a name, and it exists because every other number \
+you get is a three-month-or-shorter momentum read. `price_vs_200w_sma_pct` and `below_line` say where \
+price sits against its 200-week average (the long-cycle floor for volatile assets); `zone` runs \
+extreme_value / deep_value / below_line / at_doorstep / getting_close / approaching / above; \
+`direction` says whether it is recovering or deepening; `mayer_multiple` under 1.0 means price is \
+below its 200-day average; `pct_off_10y_high` and `drawdown_z` say how deep the drawdown is against \
+the name's OWN history; `rsi_14w` is a 14-WEEK RSI (not the daily one in `technicals`).
+
+Read it as the VALUE side of the picture, deliberately in tension with the momentum numbers. The two \
+disagreeing is normal and is exactly the case this block exists for: a name that is weak on 3-month \
+relative strength BECAUSE it is deep in a long-cycle drawdown is the classic accumulation setup, not \
+automatically a broken thesis. So: do NOT sell a position on short-horizon relative weakness alone \
+when `zone` is below_line or better and `direction` is recovering — say what the long-term read is and \
+why you are overriding it if you still sell. Equally, a name far ABOVE its 200-week line with a \
+`mayer_multiple` well over 1 is extended in the long cycle, which argues for trimming into strength \
+rather than adding. This tilts sizing and timing; it is not a standalone trigger, and it never \
+overrides the cash floor, the exposure caps or the conviction floor. A name with too little weekly \
+history simply has no `long_term` block — infer nothing from its absence. If the block carries \
+`proxy_for`, it describes THAT symbol's long cycle rather than the fund's own — a spot-bitcoin ETF is \
+too young for a 200-week read, so its cycle position is measured on bitcoin itself. Treat it as the \
+fund's cycle position (it holds the asset) and say which you mean if you cite it.
+
+If a `macro` block is present it is the current exogenous backdrop — wars, sanctions, energy and \
+shipping disruption, central-bank moves, tariffs — graded from a market-wide news feed. Each catalyst \
+carries `severity` (0-100 broad-market impact), `direction` (risk_off / risk_on / mixed), `horizon`, \
+the `affected` sectors/regions/commodities, and any `tickers` with a genuinely direct link. Use it as \
+a RISK OVERLAY on sizing and selection, never as a trade trigger on its own: a high `risk_level` with \
+severe risk_off catalysts argues for smaller new positions, more cash and avoiding the named exposures; \
+a specific catalyst that names a sector or ticker you hold or are about to buy is a real reason to skip \
+it, size it down, or trim. Do NOT trade a headline directly, do NOT buy something because a catalyst \
+sounds bullish for it, and never let macro override the hard limits or the conviction floor. Say so in \
+the order's `reason` when a catalyst actually changed the decision, so the log shows why. If `stale` is \
+true the read is old — weight it down and don't treat it as today's news. The ABSENCE of a `macro` \
+block means the backdrop is UNKNOWN, not calm: carry on with the technicals and claim nothing about \
+news either way.
+
 Bias by `risk_tolerance` (conservative = more cash, defensives, broad diversification, smaller positions; \
 aggressive = more concentrated, higher-beta, fully invested) and by the GLIDEPATH: as `retirement_date` \
 or `exit_date` approaches, shift progressively toward cash/defensives; if past/at `exit_date`, sell \
@@ -870,7 +1059,7 @@ invent news or prices. Plain reasons, no markdown."""
 
 async def sandbox_decision(
     book: dict, candidates: list[dict], *, cash: float, settings: dict,
-    strategy_note: dict | None, deep: bool = False,
+    strategy_note: dict | None, macro: dict | None = None, deep: bool = False,
 ) -> tuple[SandboxDecision, dict]:
     """The daily sandbox decision (Haiku by default): a unified order list to steer the book toward the
     strategy within the risk limits. The server validates/clamps/fills afterward — this only proposes."""
@@ -883,6 +1072,10 @@ async def sandbox_decision(
         "settings": settings,
         "strategy_note": strategy_note,
     }
+    # Omitted entirely when there's no usable read — an empty macro block would assert a calm
+    # backdrop on exactly the days the news pipeline is broken.
+    if macro:
+        payload["macro"] = macro
     prompt = (
         "Make today's paper-trading decision for this account.\n"
         + json.dumps(payload, indent=2, default=str)
@@ -924,9 +1117,11 @@ target above the cap is simply unreachable and makes the daily tick fire blocked
 want more breadth than the cap allows in one vehicle, split across distinct exposure groups instead of \
 overweighting one. Group equivalent vehicles (BTC≡FBTC).
 - themes: 2-4 short things to lean into (sectors/factors), grounded in the sector rotation + relative \
-strength you see.
-- avoid: 1-3 short things to steer clear of.
-- notes: one short paragraph tying it together.
+strength you see. Each one a fragment, not a sentence — "Energy on Hormuz supply risk", not a clause.
+- avoid: 1-3 short things to steer clear of, same shape.
+- notes: 2-4 SHORT sentences tying it together, each under 120 characters. This is read on a phone: \
+lead with the decision and the reason, drop the preamble, and do not restate the numbers already in \
+`targets`. No markdown, no bullet characters.
 
 Bias by `risk_tolerance` and the GLIDEPATH toward `retirement_date`/`exit_date` (raise cash + defense as \
 they near); if `goal_amount`/`goal_date` are set, set the stance's aggressiveness by the pace needed to \
@@ -952,6 +1147,19 @@ right level to fix that, because the daily tick can only keep getting refused. R
 the PLAN (fewer or smaller positions, different names, a different cash target), and say in `notes` \
 which constraint is binding. Do NOT propose relaxing the user's limits: max_position_pct, \
 cash_floor_pct, exclusions and the turnover cap are their decisions, not yours to argue with.
+
+If a `macro` block is present it is the current exogenous backdrop — wars, sanctions, energy and \
+shipping disruption, central-bank decisions, tariffs — graded from a market-wide news feed, with a \
+`risk_level` and catalysts carrying severity, direction, horizon and the affected sectors/regions. \
+You are the RIGHT level to act on this: setting the week's stance and cash target is exactly the kind \
+of decision a changed backdrop should move, whereas the daily tick should only apply it to individual \
+names. A high risk_level with severe risk_off catalysts is a legitimate reason for a more defensive \
+stance and a higher cash target; a catalyst naming a sector should show up in `avoid`, and one that \
+genuinely favours a sector may show up in `themes`. Name the situation in `notes` when it moved your \
+stance, so the plan can be read back against what was actually happening. Do not over-rotate on a \
+single headline, and respect `horizon` — a days-long disruption is not a reason to restructure a book \
+with a multi-year runway. If `stale` is true the read is old; weight it down. The ABSENCE of a `macro` \
+block means the backdrop is UNKNOWN, not calm — do not infer quiet from silence.
 
 If `prior_strategy_notes` is present it is your own last few weekly reads, newest first. Use them \
 for CONTINUITY — if you are reversing a stance you took recently, say so and say what changed. \

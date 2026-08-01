@@ -42,6 +42,80 @@ def round_shares(symbol: str, shares: float) -> float:
     return round(shares, 6) if is_crypto(symbol) else float(int(shares))
 
 
+# Spot-bitcoin ETFs. Every one holds the same asset, so which you own is a question about custody,
+# liquidity and fees — the user's call, not the model's.
+BTC_ETFS = frozenset({"IBIT", "FBTC", "GBTC", "BITB", "ARKB", "BTCO", "HODL", "BRRR", "EZBC", "BTCW"})
+
+
+def prefer_btc_etf(
+    orders: list[dict], *, preferred: str, positions: list[dict],
+    price_of: Callable[[str], float | None],
+) -> tuple[list[dict], list[str]]:
+    """Redirect BUYs of a spot-bitcoin ETF onto the user's chosen vehicle.
+
+    Returns (orders, notes). Pure: `orders` is a new list, inputs are not mutated.
+
+    Four rules, each load-bearing:
+
+    * **BUYS ONLY.** A sell is never redirected — you can only sell what you actually hold, and
+      rewriting "sell IBIT" into "sell FBTC" would turn a valid exit into a "not held" skip.
+    * **Consolidate, don't fragment.** If the book already holds the ordered vehicle and NOT the
+      preferred one, leave it alone. Splitting one exposure across two funds to honour a preference
+      costs spread and leaves two positions where the cap logic expects one; the preference applies
+      to NEW exposure, and takes effect naturally once the old vehicle is closed.
+    * **Only to something fillable.** If the preferred ETF has no price this tick it cannot fill, so
+      the order is left as-is rather than converted into a guaranteed skip.
+    * **Say so.** Every substitution returns a note, which lands in the trade log — a silent symbol
+      rewrite would make the log disagree with what the model actually proposed.
+    """
+    pref = (preferred or "").strip().upper()
+    if not pref or pref not in BTC_ETFS:
+        return list(orders), []
+    held = {str(p.get("symbol", "")).upper() for p in positions if (p.get("shares") or 0) > 0}
+    out: list[dict] = []
+    notes: list[str] = []
+    for o in orders:
+        sym = str(o.get("symbol") or "").strip().upper()
+        side = str(o.get("side") or "").strip().lower()
+        if side != "buy" or sym not in BTC_ETFS or sym == pref:
+            out.append(o)
+            continue
+        if sym in held and pref not in held:
+            out.append(o)
+            continue
+        px = price_of(pref)
+        if not px or px <= 0:
+            out.append(o)
+            continue
+        # Everything below is share-price arithmetic, and it matters because the two funds hold the
+        # same asset at very different share prices (IBIT ~$36 vs FBTC ~$55).
+        #
+        # Size in DOLLARS, which is share-price independent. An order may carry `dollars`, or only a
+        # `shares` count — and a raw `shares` count carried across would buy ~1.5x the intended
+        # notional. So convert via the ORIGINAL fund's price and drop `shares`; without the convert,
+        # a shares-only order would arrive with neither field and be skipped outright.
+        dollars = float(o.get("dollars") or 0.0)
+        if dollars <= 0:
+            want_shares = float(o.get("shares") or 0.0)
+            src_px = price_of(sym) or 0.0
+            if want_shares > 0 and src_px > 0:
+                dollars = want_shares * src_px
+            else:
+                out.append(o)   # nothing sizeable to carry over — leave the order untouched
+                continue
+        # The entry zone was priced against the ORDERED fund's share price, so carrying it across
+        # would gate the new symbol against a band that has nothing to do with it — and with
+        # respect_entry_zones on, would block every substituted buy forever. Drop it.
+        sub = {k: v for k, v in o.items() if k not in ("entry_low", "entry_high", "shares")}
+        sub["symbol"] = pref
+        sub["dollars"] = round(dollars, 2)
+        reason = str(o.get("reason") or "").strip()
+        sub["reason"] = (reason + f" [routed {sym}→{pref}: preferred bitcoin ETF]").strip()
+        out.append(sub)
+        notes.append(f"{sym}→{pref} (preferred bitcoin ETF)")
+    return out, notes
+
+
 def tick_gate(blob: dict, *, now: dt.datetime | None = None, force: bool = False) -> tuple[bool, str]:
     """Whether the tick should place trades. Returns (proceed, status). `force` (a manual "run now")
     relaxes the intraday-phase check but still requires a real trading day and honours the day cursor
@@ -223,6 +297,15 @@ def validate_and_fill(
 
     def _side(o: dict) -> str:
         return str(o.get("side") or "").strip().lower()
+
+    # Route bitcoin-ETF buys onto the user's chosen vehicle before any gate runs, so the caps,
+    # conviction floor and turnover budget all see the symbol that will actually be bought. Skipped
+    # for a liquidation, which is only ever selling.
+    if not liquidation:
+        orders, _routed = prefer_btc_etf(
+            orders, preferred=str(s.get("preferred_btc_etf") or ""),
+            positions=positions, price_of=price_of,
+        )
 
     sells = [o for o in orders if _side(o) == "sell"]
     buys = [o for o in orders if _side(o) == "buy"]

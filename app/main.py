@@ -33,7 +33,8 @@ from .analyst import (
 from .discover import discover
 from .market import fetch_series, summarize
 from .news import fetch_context, fetch_dated_news
-from . import scan_job
+from . import macro, scan_job
+from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
 
 _http: httpx.AsyncClient | None = None
@@ -856,6 +857,14 @@ async def _build_signal(
         if track:
             summary["track_record"] = track
     except Exception:  # noqa: BLE001 — recall is enrichment, never a blocker
+        pass
+    # Market-wide exogenous backdrop (NEWS-4) — same read the sandbox and the nightly scan see, so a
+    # tap-through verdict and the overnight one reason from the same world.
+    try:
+        mac = macro.compact(macro.load_state(), limit=3)
+        if mac:
+            summary["macro"] = mac
+    except Exception:  # noqa: BLE001 — enrichment, never a blocker
         pass
     try:
         verdict, usage = await analyze(summary, deep=deep)
@@ -2133,7 +2142,9 @@ def _exposure_group(symbol: str) -> str:
     return _EXPOSURE_GROUP.get(base, base)
 
 
-async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dict:
+async def _build_portfolio_snapshot(
+    holdings: list[Holding], cash: float, *, include_trend: bool = False,
+) -> dict:
     """Price a set of holdings into the shared portfolio structure used by the review + rebalance
     endpoints: cash / cash_pct / total_value plus a `positions` list (price, shares, value, weight_pct,
     unrealized gain, key technicals) sorted by value, priced concurrently against one S&P fetch for
@@ -2181,6 +2192,16 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
                         "shares": h.shares, "avg_cost": h.avg_cost,
                         "value": round(basis, 2) if basis > 0 else None}
             price = summ["price"]
+            # The multi-year value lens on a HELD name — the only input a sell decision gets about
+            # where the position sits in its own long cycle. Opt-in (`include_trend`) so the sandbox
+            # gets it without silently changing /portfolio/review and /rebalance, which share this
+            # builder and would otherwise pick up a fetch and ~10 prompt fields per position.
+            long_term = None
+            if include_trend:
+                try:
+                    long_term = await _long_term_block(sym, series.closes)
+                except Exception:  # noqa: BLE001 — enrichment, never a blocker
+                    long_term = None
             return {
                 "symbol": sym.removesuffix("-USD"),
                 "exposure_group": _exposure_group(sym),
@@ -2189,6 +2210,7 @@ async def _build_portfolio_snapshot(holdings: list[Holding], cash: float) -> dic
                 "avg_cost": h.avg_cost,
                 "price": round(price, 4),
                 "value": round(price * h.shares, 2),
+                **({"long_term": long_term} if long_term else {}),
                 "unrealized_gain_pct": round((price / h.avg_cost - 1) * 100, 1) if h.avg_cost else None,
                 # Same key set as candidates (_SANDBOX_TECH_KEYS). It was a divergent hardcoded
                 # copy, so held positions — the only source for a SELL's setup — carried fewer
@@ -2514,6 +2536,28 @@ async def scan_run() -> dict:
 
 
 # ======================================================================================
+# Macro / geopolitical catalysts (NEWS) — the exogenous-risk layer. Everything else in this service
+# is derived from price or fundamentals, so a war or a rate decision was previously invisible to it.
+# ======================================================================================
+
+@app.get("/macro/catalysts")
+async def macro_catalysts() -> dict:
+    """The current macro read: risk level, standing catalysts, and how old the read is.
+
+    `available` is False when no read exists at all, and `degraded` is True when the last run failed
+    but an older read survives. Consumers MUST distinguish those from an empty catalyst list — "we
+    couldn't look" and "nothing is happening" are different claims and only one is ours to make.
+    """
+    return macro.load_state()
+
+
+@app.post("/macro/run")
+async def macro_run(force: bool = False) -> dict:
+    """Run the macro research pass now (also wired to a systemd timer a few times a day)."""
+    return await run_macro(force=force)
+
+
+# ======================================================================================
 # AI Sandbox — an autonomous paper-trading agent (fictional money only; never touches the real
 # Portfolio/watchlist). The systemd timer curls POST /sandbox/tick, so this single uvicorn worker is
 # the SOLE ledger writer; _sandbox_lock serializes the read-modify-write endpoints. The LLM only
@@ -2531,6 +2575,56 @@ _SANDBOX_CAND_SEM = asyncio.Semaphore(6)
 _SANDBOX_TECH_KEYS = ("rsi14", "macd_hist", "pct_vs_sma20", "pct_vs_sma50", "golden_cross",
                       "bollinger_pct_b", "stochastic_k",
                       "rel_strength_3mo_vs_benchmark", "pct_off_52w_high")
+
+# The multi-year value lens, projected down to what a trading decision can use.
+#
+# Every key in _SANDBOX_TECH_KEYS above is momentum with a lookback of three months or less, so the
+# sandbox could only ever see a name through a short window. Measured consequence: on 2026-07-30 it
+# sold IBIT citing "-17.64% 3-month relative strength" while bitcoin sat 1.2% BELOW its 200-week line
+# and 49% off its 10-year high — i.e. squarely in the accumulation zone this app's own value screener
+# is built around. It wasn't weighing value against momentum and choosing momentum; it had no value
+# input at all. This is that input.
+_SANDBOX_TREND_KEYS = ("price_vs_200w_sma_pct", "below_line", "zone", "direction", "rsi_14w",
+                       "weekly_oversold", "mayer_multiple", "pct_off_10y_high", "drawdown_z",
+                       "cagr_3y_pct")
+
+
+def _compact_trend(lt: dict | None) -> dict | None:
+    """The long-term block trimmed to the decision-relevant keys (the full one carries raw SMA levels
+    and history bookkeeping the model doesn't need and shouldn't pay tokens for)."""
+    if not lt:
+        return None
+    out = {k: lt[k] for k in _SANDBOX_TREND_KEYS if lt.get(k) is not None}
+    return out or None
+
+
+# A spot-crypto ETF's long-cycle position is its UNDERLYING's, not its own.
+#
+# The 200-week fields need ~200 weekly bars (≈3.85 years) and are omitted below that. The US spot
+# bitcoin ETFs launched in January 2024, so measured on the live feed IBIT and FBTC return only
+# mayer_multiple / pct_off_10y_high / drawdown_z — no `below_line`, no `zone`, precisely the fields
+# this wiring exists to supply. Worse, what they DO return is distorted: IBIT's drawdown_z reads
+# -2.01 against bitcoin's own -0.55, because the fund's short history contains little but the
+# drawdown, so its "own" distribution is not a meaningful baseline.
+#
+# So for these, measure the cycle on the coin (10+ years of history) and LABEL it — `proxy_for` says
+# the block describes the underlying, not the fund. Silently swapping would be worse than the gap.
+_TREND_PROXY = {"BTC": "BTC-USD", "ETH": "ETH-USD"}
+
+
+async def _long_term_block(sym: str, closes: list[float]) -> dict | None:
+    """The multi-year value lens for a symbol, via its underlying when it is a spot-crypto ETF."""
+    proxy = _TREND_PROXY.get(_exposure_group(sym))
+    if proxy and sym.upper() != proxy:
+        try:
+            ref = await fetch_series(_http, proxy)
+            lt = _compact_trend((await cycle.crypto_context(_http, proxy, ref.closes)).get("long_term_trend"))
+            if lt:
+                return {**lt, "proxy_for": proxy,
+                        "note": f"long-cycle position measured on {proxy}; this fund is too young for a 200-week read"}
+        except Exception:  # noqa: BLE001 — fall through to the fund's own (partial) numbers
+            pass
+    return _compact_trend((await cycle.crypto_context(_http, sym, closes)).get("long_term_trend"))
 
 
 async def _sandbox_candidate(sym: str, bench_closes, watch_set: set[str]) -> dict | None:
@@ -2552,6 +2646,15 @@ async def _sandbox_candidate(sym: str, bench_closes, watch_set: set[str]) -> dic
         g = gaps.compact(gaps.detect(series.closes, series.opens, series.volumes))
         if g:
             row["gap"] = g
+        # The multi-year value lens (200-week line, Mayer, drawdown-z). Cached 6h per symbol inside
+        # cycle.crypto_context, and best-effort — a name without enough weekly history simply has no
+        # long_term block rather than blocking the tick.
+        try:
+            lt = await _long_term_block(sym, series.closes)
+            if lt:
+                row["long_term"] = lt
+        except Exception:  # noqa: BLE001 — enrichment, never a blocker
+            pass
         # What this setup has actually done before, benchmark-relative. The sandbox commits capital on
         # these decisions, so it is the one caller with real consequences riding on the base rate.
         try:
@@ -2622,6 +2725,15 @@ async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
         prior = memory.recent_notes(kind="strategy", limit=4)
         if prior:
             context["prior_strategy_notes"] = [n["body"][:400] for n in prior]
+    except Exception:  # noqa: BLE001 — enrichment, never a blocker
+        pass
+    # The exogenous backdrop (NEWS-4). The weekly review is the right altitude for it: a changed
+    # world should move the STANCE and the cash target, while the daily tick only applies it to
+    # individual names. Omitted entirely when unavailable — see macro.compact.
+    try:
+        mac = macro.compact(macro.load_state(), limit=5)
+        if mac:
+            context["macro"] = mac
     except Exception:  # noqa: BLE001 — enrichment, never a blocker
         pass
     try:
@@ -2719,7 +2831,16 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                               if s.upper() not in exclude and s.upper().removesuffix("-USD") not in exclude]
         candidate_syms = candidate_syms[:24]
 
-        prices = await _sandbox_prices(held, candidate_syms)
+        # The preferred bitcoin ETF must always be priced, even when it didn't make the candidate
+        # cut — sandbox_job.prefer_btc_etf can only route a buy onto something it can fill, so
+        # without a price the preference silently does nothing.
+        pref_etf = str(settings.get("preferred_btc_etf") or "").strip().upper()
+        price_syms = list(candidate_syms)
+        if (pref_etf in sandbox_job.BTC_ETFS and settings.get("allow_crypto_etf", True)
+                and pref_etf not in price_syms and pref_etf not in held):
+            price_syms.append(pref_etf)
+
+        prices = await _sandbox_prices(held, price_syms)
         def price_of(sym: str):
             return prices.get(sym.upper())
         spy_price = prices.get("^GSPC")
@@ -2742,7 +2863,8 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                         for p in blob["positions"]]
             if holdings:
                 try:
-                    book = await _build_portfolio_snapshot(holdings, blob["cash"])
+                    book = await _build_portfolio_snapshot(
+                        holdings, blob["cash"], include_trend=True)
                 except Exception as e:  # noqa: BLE001
                     # NEVER claim 100% cash while the ledger holds shares. That substitution told the
                     # weekly strategy review the account was entirely in cash — and that note then
@@ -2769,10 +2891,16 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
             candidates = [c for c in await asyncio.gather(
                 *[_sandbox_candidate(s, bench_closes, watch_set) for s in candidate_syms]) if c]
             source = "haiku_tick"
+            # Exogenous risk overlay (NEWS-4). None when there is no usable read, which the prompt
+            # is told to treat as "backdrop unknown" rather than "backdrop clear".
+            try:
+                macro_block = macro.compact(macro.load_state())
+            except Exception:  # noqa: BLE001 — enrichment, never a blocker
+                macro_block = None
             try:
                 decision, usage = await sandbox_decision(
                     book, candidates, cash=blob["cash"], settings=settings,
-                    strategy_note=blob.get("last_strategy_note"), deep=False)
+                    strategy_note=blob.get("last_strategy_note"), macro=macro_block, deep=False)
                 usage_store.record(usage, symbol="SANDBOX", kind="sandbox_tick")
                 orders = [o.model_dump() for o in decision.orders]
                 posture = decision.posture
@@ -2897,6 +3025,7 @@ class SandboxSettingsPatch(BaseModel):
     cash_floor_pct: float | None = None
     allow_crypto: bool | None = None
     allow_crypto_etf: bool | None = None
+    preferred_btc_etf: str | None = None
     allow_etf: bool | None = None
     exclusions: list[str] | None = None
     cadence: str | None = None
@@ -2988,6 +3117,17 @@ async def sandbox_set_settings_endpoint(patch: SandboxSettingsPatch) -> dict:
                 s[k] = d[k] or None
         if "account_type" in d and str(d["account_type"]).lower() in ("cash", "margin"):
             s["account_type"] = str(d["account_type"]).lower()
+        if "preferred_btc_etf" in d:
+            # Validated against the known spot-bitcoin ETFs, so a typo can't silently disable the
+            # preference (prefer_btc_etf ignores an unrecognised value). Empty string = no preference.
+            v = str(d["preferred_btc_etf"] or "").strip().upper()
+            if not v or v in sandbox_job.BTC_ETFS:
+                s["preferred_btc_etf"] = v
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"unknown bitcoin ETF {v!r} — expected one of "
+                           f"{', '.join(sorted(sandbox_job.BTC_ETFS))} (or empty for no preference)")
         for k in ("current_age", "retirement_age"):
             if k in d:
                 v = d[k]

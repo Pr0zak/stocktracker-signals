@@ -49,6 +49,11 @@ DEFAULT_SETTINGS = {
     # carries higher trading spreads/fees and custody friction. So ETFs are on, direct spot is off.
     "allow_crypto": False,       # direct spot crypto (BTC-USD, ETH-USD)
     "allow_crypto_etf": True,    # spot-crypto ETFs (IBIT, FBTC, FETH, …)
+    # Which spot-BITCOIN ETF to use when it wants bitcoin exposure. Every vehicle in the BTC exposure
+    # group holds the same asset, so the choice is about custody, liquidity and fees rather than
+    # exposure — the user's call, not the model's. Enforced on BUYS server-side (see
+    # sandbox_job.prefer_btc_etf); sells are never redirected, since you can only sell what you hold.
+    "preferred_btc_etf": "FBTC",
     "allow_etf": True,
     "slippage_bps": 5,                 # modeled fill slippage (buys up, sells down)
     "max_trades_per_tick": 4,
