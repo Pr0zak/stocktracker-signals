@@ -112,10 +112,16 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
                 squeeze = sp["state"]
         except Exception:  # noqa: BLE001
             pass
-        try:  # 200-week-line state for cross-below alerts — a neutral event flag, NOT fed to the analyst
+        try:
             lt = (await cycle.crypto_context(client, series.symbol, series.closes)).get("long_term_trend")
             below_200wma = lt.get("below_line") if lt else None
             weekly_oversold = lt.get("weekly_oversold") if lt else None
+            # Also hand it to the analyst. It was computed here and deliberately withheld ("a neutral
+            # event flag, NOT fed to the analyst"), used only to drive the cross-below alert — so the
+            # nightly verdict on a stock was momentum-only while the crypto verdicts beside it got a
+            # multi-year read. The fetch already happened; withholding it bought nothing.
+            if lt:
+                summary["long_term_trend"] = lt
         except Exception:  # noqa: BLE001
             pass
     # The scan sees the same setup every trading day across the whole watchlist, which makes it by

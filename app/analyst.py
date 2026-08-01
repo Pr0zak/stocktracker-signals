@@ -135,12 +135,21 @@ Treat a strong/weak current month as MILD confirming or cautioning context — e
 month with a 30% hit rate is a small reason to be patient — never as a standalone timing signal, and it \
 must never override what price and momentum are doing right now. Mention it in at most one rationale \
 bullet if the current month is notably strong or weak; otherwise ignore it. Always respect the small sample.
-- Crypto snapshots may include `long_term_trend` (price vs 200-week SMA, Mayer Multiple, distance \
-from ATH, 3y CAGR) and, for BTC, `btc_halving_cycle` (cycle position, phase, and a past-cycle \
-analog of 12-month-forward returns from this position). Use them to frame the MULTI-YEAR regime — \
-price above a rising 200-week SMA is a structurally healthier base than below it — but respect the \
-attached sample-size note: four halvings is anecdote-grade evidence. Never let cycle folklore \
-override what current price and momentum are actually doing.
+- Most snapshots include `long_term_trend` — the MULTI-YEAR position, for stocks as well as crypto: \
+price vs the 200-week SMA (`price_vs_200w_sma_pct`, `below_line`, `zone`, `direction`), a 14-WEEK RSI \
+(`rsi_14w`, distinct from the daily `rsi14`), `mayer_multiple` (price / 200-day SMA; under 1.0 = \
+below it), `pct_off_10y_high`, `drawdown_z` (how unusual today's drawdown is against this name's OWN \
+history) and `cagr_3y_pct`. Read it as the VALUE side, deliberately in tension with the momentum \
+numbers above. The two disagreeing is the useful case, not a contradiction to resolve: a name weak on \
+3-month relative strength BECAUSE it sits deep in a long-cycle drawdown is a different situation from \
+one weak at the top of its range, and the verdict should say which. Below the 200-week line with \
+`direction` recovering is the classic accumulation zone; far above it with a Mayer well over 1 is \
+extended, which argues for patience rather than chasing. It refines conviction and framing — it never \
+manufactures a call that price and momentum do not support. A name with too little weekly history has \
+no block at all; infer nothing from its absence.
+- For BTC, `btc_halving_cycle` adds the cycle position, phase, and a past-cycle analog of \
+12-month-forward returns from this position. Respect the attached sample-size note: four halvings is \
+anecdote-grade evidence. Never let cycle folklore override what current price and momentum are doing.
 - If the snapshot includes `track_record`, that is measured history for setups whose NUMBERS closely \
 match the one in front of you now, scored against what the price actually did over the following 20 \
 trading days. `this_symbol` is this same ticker; `analogues` is the same pattern across other names. \
@@ -808,6 +817,19 @@ Positions that share an `exposure_group` are the SAME underlying economic exposu
 bitcoin ETF like FBTC/IBIT are both just bitcoin; SPY and VOO are both the S&P 500). Their technicals \
 will look nearly identical — do NOT treat them as independent bets.
 
+A holding may carry a `long_term` block — its MULTI-YEAR position, which every other number here is \
+too short-dated to show: price vs the 200-week SMA (`price_vs_200w_sma_pct`, `below_line`, `zone`, \
+`direction`), a 14-week RSI, `mayer_multiple` (under 1.0 = below the 200-day), `pct_off_10y_high`, \
+`drawdown_z` (how unusual today's drawdown is against the name's OWN history) and `cagr_3y_pct`. Use \
+it as the VALUE counterweight to the momentum fields, especially on TRIM calls: a holding that is weak \
+on 3-month relative strength BECAUSE it is deep in a long-cycle drawdown is a different case from one \
+rolling over at the top of its range, and a review that cannot tell them apart will recommend selling \
+the bottom. Say which situation you think it is. Conversely a position far above its 200-week line \
+with a Mayer well over 1 is extended, which strengthens a trim-into-strength case. If the block \
+carries `proxy_for`, its cycle was measured on that symbol (a spot-crypto ETF is too young for a \
+200-week read, so bitcoin's own cycle is used) — treat it as the holding's cycle position and say \
+which you mean. A holding with too little weekly history has no block; infer nothing from its absence.
+
 Return a structured review:
 - health: ONE sentence on the book's overall posture (diversified vs concentrated, momentum tilt, cash level).
 - concentration: flag genuine risks — any single exposure over ~20-25% of the book (SUM the weights of an \
@@ -873,6 +895,17 @@ Positions sharing an `exposure_group` are the SAME underlying exposure (e.g. BTC
 like FBTC/IBIT; SPY and VOO). Judge the max-weight target against the COMBINED weight of a group, act on \
 ONE vehicle per group (prefer the more-liquid / lower-cost one), give the group a consistent direction, \
 and NEVER sell one vehicle to buy its equivalent — that's a wash that just churns fees.
+
+A holding may carry a `long_term` block — its MULTI-YEAR position (price vs the 200-week SMA with \
+`below_line` / `zone` / `direction`, a 14-week RSI, `mayer_multiple`, `pct_off_10y_high`, `drawdown_z`, \
+`cagr_3y_pct`), which nothing else here is long-dated enough to show. It should influence WHICH end of \
+an over-weight position you trim and where you put the cash: trimming a name that is below its \
+200-week line and recovering is selling into the accumulation zone, whereas one extended far above it \
+with a Mayer over 1 is the natural source of funds. Say so in the rationale when it changed the pick. \
+It does not override the max-weight target — a cap breach still has to be cut — but it should decide \
+the ORDER and the SIZE of the cuts. If the block carries `proxy_for`, its cycle was measured on that \
+symbol (a spot-crypto ETF is too young for a 200-week read). No block means too little weekly history; \
+infer nothing from that.
 
 Produce a plan that ONLY trades the EXISTING holdings + deploys the idle cash (do NOT introduce new \
 tickers — that's a different tool):

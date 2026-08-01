@@ -788,8 +788,16 @@ async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | No
             bench_closes = None
 
     summary = summarize(series, None if crypto else bench_closes)
-    if crypto:  # multi-year trend + (BTC) halving-cycle position — weak-sample context, flagged as such
+    # Multi-year trend for EVERY asset (plus, for BTC, the halving-cycle position — weak-sample
+    # context, flagged as such). This used to be crypto-only, which left an asymmetry with no
+    # justification behind it: a stock's position against its own 200-week line is exactly as real as
+    # bitcoin's, and its absence meant the per-symbol verdict and the entry plan could only ever see
+    # a name through a ≤3-month window. `crypto_context` is asset-agnostic despite the name — it is
+    # what already powers the equity /trend endpoint. Cached 6h per symbol; best-effort.
+    try:
         summary.update(await cycle.crypto_context(_http, series.symbol, series.closes))
+    except Exception:  # noqa: BLE001 — long-term context is enrichment, never a blocker
+        pass
     if not crypto:  # optional news/earnings context (Finnhub, stocks only)
         summary.update(await fetch_context(_http, series.symbol))
         # Short-pressure context (FINRA SI + daily short volume + SEC FTDs) — best-effort; the
@@ -2314,7 +2322,9 @@ async def portfolio_review_endpoint(req: PortfolioReviewRequest) -> dict:
         # moment of the original call, and a plan up to the full TTL old read as current.
         return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
 
-    portfolio = await _build_portfolio_snapshot(req.holdings, req.cash)
+    # Same multi-year value lens the sandbox gets — a whole-book review and a rebalance are
+    # decisions about where a name sits in its cycle at least as much as its last three months.
+    portfolio = await _build_portfolio_snapshot(req.holdings, req.cash, include_trend=True)
     try:
         review, usage = await review_portfolio(portfolio, cash=req.cash, deep=req.deep)
     except Exception as e:  # noqa: BLE001
@@ -2366,7 +2376,9 @@ async def portfolio_rebalance_endpoint(req: RebalanceRequest) -> dict:
         # moment of the original call, and a plan up to the full TTL old read as current.
         return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
 
-    portfolio = await _build_portfolio_snapshot(req.holdings, req.cash)
+    # Same multi-year value lens the sandbox gets — a whole-book review and a rebalance are
+    # decisions about where a name sits in its cycle at least as much as its last three months.
+    portfolio = await _build_portfolio_snapshot(req.holdings, req.cash, include_trend=True)
     try:
         plan, usage = await rebalance_portfolio(portfolio, max_position_pct=mpp, deep=req.deep)
     except Exception as e:  # noqa: BLE001
