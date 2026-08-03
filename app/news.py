@@ -6,6 +6,7 @@ headlines and the next earnings date to a stock's snapshot so Claude can ground 
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from zoneinfo import ZoneInfo
 
 _ET = ZoneInfo("America/New_York")
@@ -13,6 +14,8 @@ _ET = ZoneInfo("America/New_York")
 import httpx
 
 from . import settings_store
+
+log = logging.getLogger("signals.news")
 
 _BASE = "https://finnhub.io/api/v1"
 
@@ -37,8 +40,10 @@ async def fetch_context(client: httpx.AsyncClient, symbol: str) -> dict:
             heads = [n.get("headline", "").strip() for n in news if n.get("headline")]
             if heads:
                 out["recent_news"] = heads[:5]
-    except Exception:  # noqa: BLE001 — decorative context; never fail the verdict on it
-        pass
+    except Exception as e:  # noqa: BLE001 — decorative context; never fail the verdict on it
+        # Still logged. A verdict silently written without the news that explains the move looks
+        # identical to one written on a genuinely quiet tape.
+        log.warning("news: %s headline context failed (%s: %s)", symbol, type(e).__name__, e)
 
     try:  # next scheduled earnings date within ~90 days
         r = await client.get(
@@ -51,19 +56,33 @@ async def fetch_context(client: httpx.AsyncClient, symbol: str) -> dict:
         cal = r.json().get("earningsCalendar") or []
         if cal:
             out["next_earnings"] = min(cal, key=lambda e: e.get("date", "9999")).get("date")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        log.warning("news: %s earnings-calendar lookup failed (%s: %s)", symbol, type(e).__name__, e)
 
     return out
 
 
-async def fetch_dated_news(client: httpx.AsyncClient, symbol: str, days: int = 16) -> list[dict]:
+async def fetch_dated_news(client: httpx.AsyncClient, symbol: str, days: int = 16) -> list[dict] | None:
     """Company news over the last [days], each carrying its ET date so the analyst can line headlines
     up against specific price moves (AIE-4). Returns [{date: YYYY-MM-DD, headline, summary, source, url}]
-    newest-first. Empty when no Finnhub key, on any failure, or for a symbol with no coverage."""
+    newest-first.
+
+    Returns **None when the LOOKUP FAILED** (no key, HTTP error, rate limit, timeout) and **[] only
+    when the fetch succeeded and the symbol genuinely has no coverage**. Callers must not conflate
+    them.
+
+    That distinction is the whole point of this signature. It used to return [] on every failure,
+    silently and without a log line — so on 2026-08-03 GME fell 10.4% on a $1.4B convertible-notes
+    dilution, the app asked why, one lookup came back empty, and /news_moves rendered "No headlines
+    available for this day" and CACHED that confident claim for an hour. Finnhub had 26 articles
+    including "Why GameStop Stock Just Slumped". Because nothing was logged, it is still not
+    recoverable whether that lookup was rate-limited by the ~10-call burst the app fires when a
+    symbol is opened, or whether Finnhub had simply not indexed yet.
+    """
     key = settings_store.get().get("finnhub_api_key", "")
     if not key:
-        return []
+        log.warning("news: no Finnhub key configured — %s lookup skipped", symbol)
+        return None
     today = dt.date.today()
     try:
         r = await client.get(
@@ -74,10 +93,15 @@ async def fetch_dated_news(client: httpx.AsyncClient, symbol: str, days: int = 1
         )
         r.raise_for_status()
         raw = r.json()
-    except Exception:  # noqa: BLE001
-        return []
+    except Exception as e:  # noqa: BLE001
+        # LOUD on purpose. A rate limit and "this company made no news" are the same empty list to
+        # every caller downstream; the log is the only place they stay distinguishable.
+        log.warning("news: %s lookup FAILED (%s: %s) — this is not 'no news'",
+                    symbol, type(e).__name__, e)
+        return None
     if not isinstance(raw, list):
-        return []
+        log.warning("news: %s returned a non-list payload (%s)", symbol, type(raw).__name__)
+        return None
     out: list[dict] = []
     for n in raw:
         head = (n.get("headline") or "").strip()

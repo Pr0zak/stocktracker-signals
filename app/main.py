@@ -40,6 +40,11 @@ from .scan_job import LATEST, run_scan
 _http: httpx.AsyncClient | None = None
 _cache: dict[tuple, tuple[float, dict]] = {}
 _MARKET_NOW_TTL = 180  # market-now overview cached ~3 min so repeated taps don't re-run the model
+# A FAILED news lookup is parked in the 1h cache with its timestamp back-dated by this much, so it
+# expires after ~60s. It still needs to be cached briefly — otherwise a symbol whose news source is
+# down re-hammers it on every poll — but freezing "we couldn't look" for a full hour turns a blip
+# into an hour of confidently wrong "no news".
+_NEWS_FAIL_TTL_OFFSET = 3600 - 60
 _DAILY_BRIEF_TTL = 1800  # morning brief cached ~30 min — the app fires it once/day; this just guards retries
 _log = logging.getLogger(__name__)
 
@@ -1642,8 +1647,24 @@ async def news_moves_endpoint(symbol: str, deep: bool = False, refresh: bool = F
         return payload
 
     news = await fetch_dated_news(_http, sym)
+    if news is None:
+        # The LOOKUP FAILED — we do not know whether there was news. Say exactly that, and do NOT
+        # cache it for the usual hour: a transient Finnhub error (a rate limit from the ~10-call
+        # burst the app fires when a symbol is opened, or indexing lag) would otherwise be frozen
+        # into a confident "no news" for the next 60 minutes. Measured on GME 2026-08-03: it fell
+        # 10.4% on a $1.4B convertible-notes dilution, Finnhub had 26 articles including "Why
+        # GameStop Stock Just Slumped", and the app said there were none.
+        payload = {"symbol": sym, "news_moves": {
+            "summary": "Couldn't load the news for these moves — this is a data-source problem, "
+                       "not a sign that nothing happened.",
+            "drivers": [{"date": m["date"], "move_pct": m["move_pct"], "headline": None,
+                         "explanation": "News lookup failed — unknown, not absent."} for m in moves],
+        }, "model": "", "as_of": now, "cached": False, "news_unavailable": True}
+        _cache[key] = (now - _NEWS_FAIL_TTL_OFFSET, payload)  # expires in ~60s, not an hour
+        return payload
     if not news:
-        # Moves but no news coverage to correlate — report the moves honestly without spending an LLM call.
+        # Fetch SUCCEEDED and the symbol genuinely has no coverage in the window. This one is a real
+        # claim, so it is safe to make and safe to cache.
         payload = {"symbol": sym, "news_moves": {
             "summary": "Notable moves, but no news coverage was available to correlate them.",
             "drivers": [{"date": m["date"], "move_pct": m["move_pct"], "headline": None,
