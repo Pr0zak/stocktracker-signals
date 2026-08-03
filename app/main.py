@@ -2898,6 +2898,11 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 try:
                     book = await _build_portfolio_snapshot(
                         holdings, blob["cash"], include_trend=True)
+                    # Holding period per position, so a trim can weigh short- vs long-term capital
+                    # gains. Skipped entirely in a tax-advantaged account, where it is noise.
+                    if settings.get("taxable_account", True):
+                        sandbox_job.annotate_holding_period(
+                            book.get("positions", []), blob["positions"])
                 except Exception as e:  # noqa: BLE001
                     # NEVER claim 100% cash while the ledger holds shares. That substitution told the
                     # weekly strategy review the account was entirely in cash — and that note then

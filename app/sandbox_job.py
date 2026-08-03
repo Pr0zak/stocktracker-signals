@@ -116,6 +116,42 @@ def prefer_btc_etf(
     return out, notes
 
 
+# US long-term capital-gains treatment starts at MORE THAN one year of holding.
+_LONG_TERM_DAYS = 366
+
+
+def annotate_holding_period(
+    book_positions: list[dict], ledger_positions: list[dict], *, now_ts: float | None = None,
+) -> None:
+    """Add holding period + capital-gains status to the book rows the analyst sees, in place.
+
+    `_build_portfolio_snapshot` prices a `Holding(symbol, shares, avg_cost)`, which drops `opened_at`
+    — so the decision model could see a 19% gain on a position and had no way to know it was four days
+    old. Selling that is an ordinary-income short-term gain; the same sale a year later is taxed at
+    the long-term rate. That difference is large enough to be worth weighing, and it was simply not
+    in front of the model.
+
+    Deliberately informational, not a gate: `sandbox_job` blocks things that endanger the ACCOUNT
+    (cash conservation, caps, shares held). Tax efficiency is a preference to weigh against the
+    reason for selling, so it belongs in the prompt, not in the validator.
+    """
+    now_ts = now_ts or time.time()
+    by_sym = {str(p.get("symbol", "")).upper(): p for p in ledger_positions}
+    for row in book_positions:
+        led = by_sym.get(str(row.get("symbol", "")).upper())
+        # `last_add_at`, not `opened_at`: adding to a position starts a fresh holding period for the
+        # NEW shares (each tax lot is clocked separately). Using the older date would overstate how
+        # much of the position already qualifies for long-term treatment.
+        started = (led or {}).get("last_add_at") or (led or {}).get("opened_at")
+        if not isinstance(started, (int, float)):
+            continue
+        days = int((now_ts - float(started)) // 86_400)
+        row["holding_days"] = days
+        row["capital_gains"] = "long_term" if days >= _LONG_TERM_DAYS else "short_term"
+        if days < _LONG_TERM_DAYS:
+            row["days_to_long_term"] = _LONG_TERM_DAYS - days
+
+
 def tick_gate(blob: dict, *, now: dt.datetime | None = None, force: bool = False) -> tuple[bool, str]:
     """Whether the tick should place trades. Returns (proceed, status). `force` (a manual "run now")
     relaxes the intraday-phase check but still requires a real trading day and honours the day cursor
@@ -451,14 +487,32 @@ def validate_and_fill(
             # Name the constraint that actually bound. "cash/cap/turnover" covered three unrelated
             # causes, so the blocked-trade log could not answer the one question it exists for —
             # and a T+1 hold looked identical to simply being out of money.
-            if is_cash_account and unsettled_total > 0.01 and spend >= available - 0.01:
+            #
+            # `spend` is a min() of four terms, so the binding one is whichever term it EQUALS. The
+            # order-size case has to be tested FIRST and explicitly: when the model simply asked for
+            # less than one share, none of the limit branches match and the old `else` blamed the
+            # cash floor regardless. Measured 2026-08-03 — a VTI buy was logged as "cash floor left
+            # room for less than one share" while cash held $5,000 of headroom against a $534 floor,
+            # thirteen shares' worth. Blocked reasons feed the weekly strategy review, so a wrong one
+            # teaches the strategist that the wrong constraint is binding and it re-plans around a
+            # limit that was never in the way.
+            if want_dollars <= spend + 0.01 and want_dollars < fill:
+                why = (f"order was for ${want_dollars:,.0f}, under one share at ${fill:,.2f} "
+                       f"— no limit was binding")
+            elif is_cash_account and unsettled_total > 0.01 and spend >= available - 0.01:
                 why = (f"unsettled proceeds (T+1) — ${unsettled_total:,.0f} frees up next session")
             elif spend >= cap_room - 0.01:
                 why = f"exposure '{g}' cap left room for less than one share"
             elif spend >= room - 0.01:
                 why = f"turnover cap ({turnover_pct:.0f}% of equity) left room for less than one share"
+            elif spend >= available - 0.01:
+                why = (f"cash floor ({cash_floor_pct:.0f}% of equity) left "
+                       f"${available:,.0f} — under one share at ${fill:,.2f}")
             else:
-                why = "cash floor left room for less than one share"
+                # Every named limit exceeded `spend` — so none of them bound and the shortfall is
+                # something this branch does not model. Say that rather than picking a scapegoat.
+                why = (f"sized to ${spend:,.0f}, under one share at ${fill:,.2f} "
+                       f"— no single limit was binding")
             _skip(o, why); continue
         cost = shares * fill
         traded_notional += cost

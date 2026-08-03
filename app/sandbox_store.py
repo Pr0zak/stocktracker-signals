@@ -74,6 +74,12 @@ DEFAULT_SETTINGS = {
     #  margin = proceeds usable immediately, but the FINRA PDT rule applies under $25k equity
     "account_type": "cash",
     "avoid_wash_sales": True,          # don't rebuy a name sold at a loss within 30 days (IRS §1091)
+    # Whether gains are taxed. In a TAXABLE account a sale under one year is a short-term gain taxed
+    # at ordinary-income rates rather than the long-term rate, which is a real cost of trimming a
+    # young winner — so the decision model is shown each position's holding period and told to weigh
+    # it. Set False for an IRA/401k, where holding period is irrelevant and the model should ignore
+    # it entirely rather than "protecting" a gain that is never taxed.
+    "taxable_account": True,
     # Automation
     "cadence": "daily",                # "daily" | "weekly" — how often it DECIDES (NAV still marks daily)
     # Whether the tick may trade during the 16:00-20:00 ET after-hours window. OFF by default: extended
