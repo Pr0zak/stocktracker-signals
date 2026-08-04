@@ -2709,7 +2709,11 @@ async def _sandbox_prices(held: list[str], candidate_syms: list[str]) -> dict[st
     except Exception:  # noqa: BLE001
         quotes = {}
     for s in syms:
-        prices[s] = (quotes.get(s) or {}).get("price")
+        # The price for the CURRENT session, not the 4pm close. With allow_after_hours enabled a tick
+        # in the 16:00-20:00 window used to fill against regularMarketPrice, which is frozen at the
+        # close — so an order would book at a price that was never available. On BLZE (2026-08-03)
+        # that gap was 17%, and the ledger would have recorded the difference as a real gain.
+        prices[s] = market_now.session_price(quotes.get(s) or {})
     for s in held:
         if not prices.get(s):
             try:

@@ -88,10 +88,36 @@ async def fetch_quotes(client: httpx.AsyncClient, symbols: list[str]) -> dict[st
             "pct": _num(q.get("regularMarketChangePercent")),
             "pre_pct": _num(q.get("preMarketChangePercent")),
             "post_pct": _num(q.get("postMarketChangePercent")),
+            # The extended-hours PRICES, not just the percentages. Needed so a fill placed during an
+            # extended session is priced at what the stock is actually trading at — see session_price.
+            "pre_price": _num(q.get("preMarketPrice")),
+            "post_price": _num(q.get("postMarketPrice")),
             "state": q.get("marketState"),
             "name": q.get("shortName") or sym,
         }
     return out
+
+
+def session_price(row: dict) -> float | None:
+    """The price a trade would ACTUALLY execute at right now, given the session.
+
+    During an extended session `regularMarketPrice` is frozen at the 4pm close, so using it to fill an
+    after-hours order books a trade at a price nobody could have got. Measured 2026-08-03: BLZE closed
+    at 15.59 and traded at 18.25 after hours — a 17% gap that would have been recorded as a fill at
+    the close, i.e. a large paper gain the ledger invented.
+
+    Falls back to the regular price whenever an extended quote is missing, which is the common case
+    (most names have no pre/post print) and is correct there — a symbol that is not trading after
+    hours has no extended price to use.
+    """
+    state = (row.get("state") or "").upper()
+    if state == "PRE":
+        return row.get("pre_price") or row.get("price")
+    # POST is the live 16:00-20:00 session; POSTPOST is after it closed, where the last extended
+    # print is still the most recent real trade and a better mark than the 4pm close.
+    if state in ("POST", "POSTPOST"):
+        return row.get("post_price") or row.get("price")
+    return row.get("price")
 
 
 def _sess_pct(row: dict, phase: str) -> float | None:
