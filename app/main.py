@@ -2744,6 +2744,28 @@ async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
             "realized_pl_total": blob.get("realized_pl_total"),
         },
     }
+    # What the idle cash actually cost, in dollars, against the benchmark the account is measured on.
+    # The stance discussion is otherwise abstract: "22% cash feels prudent" reads very differently
+    # next to "the cash you held lost $193 while the picks made $6".
+    try:
+        funded = float(blob.get("funded_total") or 0.0)
+        cash = float(blob.get("cash") or 0.0)
+        equity = float(book.get("total_value") or 0.0)
+        bench = float((blob.get("benchmark") or {}).get("shares") or 0.0) * (
+            (await _sandbox_prices([], []))["^GSPC"] or 0.0)
+        if funded > 0 and bench > 0 and equity > 0:
+            bench_ret = bench / funded - 1.0
+            context["cash_drag"] = {
+                "cash_pct": round(cash / equity * 100, 1),
+                "benchmark_return_pct": round(bench_ret * 100, 2),
+                "shortfall_usd": round(bench - equity, 2),
+                "idle_cash_opportunity_cost_usd": round(cash * bench_ret, 2),
+                "note": "opportunity cost is the cash balance times the benchmark's return since "
+                        "inception — when it accounts for most of the shortfall, the picks are not "
+                        "the problem and a lower cash target is the lever",
+            }
+    except Exception:  # noqa: BLE001 — enrichment, never a blocker
+        pass
     # The weekly review is the right altitude to react to "the way I've been picking isn't working" —
     # the daily tick is too close to the trade to reconsider its own method.
     try:
@@ -2762,6 +2784,11 @@ async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
         prior = memory.recent_notes(kind="strategy", limit=4)
         if prior:
             context["prior_strategy_notes"] = [n["body"][:400] for n in prior]
+        # Your own last plans that did not add up. Without this the strategist repeats the same short
+        # allocation every week and never learns that the remainder silently became cash.
+        gaps = memory.recent_notes(kind="strategy_gap", limit=3)
+        if gaps:
+            context["prior_allocation_gaps"] = [n["body"][:400] for n in gaps]
     except Exception:  # noqa: BLE001 — enrichment, never a blocker
         pass
     # The exogenous backdrop (NEWS-4). The weekly review is the right altitude for it: a changed
@@ -2787,6 +2814,24 @@ async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
             f"{d.get('note') or d.get('summary') or ''}",
             meta={"date": today.isoformat(), "stance": d.get("stance")},
         )
+        # Audit the plan the strategist just wrote. A short plan cannot be fixed here — normalising
+        # the targets upward would push them through the per-group cap and produce orders the tick
+        # can never fill — so it is recorded instead, and fed to the NEXT review, which is the only
+        # stage that can add groups or honestly raise the cash target.
+        gap = sandbox_job.allocation_gap(d, max_position_pct=float(settings.get("max_position_pct", 25.0)))
+        if gap:
+            _log.warning("sandbox strategy plan is short: %s", gap)
+            memory.add_note(
+                "strategy_gap",
+                f"[{today.isoformat()}] targets sum to {gap['targets_sum_pct']}% against an investable "
+                f"{gap['investable_pct']}% ({gap['cash_target_pct']}% cash target) — "
+                f"{gap['unallocated_pct']}% left with no owner, which becomes idle cash. "
+                f"{gap['groups']} group(s) named, at least {gap['groups_needed']} needed to cover the "
+                f"invested share under the {settings.get('max_position_pct')}% per-group cap."
+                + (f" Targets above the cap (unreachable): {gap['targets_over_cap']}."
+                   if gap["targets_over_cap"] else ""),
+                meta={"date": today.isoformat(), **gap},
+            )
         return True
     except Exception as e:  # noqa: BLE001 — a failed Opus review must not break the daily tick
         _log.warning("sandbox weekly review failed (keeping prior note): %s", e)

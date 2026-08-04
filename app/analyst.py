@@ -1188,12 +1188,22 @@ Return a `StrategyNote` — the north star for the coming week:
 200-day, VIX, breadth) AND the account's risk tolerance + time horizon.
 - cash_target_pct: how much of equity to hold in cash this week (higher when defensive / near a horizon \
 date / high volatility).
-- targets: a handful of `exposure_group` → target_pct weights that express the plan (they need not sum \
-to 100 with cash). EVERY target MUST be <= `settings.max_position_pct`, and the cash target should be \
->= `settings.cash_floor_pct` — the execution model enforces both as HARD limits per exposure group, so a \
-target above the cap is simply unreachable and makes the daily tick fire blocked orders forever. If you \
-want more breadth than the cap allows in one vehicle, split across distinct exposure groups instead of \
-overweighting one. Group equivalent vehicles (BTC≡FBTC).
+- targets: `exposure_group` → target_pct weights that express the plan. THEY MUST SUM TO EXACTLY \
+(100 - cash_target_pct). Every percent you do not assign becomes cash by default, silently, and cash \
+is the single largest drag on a long-runway account: measured on this account 2026-08-04, targets \
+summing to 64% against a 22% cash target left 14 points with no owner, the book sat at 42% cash, and \
+the ENTIRE shortfall against the S&P was the cash that never got invested — $193 of opportunity cost \
+against a $187 gap, i.e. the stock selection was fine and the idle cash lost the race on its own. If \
+you want to hold more cash, RAISE `cash_target_pct` and say why. Do not leave it unallocated and call \
+the remainder a plan.
+  EVERY target MUST also be <= `settings.max_position_pct`, and cash_target_pct >= \
+`settings.cash_floor_pct` — the execution model enforces both as HARD limits per exposure group, so a \
+target above the cap is simply unreachable and makes the daily tick fire blocked orders forever. \
+Those two rules together mean you need ENOUGH DISTINCT GROUPS to cover the invested share: at least \
+ceil((100 - cash_target_pct) / max_position_pct) of them, and in practice one or two more so the \
+plan has somewhere to go as prices move. If you cannot name that many groups you genuinely want to \
+own, the honest answer is a HIGHER cash target, not a short plan. Split across distinct exposure \
+groups rather than overweighting one, and group equivalent vehicles (BTC≡FBTC).
 - themes: 2-4 short things to lean into (sectors/factors), grounded in the sector rotation + relative \
 strength you see. Each one a fragment, not a sentence — "Energy on Hormuz supply risk", not a clause.
 - avoid: 1-3 short things to steer clear of, same shape.
@@ -1238,6 +1248,18 @@ stance, so the plan can be read back against what was actually happening. Do not
 single headline, and respect `horizon` — a days-long disruption is not a reason to restructure a book \
 with a multi-year runway. If `stale` is true the read is old; weight it down. The ABSENCE of a `macro` \
 block means the backdrop is UNKNOWN, not calm — do not infer quiet from silence.
+
+If `cash_drag` is present it is what the account's idle cash actually COST, in dollars, against the \
+benchmark it is graded on. Read `idle_cash_opportunity_cost_usd` next to `shortfall_usd`: when the \
+first accounts for most of the second, the picks are not the problem and the cash target is — the \
+account is losing by not being invested, which no amount of better selection fixes. Respond by \
+LOWERING `cash_target_pct` and naming enough groups to absorb the difference, not by hunting for \
+better names. The reverse also holds: if the shortfall is large while the cash cost is small, \
+selection is the problem and more cash will not save it.
+
+If `prior_allocation_gaps` is present, those are YOUR OWN previous plans that did not add up — \
+targets summing to less than the investable share, so the remainder silently became cash. Do not \
+repeat it. Make this week's targets sum to exactly (100 - cash_target_pct).
 
 If `prior_strategy_notes` is present it is your own last few weekly reads, newest first. Use them \
 for CONTINUITY — if you are reversing a stance you took recently, say so and say what changed. \

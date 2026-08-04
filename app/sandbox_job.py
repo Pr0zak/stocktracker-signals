@@ -116,6 +116,52 @@ def prefer_btc_etf(
     return out, notes
 
 
+# How far the weekly targets may fall short of (100 - cash_target) before it counts as a real hole
+# rather than rounding. A point or two is noise; ten is a policy decision nobody made.
+ALLOCATION_SLACK_PCT = 3.0
+
+
+def allocation_gap(note: dict | None, *, max_position_pct: float = 25.0) -> dict | None:
+    """Audit a weekly strategy note's targets. Returns None when the plan is sound.
+
+    Two failure modes, both of which make the daily tick unable to execute the plan as written:
+
+    * **Unallocated.** Targets that sum to less than (100 - cash_target_pct) leave the remainder as
+      cash by default. Nobody decided that, and on a long-runway account it is the dominant cost —
+      measured 2026-08-04, a 64% plan against a 22% cash target left the book at 42% cash and the
+      whole S&P shortfall was that idle cash, not the picks.
+    * **Unreachable.** A target above `max_position_pct` can never be filled, so the tick fires
+      blocked orders against it forever.
+
+    Returns a dict describing the problem so the caller can log it AND feed it to the next review,
+    which is the only stage that can actually fix the plan.
+    """
+    if not note:
+        return None
+    targets = note.get("targets") or []
+    cash_target = float(note.get("cash_target_pct") or 0.0)
+    total = sum(float(t.get("target_pct") or 0.0) for t in targets)
+    investable = max(0.0, 100.0 - cash_target)
+    shortfall = investable - total
+    over_cap = [
+        t.get("exposure_group") for t in targets
+        if float(t.get("target_pct") or 0.0) > max_position_pct + 0.01
+    ]
+    # Fewest groups that could cover the invested share without breaching the per-group cap.
+    need = int(-(-investable // max_position_pct)) if max_position_pct > 0 else 0
+    if shortfall <= ALLOCATION_SLACK_PCT and not over_cap and len(targets) >= need:
+        return None
+    return {
+        "targets_sum_pct": round(total, 1),
+        "cash_target_pct": round(cash_target, 1),
+        "investable_pct": round(investable, 1),
+        "unallocated_pct": round(max(0.0, shortfall), 1),
+        "groups": len(targets),
+        "groups_needed": need,
+        "targets_over_cap": [g for g in over_cap if g],
+    }
+
+
 # US long-term capital-gains treatment starts at MORE THAN one year of holding.
 _LONG_TERM_DAYS = 366
 
