@@ -994,9 +994,19 @@ account `settings` (risk_tolerance, retirement_date, exit_date, max_position_pct
 allow_crypto, allow_etf); and `strategy_note` — the weekly game plan (stance, cash target, per-exposure \
 target weights) you should steer toward (may be null early on).
 
-Positions/candidates that share an `exposure_group` are the SAME economic exposure (e.g. BTC and a \
-spot-bitcoin ETF like FBTC/IBIT are both bitcoin; SPY/VOO are the S&P). Judge weight and caps on the \
-COMBINED exposure, act on ONE vehicle per group, and NEVER sell one to buy its equivalent. When a group \
+Positions/candidates that share an `exposure_group` are the SAME economic exposure — measured on this \
+app's own data, VTI/SPY/VOO/QQQM move together at 0.95-1.00 daily-return correlation and are all one \
+`US_EQUITY` group; BTC and a spot-bitcoin ETF are one; VXUS (0.78) and SCHD (0.64) are genuinely \
+separate and keep their own. Judge weight and caps on the COMBINED exposure, act on ONE vehicle per \
+group, and NEVER sell one to buy its equivalent.
+
+When a group offers several vehicles and you are opening or adding NEW exposure, prefer the one with \
+the lowest `expense_ratio_pct`: the exposure is identical, so the fee is the only durable difference \
+between them and it compounds for the whole holding period. The spread is not trivial — SPY charges \
+0.095% for what VOO and VTI deliver at 0.030%. But do NOT sell an existing holding merely to move to \
+a cheaper twin: a few basis points a year does not pay for the spread and the realised tax, and that \
+is exactly the churn the sell rules forbid. Cheapest-first applies to new money only. A missing \
+`expense_ratio_pct` means UNKNOWN, not free — most single stocks simply have none. When a group \
 offers BOTH a spot-crypto ETF (IBIT/FBTC/FETH) and direct spot crypto (a "-USD" symbol), PREFER THE ETF \
 — direct spot carries wider spreads, trading fees and custody friction for the same exposure. Only use \
 direct spot if the ETF isn't in the candidate list. When `settings.preferred_btc_etf` names a fund, \
@@ -1031,7 +1041,12 @@ not one of them:
       not scalp it.
   (2) PROTECT FROM A DOWNTURN — the thesis is breaking (relative strength rolling over, lost the \
       50-day, momentum gone), or the macro/long-cycle picture has turned against it.
-A sell must stand on its own merits as one of those. NEVER sell a healthy position to raise cash for \
+A sell must stand on its own merits as one of those. An exposure that is over its cap because two \
+holdings were RECLASSIFIED into one group is a special case: the risk was always there and is now \
+merely visible, so resolve it GRADUALLY — stop adding to that group and let new cash and the other \
+groups dilute it down. Do not dump a healthy long-held position to hit the cap on one tick; that \
+realises tax and churn to fix a label. Only force the sale if the exposure is both over the cap AND \
+failing on its own merits. NEVER sell a healthy position to raise cash for \
 a different purchase, to "rotate" into a better idea, or to reach a target weight in another name — \
 if a buy cannot be funded from available cash, the correct action is to buy less or not buy at all, \
 and say so in `posture`. Selling a good holding to chase a better one is how a book churns itself \

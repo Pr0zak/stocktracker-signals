@@ -80,6 +80,10 @@ DEFAULT_SETTINGS = {
     # it. Set False for an IRA/401k, where holding period is irrelevant and the model should ignore
     # it entirely rather than "protecting" a gain that is never taxed.
     "taxable_account": True,
+    # Yield paid on idle cash, annualised. Real brokerage cash sits in a sweep/MMF earning roughly the
+    # T-bill rate; modelling it at 0 overstates the cost of being uninvested and pushes the strategist
+    # to deploy harder than reality justifies. Set 0 to model a non-interest-bearing account.
+    "cash_apy_pct": 4.3,
     # Automation
     "cadence": "daily",                # "daily" | "weekly" — how often it DECIDES (NAV still marks daily)
     # Whether the tick may trade during the 16:00-20:00 ET after-hours window. OFF by default: extended

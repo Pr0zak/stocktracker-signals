@@ -2161,14 +2161,50 @@ for _s in ("ETH", "FETH", "ETHA", "ETHE", "ETHW", "CETH", "EZET", "ETHV"):
     _EXPOSURE_GROUP[_s] = "ETH"          # ether + US spot-ether ETFs
 for _s in ("GLD", "IAU", "GLDM", "SGOL", "IAUM", "BAR", "AAAU"):
     _EXPOSURE_GROUP[_s] = "GOLD"         # gold-bullion ETFs
-for _s in ("SPY", "VOO", "IVV", "SPLG"):
-    _EXPOSURE_GROUP[_s] = "SP500"        # S&P 500 index ETFs
+# Broad US equity — ONE exposure, not several. Measured on 2y of daily returns (2026-08-05):
+# SPY-VTI 0.997, VOO-VTI 0.997, SPY-VOO 0.998, QQQM-SPY 0.951, and SPMO joins the same cluster at
+# 0.90. Treating these as independent let the 25% per-group cap apply once EACH, so the sandbox held
+# 46.3% of its book (VTI 24.8% + SPY 21.5%) in what moves as a single asset while its risk model
+# believed it was diversified across two.
+#
+# VTI is the total US market and SPY is the S&P 500, which is genuinely a difference in holdings —
+# the S&P is ~80-85% of US market cap, so VTI adds a mid/small tail. At 0.997 that tail is not
+# diversification, and pretending otherwise defeats the cap. Deliberately NOT merged: VXUS (0.778 vs
+# VTI) and SCHD (0.641) do real work and keep their own groups.
+for _s in ("SPY", "VOO", "IVV", "SPLG",      # S&P 500
+           "VTI", "ITOT", "SCHB",            # total US market
+           "QQQ", "QQQM",                    # Nasdaq-100
+           "SPMO"):                          # S&P 500 momentum
+    _EXPOSURE_GROUP[_s] = "US_EQUITY"
+
+
+# Fund expense ratios, % per year. Fetched live from Yahoo's fundProfile 2026-08-05 — re-check
+# occasionally, issuers do cut them.
+#
+# This matters BECAUSE of the grouping above: once two funds are 0.997 correlated, the exposure is
+# identical and cost is the only durable difference left between them. SPY charges 0.095% for what
+# VOO, IVV and VTI deliver at 0.030% and SPLG at 0.020% — a 3-5x fee for the same tape. Likewise QQQ
+# 0.180% vs QQQM 0.150% on the same index. The sandbox currently holds the expensive one (SPY).
+#
+# Absent from this map = unknown, not free. Single stocks have no expense ratio at all and are simply
+# omitted rather than recorded as 0.
+_EXPENSE_RATIO_PCT: dict[str, float] = {
+    "SPLG": 0.020, "VTI": 0.030, "VOO": 0.030, "IVV": 0.030, "ITOT": 0.030, "SCHB": 0.030,
+    "SPY": 0.095, "SPMO": 0.130, "QQQM": 0.150, "QQQ": 0.180,
+    "VXUS": 0.050, "SCHD": 0.060,
+    "FBTC": 0.250, "IBIT": 0.250,
+}
 
 
 def _exposure_group(symbol: str) -> str:
     """The shared-exposure key for a holding (its own symbol when it has no known equivalent)."""
     base = symbol.upper().removesuffix("-USD")
     return _EXPOSURE_GROUP.get(base, base)
+
+
+def _expense_ratio(symbol: str) -> float | None:
+    """Annual expense ratio in %, or None when unknown (which is NOT the same as zero)."""
+    return _EXPENSE_RATIO_PCT.get(symbol.upper().removesuffix("-USD"))
 
 
 async def _build_portfolio_snapshot(
@@ -2234,6 +2270,7 @@ async def _build_portfolio_snapshot(
             return {
                 "symbol": sym.removesuffix("-USD"),
                 "exposure_group": _exposure_group(sym),
+                **({"expense_ratio_pct": _expense_ratio(sym)} if _expense_ratio(sym) is not None else {}),
                 "currency": (summ.get("currency") or "USD").upper(),
                 "shares": h.shares,
                 "avg_cost": h.avg_cost,
@@ -2673,6 +2710,7 @@ async def _sandbox_candidate(sym: str, bench_closes, watch_set: set[str]) -> dic
         row = {
             "symbol": sym, "source": "watchlist" if sym in watch_set else "market_screen",
             "price": round(summ["price"], 4), "exposure_group": _exposure_group(sym),
+            **({"expense_ratio_pct": _expense_ratio(sym)} if _expense_ratio(sym) is not None else {}),
             "technicals": {k: summ.get(k) for k in _SANDBOX_TECH_KEYS if summ.get(k) is not None},
         }
         # Overnight gap + its MEASURED fill/edge base rate (app/gaps.py) — a mild tilt, not a trigger.
@@ -2851,9 +2889,26 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         settings = blob["settings"]
         cfg = settings_store.get()
 
+        warnings: list[str] = []
+
+        # Interest on idle cash, BEFORE the deposit and the decision so the day's balance is right.
+        # No benchmark leg: interest is earned by cash the benchmark never holds (it is 100% invested
+        # by construction), so crediting it here is what makes the two comparable rather than
+        # penalising the sandbox twice for the same choice.
+        earned = sandbox_job.accrue_cash_interest(blob, now=now)
+        if earned > 0:
+            # One row per accrual keeps it auditable — the trade log is the ledger's only human-
+            # readable history, and silently growing cash is exactly the kind of thing that should
+            # never just appear.
+            sandbox_store.append_trade({
+                "ts": time.time(), "date": sandbox_job.today_et_str(now), "symbol": "CASH",
+                "side": "interest", "status": "filled", "shares": 0.0, "price": None,
+                "gross": earned, "cash_after": round(blob["cash"], 2), "source": "cash_yield",
+                "reason": f"Interest on idle cash at {settings.get('cash_apy_pct')}% APY",
+            })
+
         # Recurring monthly deposit (DCA) — added once per ET calendar month, BEFORE the decision so the
         # AI can deploy it; the benchmark shadow gets the same cash on the same day.
-        warnings: list[str] = []
         dep = float(settings.get("monthly_deposit") or 0.0)
         month = now.strftime("%Y-%m")
         if dep > 0 and blob.get("last_deposit_month") != month:
@@ -3149,8 +3204,19 @@ async def sandbox_state_endpoint() -> dict:
         px = price_of(p["symbol"]) or p["avg_cost"]
         val = p["shares"] * px
         pv += val
-        positions.append({**p, "price": round(px, 4), "value": round(val, 2),
-                          "unrealized_pct": round((px / p["avg_cost"] - 1) * 100, 2) if p["avg_cost"] else None})
+        positions.append({
+            **p,
+            # Recompute the group rather than echoing the label stored when the position was opened.
+            # The cap logic already looks it up fresh, so a stale stored label meant the API (and the
+            # app) reported a grouping the risk engine was no longer using — after VTI and SPY were
+            # merged into US_EQUITY they still displayed as two separate groups while being capped as
+            # one. Same class of lie as any other stale field.
+            "exposure_group": _exposure_group(p["symbol"]),
+            **({"expense_ratio_pct": _expense_ratio(p["symbol"])}
+               if _expense_ratio(p["symbol"]) is not None else {}),
+            "price": round(px, 4), "value": round(val, 2),
+            "unrealized_pct": round((px / p["avg_cost"] - 1) * 100, 2) if p["avg_cost"] else None,
+        })
     cash = round(blob["cash"], 2)
     equity = round(cash + pv, 2)
     spy = price_of("^GSPC")

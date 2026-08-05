@@ -116,6 +116,52 @@ def prefer_btc_etf(
     return out, notes
 
 
+def accrue_cash_interest(blob: dict, *, now: dt.datetime | None = None) -> float:
+    """Credit idle cash a money-market yield. Returns the amount credited (0.0 when nothing is due).
+
+    The ledger paid NOTHING on cash, which quietly biased every decision that weighs holding cash.
+    Real cash sits in a sweep/MMF earning roughly the T-bill rate, so a 0% model overstates the cost
+    of being uninvested and pushes the strategist to deploy harder than reality justifies. Measured
+    2026-08-05 on this account's own numbers: the 40%-cash position looks like it costs $193 against
+    the benchmark at 0%, but nearer $177 once the cash earns its keep — and over the 18-year runway
+    the gap between those two assumptions is $8.5k of projected terminal value.
+
+    It also makes the benchmark comparison fair. The benchmark shadow is 100% invested by
+    construction, so charging the sandbox 0% on cash penalised it twice for the same choice.
+
+    Accrual is ACT/365 simple daily, cursored on `last_interest_date` so a forced re-run on the same
+    day cannot double-credit. Interest is earnings, not a contribution: it raises `cash` and
+    `interest_total` but NEVER `funded_total`, so `total_return_pct` keeps counting it as return.
+    """
+    now = now or now_et()
+    today = now.date()
+    apy = float((blob.get("settings") or {}).get("cash_apy_pct") or 0.0)
+    cash = float(blob.get("cash") or 0.0)
+    last = blob.get("last_interest_date")
+    if apy <= 0.0 or cash <= 0.0:
+        blob["last_interest_date"] = today.isoformat()
+        return 0.0
+    if not last:
+        # First run: start the clock, don't back-pay a period we never modelled.
+        blob["last_interest_date"] = today.isoformat()
+        return 0.0
+    try:
+        days = (today - dt.date.fromisoformat(last)).days
+    except ValueError:
+        blob["last_interest_date"] = today.isoformat()
+        return 0.0
+    if days <= 0:
+        return 0.0
+    amount = round(cash * (apy / 100.0) * (days / 365.0), 2)
+    if amount <= 0.0:
+        blob["last_interest_date"] = today.isoformat()
+        return 0.0
+    blob["cash"] = round(cash + amount, 2)
+    blob["interest_total"] = round(float(blob.get("interest_total") or 0.0) + amount, 2)
+    blob["last_interest_date"] = today.isoformat()
+    return amount
+
+
 # How far the weekly targets may fall short of (100 - cash_target) before it counts as a real hole
 # rather than rounding. A point or two is noise; ten is a policy decision nobody made.
 ALLOCATION_SLACK_PCT = 3.0
