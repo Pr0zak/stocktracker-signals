@@ -116,6 +116,41 @@ def prefer_btc_etf(
     return out, notes
 
 
+def intra_group_swaps(orders: list[dict], *, group_of: Callable[[str], str]) -> set[int]:
+    """Indices of orders that sell and re-buy the SAME exposure in one tick. Both sides are returned.
+
+    A swap inside one exposure group changes nothing about what the account owns. It pays the spread
+    twice and, in a taxable account, realises a gain for the privilege. The prompt has said "NEVER
+    sell one to buy its equivalent" since the sandbox was built — and on 2026-08-06 the model did it
+    anyway, selling all 3 SPY to buy VTI on the argument that 0.095% is a worse expense ratio than
+    0.030%. That reasoning is correct for NEW money and wrong for an existing holding: it banked
+    $85.56 of SHORT-TERM gains to save ~$1.50 a year in fees. The buy was then blocked by the group
+    cap, so the proceeds did not even reach VTI — cash went from 39.9% to 58.3%.
+
+    The prompt caveat existed and was ignored, which is the argument for enforcing it here instead.
+    This module is the authority on what the ledger does; a same-group round trip is mechanically
+    detectable, so it does not need to be trusted to a paragraph.
+
+    Only pairs matter: a lone sell (trimming a group that is over its cap) is untouched, and so is a
+    sell funding a buy in a DIFFERENT group — that is a real allocation change, governed by the
+    prompt's sell rules rather than by this one.
+    """
+    by_group: dict[str, dict[str, list[int]]] = {}
+    for i, o in enumerate(orders):
+        side = str(o.get("side") or "").strip().lower()
+        sym = str(o.get("symbol") or "").strip().upper()
+        if side not in ("buy", "sell") or not sym:
+            continue
+        g = group_of(sym)
+        by_group.setdefault(g, {"buy": [], "sell": []})[side].append(i)
+    blocked: set[int] = set()
+    for sides in by_group.values():
+        if sides["buy"] and sides["sell"]:
+            blocked.update(sides["buy"])
+            blocked.update(sides["sell"])
+    return blocked
+
+
 def accrue_cash_interest(blob: dict, *, now: dt.datetime | None = None) -> float:
     """Credit idle cash a money-market yield. Returns the amount credited (0.0 when nothing is due).
 
@@ -434,6 +469,18 @@ def validate_and_fill(
             orders, preferred=str(s.get("preferred_btc_etf") or ""),
             positions=positions, price_of=price_of,
         )
+
+    # A sell-and-rebuy inside one exposure group is a wash: same exposure afterwards, two spreads
+    # paid, and a realised gain in a taxable account. Dropped BEFORE any gate so neither leg can
+    # execute — and recorded as skips, because an order the ledger silently ate is the one thing the
+    # audit trail must never miss. Exempt during a liquidation, which is only ever selling.
+    if not liquidation:
+        swapped = intra_group_swaps(orders, group_of=group_of)
+        for i in sorted(swapped):
+            o = orders[i]
+            _skip(o, f"same-exposure swap within '{group_of(str(o.get('symbol') or ''))}' "
+                     f"— sells and re-buys the same thing, paying spread and tax for no change")
+        orders = [o for i, o in enumerate(orders) if i not in swapped]
 
     sells = [o for o in orders if _side(o) == "sell"]
     buys = [o for o in orders if _side(o) == "buy"]
