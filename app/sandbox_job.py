@@ -202,7 +202,10 @@ def accrue_cash_interest(blob: dict, *, now: dt.datetime | None = None) -> float
 ALLOCATION_SLACK_PCT = 3.0
 
 
-def allocation_gap(note: dict | None, *, max_position_pct: float = 25.0) -> dict | None:
+def allocation_gap(
+    note: dict | None, *, max_position_pct: float = 25.0,
+    group_of: Callable[[str], str] | None = None,
+) -> dict | None:
     """Audit a weekly strategy note's targets. Returns None when the plan is sound.
 
     Two failure modes, both of which make the daily tick unable to execute the plan as written:
@@ -224,10 +227,21 @@ def allocation_gap(note: dict | None, *, max_position_pct: float = 25.0) -> dict
     total = sum(float(t.get("target_pct") or 0.0) for t in targets)
     investable = max(0.0, 100.0 - cash_target)
     shortfall = investable - total
-    over_cap = [
-        t.get("exposure_group") for t in targets
-        if float(t.get("target_pct") or 0.0) > max_position_pct + 0.01
-    ]
+
+    # Collapse the targets onto their CURRENT exposure groups before checking the cap. Checking each
+    # target on its own misses the case that matters: after VTI/SPY/VOO/QQQM were merged into
+    # US_EQUITY on 2026-08-05, the standing plan's "VTI 25%" and "SP500 21%" each passed a 25% cap
+    # individually while together asking for 46% of ONE group. The daily tick then fired a blocked
+    # VTI buy every day and deployed nothing — exactly the "unreachable target = blocked orders
+    # forever" failure this function exists to catch, hidden by the plan naming two labels for one
+    # thing. A regrouping can turn a sound old plan into an impossible one without a word of it
+    # changing, so the check has to be done against today's map, not the plan's vocabulary.
+    _g = group_of or (lambda s: s)
+    by_group: dict[str, float] = {}
+    for t in targets:
+        g = _g(str(t.get("exposure_group") or ""))
+        by_group[g] = by_group.get(g, 0.0) + float(t.get("target_pct") or 0.0)
+    over_cap = [g for g, pct in by_group.items() if pct > max_position_pct + 0.01 and g]
     # Fewest groups that could cover the invested share without breaching the per-group cap.
     need = int(-(-investable // max_position_pct)) if max_position_pct > 0 else 0
     if shortfall <= ALLOCATION_SLACK_PCT and not over_cap and len(targets) >= need:

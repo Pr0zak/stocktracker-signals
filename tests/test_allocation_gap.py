@@ -75,6 +75,23 @@ def test_a_target_above_the_cap_is_flagged_as_unreachable():
     assert gap["targets_over_cap"] == ["VTI"]
 
 
+def test_two_labels_for_one_group_are_caught_as_a_cap_breach():
+    """The case that slipped through. After VTI/SPY/VOO were merged into US_EQUITY, the standing plan
+    still said "VTI 25%" and "SP500 21%" — each fine alone, 46% of one group together, so the tick
+    fired a blocked VTI buy every day and deployed nothing while the audit reported no cap problem."""
+    groups = {"VTI": "US_EQUITY", "SP500": "US_EQUITY", "VXUS": "VXUS", "AMZN": "AMZN"}
+    note = _note([("VTI", 25), ("SP500", 21), ("VXUS", 12), ("AMZN", 6)], cash=22.0)
+    assert allocation_gap(note, max_position_pct=25.0)["targets_over_cap"] == []  # old behaviour
+    gap = allocation_gap(note, max_position_pct=25.0, group_of=lambda s: groups.get(s, s))
+    assert gap["targets_over_cap"] == ["US_EQUITY"]
+
+
+def test_grouping_does_not_invent_a_breach_that_is_not_there():
+    groups = {"VTI": "US_EQUITY", "VXUS": "VXUS", "SCHD": "SCHD", "AMZN": "AMZN"}
+    note = _note([("VTI", 25), ("VXUS", 25), ("SCHD", 18), ("AMZN", 10)], cash=22.0)
+    assert allocation_gap(note, max_position_pct=25.0, group_of=lambda s: groups.get(s, s)) is None
+
+
 def test_the_cap_is_configurable():
     note = _note([("VTI", 40), ("SP500", 38)], cash=22.0)
     assert allocation_gap(note, max_position_pct=40.0) is None

@@ -2177,6 +2177,14 @@ for _s in ("SPY", "VOO", "IVV", "SPLG",      # S&P 500
            "SPMO"):                          # S&P 500 momentum
     _EXPOSURE_GROUP[_s] = "US_EQUITY"
 
+# SUPERSEDED GROUP NAMES. Strategy notes name their targets by GROUP, not by ticker, so a note
+# written before a regrouping carries the old label forever — the standing plan still said "SP500"
+# days after that group ceased to exist, and every consumer that resolved it got "SP500" back
+# unchanged. That let a plan asking for VTI 25% + SP500 21% read as two compliant targets when it was
+# 46% of one capped group. Aliasing the retired names keeps old notes resolvable against today's map.
+for _s in ("SP500",):
+    _EXPOSURE_GROUP[_s] = "US_EQUITY"
+
 
 # Fund expense ratios, % per year. Fetched live from Yahoo's fundProfile 2026-08-05 — re-check
 # occasionally, issuers do cut them.
@@ -2856,7 +2864,9 @@ async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
         # the targets upward would push them through the per-group cap and produce orders the tick
         # can never fill — so it is recorded instead, and fed to the NEXT review, which is the only
         # stage that can add groups or honestly raise the cash target.
-        gap = sandbox_job.allocation_gap(d, max_position_pct=float(settings.get("max_position_pct", 25.0)))
+        gap = sandbox_job.allocation_gap(
+            d, max_position_pct=float(settings.get("max_position_pct", 25.0)),
+            group_of=_exposure_group)
         if gap:
             _log.warning("sandbox strategy plan is short: %s", gap)
             memory.add_note(
@@ -3226,6 +3236,7 @@ async def sandbox_state_endpoint() -> dict:
     return {
         "cash": cash, "equity": equity, "positions_value": round(pv, 2),
         "funded_total": round(funded, 2), "realized_pl_total": blob.get("realized_pl_total", 0.0),
+        "interest_total": round(float(blob.get("interest_total") or 0.0), 2),
         "total_return_pct": round((equity / funded - 1) * 100, 2) if funded else None,
         "cash_pct": round(cash / equity * 100, 1) if equity else None,
         "benchmark_value": bench_val,
