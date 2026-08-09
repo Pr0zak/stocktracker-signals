@@ -134,7 +134,13 @@ def _synthetic_annotated_chain(now, *, spot=100.0, oi=500, quote_delayed=False, 
     chain.expiry = ExpiryChain(expiration=exp_ts,
                                expiration_iso=time.strftime("%Y-%m-%d", time.gmtime(exp_ts)),
                                calls=calls, puts=[])
-    o.annotate_expiry(chain)
+    # now_ts=now, NOT the default real clock. annotate_expiry falls back to time.time(), so omitting
+    # it computed the greeks at the REAL distance to a synthetic expiry pinned 60 days after _NOW —
+    # i.e. the DTE shrank a day at a time until 2026-08-08, when it hit 5.5 days, the delta curve
+    # went binary (80:1.00 85:1.00 90:0.99 95:0.89 100:0.51 105:0.14) and the 0.70 and 0.50 targets
+    # both landed on strike 100. build_candidates de-duped them and "safer" vanished. The test was a
+    # time bomb from the day it was written, and it had been asserting on wrong greeks throughout.
+    o.annotate_expiry(chain, now_ts=now)
     return chain
 
 
@@ -311,7 +317,7 @@ def test_f5_red_reason_no_candidates_even_when_bullish():
     chain.expiry = ExpiryChain(expiration=exp_ts,
                                expiration_iso=time.strftime("%Y-%m-%d", time.gmtime(exp_ts)),
                                calls=calls, puts=[])
-    o.annotate_expiry(chain)
+    o.annotate_expiry(chain, now_ts=now)
     chosen, _ = o.select_expiry(chain, now=now)
     resp = o.assemble_suggestion(chain, chain.expiry, _BULLISH, chosen=chosen, now=now)
 
@@ -330,7 +336,7 @@ def test_f10_requested_style_dropped_when_unquotable_warns():
     # no mid and no last -> no limit price -> build_candidates drops it.
     pick = o._pick_by_delta(chain.expiry.calls, o.TARGET_DELTAS["safer"])
     pick.bid = pick.ask = pick.last_price = None
-    o.annotate_expiry(chain)
+    o.annotate_expiry(chain, now_ts=now)
     chosen, _ = o.select_expiry(chain, now=now)
     resp = o.assemble_suggestion(chain, chain.expiry, _BULLISH, chosen=chosen, style="safer", now=now)
 
@@ -383,3 +389,23 @@ def test_live_options_aapl():
             assert by["safer"] >= by["balanced"]
         if "balanced" in by and "cheaper" in by:
             assert by["balanced"] >= by["cheaper"]
+
+
+def test_synthetic_chains_are_annotated_at_the_PINNED_clock():
+    """Guard against the time bomb that broke this file on 2026-08-08.
+
+    `annotate_expiry` falls back to `time.time()` when `now_ts` is omitted, which is right in
+    production and wrong in a test whose expiry is pinned relative to `_NOW`. Omitting it computed
+    the greeks at the REAL distance to a synthetic 2026-08-14 expiry, so the effective DTE fell by
+    one a day until the delta curve went binary and two profiles collapsed onto the same strike.
+    Nothing failed for weeks; the suite was asserting on greeks it had never intended to produce.
+
+    Asserting the annotated DTE equals the intended one catches any helper that forgets the pin,
+    on the day it is written rather than whenever the calendar happens to reach the expiry.
+    """
+    for dte in (30, 60, 90):
+        chain = _synthetic_annotated_chain(_NOW, dte=dte)
+        assert chain.expiry.dte_days == pytest.approx(dte, abs=0.01), (
+            f"greeks annotated at {chain.expiry.dte_days} DTE, not the intended {dte} — "
+            "a helper is using the real clock instead of the pinned one"
+        )

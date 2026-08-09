@@ -68,7 +68,8 @@ def _chain(now, *, spot=100.0, dte=60, oi=500, iv=0.35, quote_delayed=False):
             implied_volatility=iv, open_interest=oi, volume=100, in_the_money=k < spot,
         ))
     chain.expiry = ExpiryChain(expiration=exp_ts, expiration_iso=iso, calls=calls, puts=[])
-    o.annotate_expiry(chain)
+    # now_ts, not the real clock — see the note in test_options_endpoint._synthetic_annotated_chain.
+    o.annotate_expiry(chain, now_ts=now)
     return chain
 
 
@@ -199,7 +200,7 @@ def test_no_spread_when_long_leg_is_top_strike():
                        bid=3.0, ask=3.1, last_price=3.0, implied_volatility=0.35, open_interest=500),
     ]
     chain.expiry = ExpiryChain(expiration=exp_ts, expiration_iso=iso, calls=calls, puts=[])
-    o.annotate_expiry(chain)
+    o.annotate_expiry(chain, now_ts=now)
     chosen, _ = o.select_expiry(chain, now=now)
     resp = o.assemble_suggestion(chain, chain.expiry, _BULLISH, chosen=chosen, now=now, iv_rank=90.0)
     # balanced pick is the 100 strike (delta ~0.55); nothing higher is quotable -> no spread
