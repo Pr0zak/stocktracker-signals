@@ -33,7 +33,7 @@ from .analyst import (
 from .discover import discover
 from .market import fetch_series, summarize
 from .news import fetch_context, fetch_dated_news
-from . import macro, scan_job
+from . import macro, scan_job, sectors
 from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
 
@@ -1395,7 +1395,17 @@ async def heatmap_endpoint(mode: str = "market", limit: int = 80, refresh: bool 
         phase = market_now.session_phase()
     except Exception:  # noqa: BLE001 — no phase just means we fall back to the regular-session move
         phase = None
-    tiles, unpriced = heatmap.market_tiles(uni, quotes, limit=limit, phase=phase)
+    # Sector per symbol, so the map can be drawn as labelled blocks instead of one flat wall of
+    # rectangles. Disk-cached with a 90-day TTL — a company's sector changes approximately never, so
+    # this is a write-once cost per symbol. Best-effort: an unclassified name still gets a tile.
+    try:
+        profiles = await sectors.lookup(
+            _http, [r["symbol"] for r in ((uni or {}).get("detail") or [])[:limit]])
+    except Exception:  # noqa: BLE001 — the map is more useful ungrouped than absent
+        _log.warning("heatmap: sector lookup failed, drawing ungrouped", exc_info=True)
+        profiles = {}
+    tiles, unpriced = heatmap.market_tiles(
+        uni, quotes, limit=limit, phase=phase, sectors=profiles)
     if not tiles:
         raise HTTPException(status_code=502, detail="no tiles could be priced")
 
