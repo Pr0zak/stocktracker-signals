@@ -202,6 +202,52 @@ def accrue_cash_interest(blob: dict, *, now: dt.datetime | None = None) -> float
 ALLOCATION_SLACK_PCT = 3.0
 
 
+def canonicalize_targets(
+    note: dict | None, *, group_of: Callable[[str], str] | None = None,
+) -> list[str]:
+    """Rewrite a strategy note's targets onto today's exposure groups, in place. Returns the labels
+    that were rewritten or merged away, for logging.
+
+    A note names its targets by GROUP LABEL, and the strategist picks those labels from what it sees
+    in the book — so nothing stops it naming one group twice under two spellings. On 2026-08-10 the
+    weekly plan asked for `US_EQUITY` 22% AND `SP500` 18%; `SP500` has been an alias of `US_EQUITY`
+    since the 2026-08-05 merge, so that is 40% of one group against a 25% cap. The plan summed to
+    exactly (100 - cash_target) and read as six diversified groups, which is precisely why it slipped
+    past every eye on it: the arithmetic was right, the vocabulary was not.
+
+    `allocation_gap` already collapses aliases to CHECK the plan, but checking happens after the note
+    is stored, so every downstream consumer — the daily tick's fill logic, the prompt that shows the
+    plan back to the decision model, the app — still saw two entries for one exposure. Fixing the
+    stored note instead means the alias can only exist for the instant between parse and store.
+
+    Merging is safe in a way that clamping would not be: two labels for one group is a naming error
+    with exactly one correct reading, whereas a merged target that lands over the cap is a real
+    policy problem that must stay visible for `allocation_gap` to report and the next review to fix.
+    """
+    if not note:
+        return []
+    targets = note.get("targets") or []
+    if not targets:
+        return []
+    _g = group_of or (lambda s: s)
+    merged: dict[str, dict] = {}
+    changed: list[str] = []
+    for t in targets:
+        raw = str(t.get("exposure_group") or "").strip()
+        canon = _g(raw) if raw else raw
+        if canon != raw:
+            changed.append(f"{raw}->{canon}")
+        prior = merged.get(canon)
+        if prior is None:
+            merged[canon] = {**t, "exposure_group": canon}
+        else:
+            changed.append(f"{canon} named twice, summed")
+            prior["target_pct"] = round(
+                float(prior.get("target_pct") or 0.0) + float(t.get("target_pct") or 0.0), 1)
+    note["targets"] = list(merged.values())
+    return changed
+
+
 def allocation_gap(
     note: dict | None, *, max_position_pct: float = 25.0,
     group_of: Callable[[str], str] | None = None,

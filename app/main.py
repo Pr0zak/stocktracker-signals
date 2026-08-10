@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import time
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 
 import httpx
@@ -2779,7 +2780,28 @@ async def _sandbox_prices(held: list[str], candidate_syms: list[str]) -> dict[st
     return prices
 
 
-async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
+def _exposure_vocabulary(symbols: Iterable[str]) -> dict[str, list[str]]:
+    """The exposure groups reachable from a symbol list, each with the tickers that map into it.
+
+    The strategist names its targets by group, and until this existed it had to INFER the group
+    vocabulary from whatever labels happened to appear in the book. That is how the 2026-08-10 plan
+    came to ask for `US_EQUITY` and `SP500` separately: it saw `US_EQUITY` on the VTI holding, knew
+    the universe contained S&P funds it did not own, and coined a second label for them. Showing the
+    groups and their members outright removes the guess — and makes the "these tickers are ONE
+    exposure" rule concrete rather than an instruction to be taken on faith.
+    """
+    vocab: dict[str, list[str]] = {}
+    for s in symbols:
+        sym = str(s or "").upper().removesuffix("-USD")
+        if not sym or sym.startswith("^"):
+            continue
+        vocab.setdefault(_exposure_group(sym), []).append(sym)
+    return {g: sorted(set(members)) for g, members in sorted(vocab.items())}
+
+
+async def _maybe_weekly_review(
+    blob: dict, book: dict, settings: dict, *, tradable: Iterable[str] = (),
+) -> bool:
     """Run the Opus weekly strategy review if it's due (>=7 days). Mutates blob's strategy note/date on
     success; on failure keeps the prior note and does NOT advance the cursor (retries next trading day)."""
     from datetime import date as _date
@@ -2795,6 +2817,9 @@ async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
         return False
     context = {
         "book": book,
+        # The ONLY legal target labels, with their members. See _exposure_vocabulary.
+        "exposure_groups": _exposure_vocabulary(
+            [p.get("symbol") for p in (book.get("positions") or [])] + list(tradable)),
         "performance": {
             "funded_total": blob.get("funded_total"), "cash": blob.get("cash"),
             "realized_pl_total": blob.get("realized_pl_total"),
@@ -2859,11 +2884,17 @@ async def _maybe_weekly_review(blob: dict, book: dict, settings: dict) -> bool:
     try:
         note, usage = await strategy_review(context, settings=settings, deep=True)
         usage_store.record(usage, symbol="SANDBOX", kind="sandbox_strategy")
-        blob["last_strategy_note"] = note.model_dump()
+        # Resolve the targets onto today's exposure groups BEFORE anything stores or reads them, so a
+        # plan can never carry two labels for one group past this line. One dict from here on: the
+        # note that gets stored must be the same object that gets audited and remembered.
+        d = note.model_dump()
+        renamed = sandbox_job.canonicalize_targets(d, group_of=_exposure_group)
+        if renamed:
+            _log.info("sandbox strategy targets canonicalised: %s", ", ".join(renamed))
+        blob["last_strategy_note"] = d
         blob["last_weekly_review_date"] = today.isoformat()
         # Keep the weekly reads searchable. Without this each review overwrites the last and the
         # strategy's own history — what it believed and when — is lost.
-        d = note.model_dump()
         memory.add_note(
             "strategy",
             f"[{today.isoformat()}] stance={d.get('stance')} cash_target={d.get('cash_target_pct')}%\n"
@@ -2910,6 +2941,15 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         cfg = settings_store.get()
 
         warnings: list[str] = []
+
+        # Heal a standing plan that names one exposure group twice, before anything reads it. Notes
+        # written from now on are canonicalised at store time, but a plan lasts a WEEK — today's
+        # already-stored `US_EQUITY 22% + SP500 18%` would otherwise steer seven days of ticks toward
+        # a 40% target it can never fill. Idempotent, so a clean note passes through untouched.
+        _renamed = sandbox_job.canonicalize_targets(
+            blob.get("last_strategy_note"), group_of=_exposure_group)
+        if _renamed:
+            _log.info("standing strategy plan canonicalised: %s", ", ".join(_renamed))
 
         # Interest on idle cash, BEFORE the deposit and the decision so the day's balance is right.
         # No benchmark leg: interest is earned by cash the benchmark never holds (it is 100% invested
@@ -3045,7 +3085,8 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                             "positions": at_cost, "priced_at_cost": True}
             else:
                 book = {"total_value": blob["cash"], "cash_pct": 100.0, "positions": []}
-            weekly_ran = await _maybe_weekly_review(blob, book, settings)
+            weekly_ran = await _maybe_weekly_review(
+                blob, book, settings, tradable=candidate_syms)
             try:
                 bench_closes = (await fetch_series(_http, "^GSPC")).closes
             except Exception:  # noqa: BLE001
