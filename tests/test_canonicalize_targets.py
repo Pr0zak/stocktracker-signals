@@ -18,7 +18,7 @@ green suite reported a fix that did not exist.
 """
 from __future__ import annotations
 
-from app.main import _exposure_group, _exposure_vocabulary
+from app.main import _crypto_symbol, _exposure_group, _exposure_vocabulary
 from app.sandbox_job import allocation_gap, canonicalize_targets
 
 
@@ -124,3 +124,19 @@ def test_the_vocabulary_never_offers_a_retired_label():
 
 def test_the_benchmark_is_not_a_tradable_group():
     assert "^GSPC" not in _exposure_vocabulary(["^GSPC", "VTI"])
+
+
+# ---------------------------------------------------------------- adjacent: crypto symbol shape
+
+def test_crypto_watchlist_entries_are_normalised_not_concatenated():
+    """The stored watchlist already carries the suffix, so appending one built `BTC-USD-USD`.
+
+    Found while checking what vocabulary the strategist would receive. Latent, because `allow_crypto`
+    was off and the candidate filter drops everything ending in `-USD` — malformed or not — so the
+    ghosts were swept up by the same filter that hid them. Turning that setting on would have made
+    every crypto candidate a symbol nothing can price.
+    """
+    stored = ["BTC-USD", "SHIB-USD", "DOGE-USD"]        # exactly what settings_store holds
+    assert [_crypto_symbol(c) for c in stored] == stored
+    assert _crypto_symbol("btc") == "BTC-USD"           # the other shape, still one suffix
+    assert _exposure_vocabulary([_crypto_symbol(c) for c in stored])["BTC"] == ["BTC"]

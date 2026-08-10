@@ -2780,6 +2780,19 @@ async def _sandbox_prices(held: list[str], candidate_syms: list[str]) -> dict[st
     return prices
 
 
+def _crypto_symbol(entry: str) -> str:
+    """A crypto watchlist entry as a Yahoo symbol, whichever shape it was stored in.
+
+    The stored list already carries the suffix (`BTC-USD`), so the tick's `f"{c.upper()}-USD"` built
+    `BTC-USD-USD` — a symbol nothing can price. It stayed invisible because `allow_crypto` is off and
+    the candidate filter drops everything ending in `-USD`, malformed or not: the same filter that hid
+    the ghosts also swept them up. Turning that one setting on would have made every crypto candidate
+    unfillable, with no error anywhere, because a dropped candidate looks exactly like a name the
+    model chose not to buy.
+    """
+    return f"{str(entry or '').upper().removesuffix('-USD')}-USD"
+
+
 def _exposure_vocabulary(symbols: Iterable[str]) -> dict[str, list[str]]:
     """The exposure groups reachable from a symbol list, each with the tickers that map into it.
 
@@ -3008,7 +3021,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
 
         held = [p["symbol"].upper() for p in blob["positions"]]
         watch = [s.upper() for s in (cfg.get("watchlist") or [])]
-        cwatch = [f"{c.upper()}-USD" for c in (cfg.get("crypto_watchlist") or [])]
+        cwatch = [_crypto_symbol(c) for c in (cfg.get("crypto_watchlist") or [])]
         try:
             discovered = [s.upper() for s in await discover(_http, set(held) | set(watch) | set(cwatch))][:8]
         except Exception:  # noqa: BLE001
