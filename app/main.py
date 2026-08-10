@@ -2946,6 +2946,19 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
     async with _sandbox_lock:
         blob = sandbox_store.get()
         now = sandbox_job.now_et()
+
+        # Heal a standing plan that names one exposure group twice — ABOVE the gate, because this
+        # does not depend on market state and the gate is exactly what would delay it. Notes written
+        # from now on are canonicalised at store time, but a plan lasts a WEEK: today's already-stored
+        # `US_EQUITY 22% + SP500 18%` would otherwise steer seven days of ticks toward a 40% target it
+        # can never fill, and the first tick that could fix it is the one the gate turns away.
+        # Idempotent, so a clean note costs nothing and writes nothing.
+        _renamed = sandbox_job.canonicalize_targets(
+            blob.get("last_strategy_note"), group_of=_exposure_group)
+        if _renamed:
+            _log.info("standing strategy plan canonicalised: %s", ", ".join(_renamed))
+            sandbox_store.save(blob)
+
         proceed, status = sandbox_job.tick_gate(blob, now=now, force=force)
         if not proceed:
             return {"status": status, "date": sandbox_job.today_et_str(now)}
@@ -2954,15 +2967,6 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         cfg = settings_store.get()
 
         warnings: list[str] = []
-
-        # Heal a standing plan that names one exposure group twice, before anything reads it. Notes
-        # written from now on are canonicalised at store time, but a plan lasts a WEEK — today's
-        # already-stored `US_EQUITY 22% + SP500 18%` would otherwise steer seven days of ticks toward
-        # a 40% target it can never fill. Idempotent, so a clean note passes through untouched.
-        _renamed = sandbox_job.canonicalize_targets(
-            blob.get("last_strategy_note"), group_of=_exposure_group)
-        if _renamed:
-            _log.info("standing strategy plan canonicalised: %s", ", ".join(_renamed))
 
         # Interest on idle cash, BEFORE the deposit and the decision so the day's balance is right.
         # No benchmark leg: interest is earned by cash the benchmark never holds (it is 100% invested
