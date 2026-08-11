@@ -151,6 +151,44 @@ def intra_group_swaps(orders: list[dict], *, group_of: Callable[[str], str]) -> 
     return blocked
 
 
+def same_day_reversals(
+    orders: list[dict], positions: list[dict], *, now_ts: float | None = None,
+) -> set[int]:
+    """Indices of SELL orders that unwind a position bought earlier the same trading day.
+
+    Measured 2026-08-11. The 14:35 tick bought 7 VXUS toward a 22% target; a second tick 54 minutes
+    later re-ran the weekly review, which rewrote that target to 12%, and the same tick sold 5 of
+    those shares back. Both decisions were correct against the plan in front of them. The account
+    still paid the spread twice and booked $3.84 of SHORT-TERM gain — realised against the position's
+    average cost, so a round trip that netted nine cents on the shares themselves became a taxable
+    event forty times that size.
+
+    `intra_group_swaps` cannot catch this: the two legs are in different ticks, so they are never in
+    one order list. What links them is the position's own `last_add_at`, which the fill path already
+    stamps on every buy.
+
+    Same TRADING DAY in exchange time, not 24 hours — a sell the next morning is a normal overnight
+    decision, and measuring in hours would block it while letting a 23-hour-old add through.
+
+    Deliberately NOT applied to a liquidation: an exit-date flatten is the user asking to be out, and
+    a guard against churn must never be the reason the account is still holding stock on the date
+    they named.
+    """
+    now_ts = now_ts or time.time()
+    today = dt.datetime.fromtimestamp(now_ts, ET).date()
+    bought_today = {
+        str(p.get("symbol") or "").upper()
+        for p in positions
+        if (p.get("last_add_at") or 0)
+        and dt.datetime.fromtimestamp(float(p["last_add_at"]), ET).date() == today
+    }
+    return {
+        i for i, o in enumerate(orders)
+        if str(o.get("side") or "").strip().lower() == "sell"
+        and str(o.get("symbol") or "").strip().upper() in bought_today
+    }
+
+
 def accrue_cash_interest(blob: dict, *, now: dt.datetime | None = None) -> float:
     """Credit idle cash a money-market yield. Returns the amount credited (0.0 when nothing is due).
 
@@ -541,6 +579,18 @@ def validate_and_fill(
             _skip(o, f"same-exposure swap within '{group_of(str(o.get('symbol') or ''))}' "
                      f"— sells and re-buys the same thing, paying spread and tax for no change")
         orders = [o for i, o in enumerate(orders) if i not in swapped]
+
+        # ...and the cross-tick version of the same mistake: selling back what an earlier tick bought
+        # today. `intra_group_swaps` only sees one order list, so it cannot link two ticks; the
+        # position's own `last_add_at` can. Same rationale — spread paid twice, a short-term gain
+        # realised against the average cost rather than against this morning's price.
+        reversed_today = same_day_reversals(orders, positions, now_ts=now_ts)
+        for i in sorted(reversed_today):
+            o = orders[i]
+            _skip(o, f"{str(o.get('symbol') or '').upper()} was bought earlier today — a same-day "
+                     f"reversal pays the spread twice and realises a short-term gain for no change "
+                     f"in what the account holds")
+        orders = [o for i, o in enumerate(orders) if i not in reversed_today]
 
     sells = [o for o in orders if _side(o) == "sell"]
     buys = [o for o in orders if _side(o) == "buy"]
