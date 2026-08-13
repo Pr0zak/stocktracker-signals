@@ -1,7 +1,7 @@
 """
 Persistence for the AI paper-trading sandbox.
 
-Two shapes, mirroring the rest of the service:
+Three shapes, mirroring the rest of the service:
   • data/sandbox.json         — the mutable ledger (cash + positions + settings + cursors), a single
                                 blob fully read / fully rewritten as one consistent snapshot. Written
                                 ATOMICALLY (temp file + fsync + os.replace) with a .bak of the prior
@@ -12,25 +12,72 @@ Two shapes, mirroring the rest of the service:
 data/ is gitignored, so all of this survives the git-reset self-update. All mutations to the blob are
 serialized by callers via an asyncio lock in main.py (single uvicorn worker = sole writer); the
 threading.Lock here only guards the file I/O itself.
+
+ARMS. The account above is one ARM, named `main`. Additional arms are independent ledgers — their own
+cash, positions, settings and decision engine — run against the SAME market snapshot on the same tick,
+so their equity curves are comparable and the difference between them is the strategy rather than the
+weather. That is the point: with one arm, every change is a guess measured against noise, and the
+question actually on the table (is 52% cash the strategist's fault or the mechanism's?) has no
+experiment that can answer it.
+
+`main` deliberately keeps the original three paths rather than moving under `arms/main/`. It holds the
+real history and there is no version of a migration that is safer than not migrating; extra arms live
+at data/arms/<id>/ and cost the existing account nothing.
 """
 from __future__ import annotations
 
 import copy
 import json
 import os
+import re
 import shutil
 import threading
 import time
 from pathlib import Path
 
 _DATA_DIR = Path(os.environ.get("SIGNALS_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
-_FILE = _DATA_DIR / "sandbox.json"
-_BAK = _DATA_DIR / "sandbox.json.bak"
-_TRADES = _DATA_DIR / "sandbox_trades.jsonl"
-_NAV = _DATA_DIR / "sandbox_nav.jsonl"
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 VERSION = 1
+
+MAIN_ARM = "main"
+ENGINES = ("llm", "rules")
+# An arm id becomes a DIRECTORY NAME, so it is validated as one before it is ever joined to a path.
+# Whitelist rather than blacklist: `..`, absolute paths, separators, NUL and unicode lookalikes are
+# all excluded by construction instead of by remembering to check for each of them.
+_ARM_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+class ArmError(ValueError):
+    """Bad arm id, or an operation refused on a reserved arm."""
+
+
+def validate_arm(arm: str) -> str:
+    arm = (arm or "").strip().lower()
+    if not _ARM_RE.fullmatch(arm):
+        raise ArmError(
+            "arm id must be 1-32 chars of a-z, 0-9, '_' or '-', starting alphanumeric")
+    return arm
+
+
+def _paths(arm: str) -> tuple[Path, Path, Path, Path]:
+    """(ledger, ledger.bak, trades, nav) for an arm. `main` keeps the original flat layout."""
+    arm = validate_arm(arm)
+    d = _DATA_DIR if arm == MAIN_ARM else _DATA_DIR / "arms" / arm
+    return (d / "sandbox.json", d / "sandbox.json.bak",
+            d / "sandbox_trades.jsonl", d / "sandbox_nav.jsonl")
+
+
+def list_arms() -> list[str]:
+    """`main` first, then any extra arms alphabetically. `main` is always listed even before its file
+    exists, because it is the account every existing caller means when it says nothing at all."""
+    out = [MAIN_ARM]
+    root = _DATA_DIR / "arms"
+    if root.is_dir():
+        for p in sorted(root.iterdir()):
+            if p.is_dir() and _ARM_RE.fullmatch(p.name) and p.name != MAIN_ARM:
+                out.append(p.name)
+    return out
 
 # Defaults are conservative — the sandbox does nothing until it's funded and turned on.
 DEFAULT_SETTINGS = {
@@ -98,9 +145,14 @@ DEFAULT_SETTINGS = {
 }
 
 
-def _defaults() -> dict:
+def _defaults(arm: str = MAIN_ARM, *, engine: str = "llm", label: str | None = None) -> dict:
     return {
         "version": VERSION,
+        # Identity travels INSIDE the blob as well as in its path, so a row copied out of one arm's
+        # log can still say which book it came from.
+        "arm": arm,
+        "label": label or ("Main" if arm == MAIN_ARM else arm),
+        "engine": engine,           # "llm" = the analyst decides; "rules" = mechanical, no model
         "created_at": None,
         "funded_total": 0.0,
         "cash": 0.0,
@@ -116,31 +168,42 @@ def _defaults() -> dict:
     }
 
 
-def _load() -> dict:
-    """Load the ledger, falling back to the .bak (last-known-good) then to fresh defaults. Settings are
-    merged over DEFAULT_SETTINGS so a new setting key always has a value."""
-    for p in (_FILE, _BAK):
+def _load(arm: str = MAIN_ARM) -> dict:
+    """Load an arm's ledger, falling back to its .bak (last-known-good) then to fresh defaults.
+    Settings are merged over DEFAULT_SETTINGS so a new setting key always has a value."""
+    f, bak, _, _ = _paths(arm)
+    for p in (f, bak):
         if p.exists():
             try:
-                blob = _defaults()
+                blob = _defaults(arm)
                 blob.update(json.loads(p.read_text()))
                 blob["settings"] = {**DEFAULT_SETTINGS, **(blob.get("settings") or {})}
+                # The path is the authority on which arm this is. A blob restored from the wrong
+                # backup, or hand-edited, must not be able to claim it belongs to another book.
+                blob["arm"] = arm
+                if blob.get("engine") not in ENGINES:
+                    blob["engine"] = "llm"
                 return blob
             except Exception:  # noqa: BLE001 — try the .bak, then defaults
                 continue
-    return _defaults()
+    return _defaults(arm)
 
 
-_current = _load()
+# Cache per arm, populated lazily. `main` is loaded eagerly to preserve the original import-time
+# behaviour that the rest of the service was written against.
+_cache: dict[str, dict] = {MAIN_ARM: _load(MAIN_ARM)}
 
 
-def get() -> dict:
-    """A deep copy of the current ledger (safe to mutate by the caller before save())."""
+def get(arm: str = MAIN_ARM) -> dict:
+    """A deep copy of an arm's ledger (safe to mutate by the caller before save())."""
+    arm = validate_arm(arm)
     with _lock:
-        return copy.deepcopy(_current)
+        if arm not in _cache:
+            _cache[arm] = _load(arm)
+        return copy.deepcopy(_cache[arm])
 
 
-def _atomic_write_json(path: Path, data: dict) -> None:
+def _atomic_write_json(path: Path, bak: Path, data: dict) -> None:
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     with tmp.open("w") as f:
         json.dump(data, f, indent=2)
@@ -149,35 +212,39 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     os.chmod(tmp, 0o600)
     if path.exists():
         try:
-            shutil.copy2(path, _BAK)   # last-known-good before we overwrite
+            shutil.copy2(path, bak)    # last-known-good before we overwrite
         except Exception:  # noqa: BLE001
             pass
     os.replace(tmp, path)              # atomic on a single filesystem
 
 
-def save(blob: dict) -> dict:
-    """Atomically persist the ledger and update the in-memory copy. Returns the saved blob."""
-    global _current
+def save(blob: dict, arm: str | None = None) -> dict:
+    """Atomically persist an arm's ledger and update the in-memory copy. Returns the saved blob.
+
+    The arm comes from the blob itself unless overridden, so a caller that read one arm and wrote it
+    back cannot silently land it on another."""
+    arm = validate_arm(arm or blob.get("arm") or MAIN_ARM)
+    f, bak, _, _ = _paths(arm)
     with _lock:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        _atomic_write_json(_FILE, blob)
-        _current = copy.deepcopy(blob)
-        return copy.deepcopy(_current)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(f, bak, blob)
+        _cache[arm] = copy.deepcopy(blob)
+        return copy.deepcopy(_cache[arm])
 
 
 def _append_jsonl(path: Path, row: dict) -> None:
     with _lock:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a") as f:
             f.write(json.dumps(row) + "\n")
 
 
-def append_trade(row: dict) -> None:
-    _append_jsonl(_TRADES, row)
+def append_trade(row: dict, arm: str = MAIN_ARM) -> None:
+    _append_jsonl(_paths(arm)[2], row)
 
 
-def append_nav(row: dict) -> None:
-    _append_jsonl(_NAV, row)
+def append_nav(row: dict, arm: str = MAIN_ARM) -> None:
+    _append_jsonl(_paths(arm)[3], row)
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -195,29 +262,99 @@ def _read_jsonl(path: Path) -> list[dict]:
     return out
 
 
-def read_trades(limit: int = 200) -> list[dict]:
+def read_trades(limit: int = 200, arm: str = MAIN_ARM) -> list[dict]:
     """Most recent trade rows first (filled + skipped)."""
-    rows = _read_jsonl(_TRADES)
+    rows = _read_jsonl(_paths(arm)[2])
     return list(reversed(rows))[: max(1, limit)]
 
 
-def read_nav(days: int | None = None) -> list[dict]:
+def read_nav(days: int | None = None, arm: str = MAIN_ARM) -> list[dict]:
     """The NAV/equity series oldest-first; optionally only the last `days` calendar days."""
-    rows = _read_jsonl(_NAV)
+    rows = _read_jsonl(_paths(arm)[3])
     if days:
         cutoff = time.time() - days * 86400
         rows = [r for r in rows if float(r.get("ts", 0)) >= cutoff]
     return rows
 
 
-def reset() -> dict:
-    """Wipe the ledger back to fresh defaults and rotate the append-only logs to .bak (never truncated
-    in place — the history is preserved on disk). Returns the fresh blob."""
+def reset(arm: str = MAIN_ARM) -> dict:
+    """Wipe an arm's ledger back to fresh defaults and rotate its append-only logs to .bak (never
+    truncated in place — the history is preserved on disk). Returns the fresh blob.
+
+    The arm's IDENTITY survives the reset: a reset arm is the same experiment starting over, not a
+    nameless one, and silently reverting `engine` to "llm" would turn the rules arm into a second copy
+    of main without saying so."""
+    arm = validate_arm(arm)
+    prior = get(arm)
     with _lock:
-        for p in (_TRADES, _NAV):
+        for p in _paths(arm)[2:]:
             if p.exists():
                 try:
                     p.replace(p.with_suffix(p.suffix + f".bak.{int(time.time())}"))
                 except Exception:  # noqa: BLE001
                     pass
-    return save(_defaults())
+    return save(_defaults(arm, engine=prior.get("engine", "llm"), label=prior.get("label")), arm)
+
+
+def create_arm(arm: str, *, engine: str = "rules", label: str | None = None,
+               settings: dict | None = None, seed_settings_from: str | None = MAIN_ARM,
+               clone_from: str | None = None) -> dict:
+    """Create a new arm. Refuses to overwrite an existing one.
+
+    Settings are seeded from another arm by default, so a comparison starts as a genuine A/B — the
+    variable under test is whatever the caller then overrides, not forty defaults that silently
+    drifted apart from the account being compared against.
+
+    `clone_from` copies the BOOK too — cash, positions, funded total and the benchmark shadow. That
+    is usually what you want when adding an arm to a running account: an arm started empty today
+    against one that has been invested for three weeks differs by a head start as well as by its
+    strategy, and the head start is the larger effect for months. Cloning makes today the common
+    ancestor, so everything after it is attributable. The benchmark shadow is copied with the rest,
+    which is the point — both arms then measure excess return from the same starting line."""
+    arm = validate_arm(arm)
+    if arm == MAIN_ARM:
+        raise ArmError("'main' already exists and cannot be re-created")
+    if _paths(arm)[0].exists():
+        raise ArmError(f"arm '{arm}' already exists")
+    if engine not in ENGINES:
+        raise ArmError(f"engine must be one of {ENGINES}")
+    blob = _defaults(arm, engine=engine, label=label)
+    if seed_settings_from:
+        blob["settings"] = {**DEFAULT_SETTINGS, **(get(seed_settings_from).get("settings") or {})}
+    if clone_from:
+        src = get(validate_arm(clone_from))
+        blob.update({
+            "cash": float(src.get("cash") or 0.0),
+            "positions": copy.deepcopy(src.get("positions") or []),
+            "funded_total": float(src.get("funded_total") or 0.0),
+            "realized_pl_total": float(src.get("realized_pl_total") or 0.0),
+            "interest_total": float(src.get("interest_total") or 0.0),
+            "benchmark": copy.deepcopy(src.get("benchmark") or _defaults()["benchmark"]),
+            # The plan is shared at tick time, but carrying it here means the arm can be inspected
+            # (and can act) before its first tick rather than looking planless.
+            "last_strategy_note": copy.deepcopy(src.get("last_strategy_note")),
+            # Deliberately NOT copied: last_tick_date and last_decision_date. Inheriting today's
+            # cursor would gate the new arm out of its own first tick.
+            "last_deposit_month": src.get("last_deposit_month"),
+            # Unsettled proceeds belong to trades this arm never made.
+            "unsettled": [],
+            "recent_loss_sales": {},
+        })
+    # An arm is enabled explicitly by the caller, never by inheritance from a live account.
+    blob["settings"]["master_enabled"] = False
+    blob["created_at"] = time.time()
+    if settings:
+        blob["settings"].update(settings)
+    return save(blob, arm)
+
+
+def delete_arm(arm: str) -> None:
+    """Remove an arm's directory entirely. `main` is not deletable — it is the real account."""
+    arm = validate_arm(arm)
+    if arm == MAIN_ARM:
+        raise ArmError("the 'main' arm cannot be deleted")
+    d = (_DATA_DIR / "arms" / arm)
+    with _lock:
+        _cache.pop(arm, None)
+        if d.is_dir():
+            shutil.rmtree(d)

@@ -504,6 +504,137 @@ def exit_date_flatten_orders(blob: dict, price_of: Callable[[str], float | None]
     return orders
 
 
+# Which ticker expresses a GROUP target, for groups that span more than one vehicle. Ordered
+# cheapest-first by expense ratio, because within a group the exposure is by definition the same and
+# cost is the only durable difference left. Every other group IS its own ticker (VXUS, SCHD, AMZN…),
+# which the identity fallback handles without needing an entry here.
+GROUP_REPRESENTATIVE: dict[str, tuple[str, ...]] = {
+    "US_EQUITY": ("SPLG", "VTI", "VOO", "IVV", "ITOT", "SCHB", "SPY", "QQQM", "QQQ", "SPMO"),
+    "ETH": ("FETH", "ETHA"),
+    "GOLD": ("GLDM", "IAU", "GLD"),
+}
+
+
+def group_representative(
+    group: str, *, positions: list[dict], price_of: Callable[[str], float | None],
+    group_of: Callable[[str], str], preferred_btc_etf: str = "FBTC",
+) -> str | None:
+    """The ticker to buy in order to express a target stated as an exposure GROUP.
+
+    Strategy notes name targets by group, not by ticker, so anything acting on a plan mechanically has
+    to invert that map. Held-first matters most: buying SPLG to top up a US_EQUITY target already
+    expressed as VTI would split one exposure across two vehicles, which is the fragmentation the
+    grouping exists to prevent. Returns None when nothing in the group can be priced — the caller
+    must skip rather than guess."""
+    held = [p for p in positions
+            if group_of(p["symbol"]) == group and float(p.get("shares") or 0) > 0]
+    if held:
+        return max(held, key=lambda p: float(p["shares"]) * (price_of(p["symbol"]) or 0.0)
+                   )["symbol"].upper()
+    if group == "BTC":
+        # Same rule prefer_btc_etf enforces on the LLM's buys: which bitcoin vehicle to own is the
+        # user's call, so the mechanical path must not quietly pick a different one.
+        c = (preferred_btc_etf or "").strip().upper()
+        if c and price_of(c):
+            return c
+    for c in GROUP_REPRESENTATIVE.get(group, ()):
+        if price_of(c):
+            return c
+    return group if price_of(group) else None
+
+
+def rules_decision(
+    blob: dict, *, plan: dict | None, group_of: Callable[[str], str],
+    price_of: Callable[[str], float | None],
+) -> dict:
+    """Fill toward the standing plan's targets. No model, no market opinion, no judgement.
+
+    This is the control arm. It exists to answer a question the live account cannot answer about
+    itself: does the daily analyst add anything over mechanically executing the plan it was already
+    given? On 2026-08-04 the measured shortfall against the S&P was entirely idle cash while stock
+    selection was net positive, which is the shape of a result where the answer might be "no" — but
+    with a single ledger there is no way to tell, because the analyst's picks and the analyst's
+    deployment are the same experiment.
+
+    Deliberately BUY-ONLY. Two reasons, and neither is laziness. Selling to reach a target would make
+    this a rebalancer rather than a deployment baseline, and it would inherit exactly the behaviour
+    the account already bans for the LLM ("selling to fund another purchase is banned"). An overweight
+    group is left alone; the cap in validate_and_fill is what stops one running away.
+
+    Pure: reads the blob, returns a decision, touches nothing. Same {posture, orders} shape the
+    analyst returns, so validate_and_fill remains the single authority over both."""
+    settings = blob.get("settings") or {}
+    positions = blob.get("positions") or []
+    cash = float(blob.get("cash") or 0.0)
+    targets = (plan or {}).get("targets") or []
+    if not targets:
+        # An unpriced plan is not "everything is on target" — say which it is.
+        return {"posture": "No standing plan — holding.", "orders": []}
+
+    equity = cash + positions_value(positions, price_of)
+    if equity <= 0:
+        return {"posture": "Unfunded — nothing to allocate.", "orders": []}
+
+    # Reserve whichever is larger: the plan's cash target or the hard floor. The floor is a risk
+    # limit and the target is an intention; deploying through either would be the arm overriding its
+    # own instructions, which is the one thing a mechanical baseline must never do.
+    cash_target_pct = float((plan or {}).get("cash_target_pct") or 0.0)
+    reserve_pct = max(cash_target_pct, float(settings.get("cash_floor_pct") or 0.0))
+    budget = cash - reserve_pct / 100.0 * equity
+    if budget <= 0:
+        return {"posture": f"At the {reserve_pct:.0f}% cash reserve — nothing to deploy.", "orders": []}
+
+    group_value: dict[str, float] = {}
+    for p in positions:
+        px = mark_price(p, price_of)
+        if px:
+            g = group_of(p["symbol"])
+            group_value[g] = group_value.get(g, 0.0) + float(p["shares"]) * px
+
+    # Collapse targets onto their current exposure groups first — a plan written before a regrouping
+    # names labels that no longer exist on their own, and two of them can be the same group today.
+    want: dict[str, float] = {}
+    for t in targets:
+        g = group_of(str(t.get("exposure_group") or ""))
+        want[g] = want.get(g, 0.0) + float(t.get("target_pct") or 0.0)
+
+    gaps = sorted(((g, pct / 100.0 * equity - group_value.get(g, 0.0)) for g, pct in want.items()),
+                  key=lambda kv: -kv[1])
+    orders: list[dict] = []
+    max_orders = max(1, int(settings.get("max_trades_per_tick") or 4))
+    for g, gap in gaps:
+        if gap <= 0 or budget <= 0 or len(orders) >= max_orders:
+            break
+        sym = group_representative(
+            g, positions=positions, price_of=price_of, group_of=group_of,
+            preferred_btc_etf=str(settings.get("preferred_btc_etf") or "FBTC"))
+        if not sym:
+            continue
+        px = price_of(sym) or 0.0
+        dollars = min(gap, budget)
+        # Under one share is not worth an order. validate_and_fill would skip it and log a blocked
+        # row, and a group within a share of its target every single day would fill the log with
+        # noise that reads like a problem.
+        if px <= 0 or (dollars < px and not is_crypto(sym)):
+            continue
+        orders.append({
+            "symbol": sym, "side": "buy", "dollars": round(dollars, 2),
+            # There is no model here to be confident or otherwise. 100 states plainly that this is
+            # mechanical, and keeps it clear of a conviction floor that only means something for a
+            # judgement this arm never makes.
+            "conviction": 100,
+            "reason": (f"{g} is {gap / equity * 100:.1f}pp under its {want[g]:.0f}% target "
+                       f"(${gap:,.0f}); mechanical fill, no view taken."),
+        })
+        budget -= dollars
+
+    if not orders:
+        return {"posture": "Every group at or above its target — holding.", "orders": []}
+    return {"posture": (f"Mechanically filling {len(orders)} underweight "
+                        f"group{'s' if len(orders) != 1 else ''} toward the standing plan."),
+            "orders": orders}
+
+
 def validate_and_fill(
     blob: dict,
     orders: list[dict],

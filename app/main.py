@@ -2940,6 +2940,113 @@ async def _maybe_weekly_review(
         return False
 
 
+async def _run_extra_arm(
+    arm: str, *, now, price_of, spy_price: float | None, shared_plan: dict | None,
+    candidates: list[dict], macro_block, force: bool,
+) -> dict:
+    """One decision cycle for a NON-main arm, against the market snapshot main already fetched.
+
+    Same quotes, same tick, same day — that identity is the whole reason the arms are comparable, and
+    it is why this takes the price map as an argument instead of fetching its own. Two arms priced
+    from two fetches minutes apart would differ by the market as well as by the strategy, and the
+    experiment would be measuring the weather.
+
+    Extra arms INHERIT main's standing plan rather than running their own weekly review. The question
+    these are here to answer is about execution — does the daily analyst beat mechanically filling the
+    plan, does a higher per-tick cap deploy faster — so the plan has to be the constant. It is also
+    the difference between one Opus call a week and one per arm per week.
+
+    Failures are contained: an arm that raises is reported and skipped, never allowed to take down
+    main's tick, which is the account that actually matters."""
+    blob = sandbox_store.get(arm)
+    engine = blob.get("engine", "llm")
+    label = blob.get("label") or arm
+    proceed, status = sandbox_job.tick_gate(blob, now=now, force=force)
+    if not proceed:
+        return {"arm": arm, "label": label, "engine": engine, "status": status}
+
+    settings = blob["settings"]
+    warnings: list[str] = []
+    exclude = {s.upper() for s in (settings.get("exclusions") or [])}
+
+    earned = sandbox_job.accrue_cash_interest(blob, now=now)
+    if earned > 0:
+        sandbox_store.append_trade({
+            "ts": time.time(), "date": sandbox_job.today_et_str(now), "symbol": "CASH",
+            "side": "interest", "status": "filled", "shares": 0.0, "price": None,
+            "gross": earned, "cash_after": round(blob["cash"], 2), "source": "cash_yield",
+            "reason": f"Interest on idle cash at {settings.get('cash_apy_pct')}% APY"}, arm)
+
+    dep = float(settings.get("monthly_deposit") or 0.0)
+    month = now.strftime("%Y-%m")
+    if dep > 0 and blob.get("last_deposit_month") != month:
+        if not spy_price:
+            warnings.append("monthly deposit deferred — no benchmark quote; will retry next tick")
+        else:
+            blob["benchmark"]["shares"] = round(blob["benchmark"]["shares"] + dep / spy_price, 6)
+            blob["benchmark"]["cost_basis"] = round(blob["benchmark"]["cost_basis"] + dep, 2)
+            blob["cash"] = round(blob["cash"] + dep, 2)
+            blob["funded_total"] = round(blob["funded_total"] + dep, 2)
+            blob["last_deposit_month"] = month
+            sandbox_store.append_trade({
+                "ts": time.time(), "date": sandbox_job.today_et_str(now), "symbol": "CASH",
+                "side": "deposit", "status": "filled", "shares": 0.0, "price": None,
+                "gross": round(dep, 2), "cash_after": blob["cash"], "source": "recurring",
+                "reason": f"Recurring monthly deposit ${dep:,.0f}"}, arm)
+
+    flat = sandbox_job.exit_date_flatten_orders(blob, price_of)
+    if flat is not None:
+        orders, source, posture = flat, "exit_date", "Exit date reached — flattening to cash."
+    elif engine == "rules":
+        d = sandbox_job.rules_decision(
+            blob, plan=shared_plan, group_of=_exposure_group, price_of=price_of)
+        orders, source, posture = d["orders"], "rules_tick", d["posture"]
+    else:
+        holdings = [Holding(symbol=p["symbol"], shares=p["shares"], avg_cost=p["avg_cost"])
+                    for p in blob["positions"]]
+        try:
+            book = (await _build_portfolio_snapshot(holdings, blob["cash"], include_trend=True)
+                    if holdings else
+                    {"total_value": blob["cash"], "cash_pct": 100.0, "positions": []})
+            if holdings and settings.get("taxable_account", True):
+                sandbox_job.annotate_holding_period(book.get("positions", []), blob["positions"])
+            decision, usage = await sandbox_decision(
+                book, candidates, cash=blob["cash"], settings=settings,
+                strategy_note=shared_plan, macro=macro_block, deep=False)
+            usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
+            orders, posture = [o.model_dump() for o in decision.orders], decision.posture
+            source = "haiku_tick"
+            blob["last_decision_date"] = sandbox_job.today_et_str(now)
+        except Exception as e:  # noqa: BLE001 — a failed decision = no trades, still mark NAV
+            warnings.append(f"decision failed: {e}")
+            orders, source, posture = [], "haiku_tick", "No decision (analyst unavailable) — held."
+
+    try:
+        new_blob, filled, skipped = sandbox_job.validate_and_fill(
+            blob, orders, price_of, group_of=_exposure_group, source=source, exclude=exclude,
+            liquidation=(source == "exit_date"))
+    except AssertionError as e:
+        # Main is mid-tick and already persisted. Aborting the whole request over a side arm would
+        # throw away a completed real tick, so this arm alone is skipped and says why.
+        _log.error("sandbox arm %s ABORTED (cash not conserved): %s", arm, e)
+        return {"arm": arm, "label": label, "engine": engine, "status": "aborted",
+                "warnings": [f"cash not conserved: {e}"]}
+
+    stale = sandbox_job.stale_marks(new_blob["positions"], price_of)
+    if stale:
+        warnings.append(f"no fresh quote for {', '.join(stale)} — valued at last known mark")
+
+    pv = sandbox_job.positions_value(new_blob["positions"], price_of)
+    nav = sandbox_job.nav_row(new_blob, positions_val=pv, spy_price=spy_price)
+    new_blob["last_tick_date"] = sandbox_job.today_et_str(now)
+    sandbox_store.save(new_blob, arm)
+    for r in filled + skipped:
+        sandbox_store.append_trade(r, arm)
+    sandbox_store.append_nav(nav, arm)
+    return {"arm": arm, "label": label, "engine": engine, "status": "ok", "posture": posture,
+            "orders_filled": filled, "orders_skipped": skipped, "nav": nav, "warnings": warnings}
+
+
 async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict:
     """One decision cycle: gate → price → (weekly review) → decide → validate+fill → log → NAV → persist."""
     assert _http is not None
@@ -3054,6 +3161,35 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 and pref_etf not in price_syms and pref_etf not in held):
             price_syms.append(pref_etf)
 
+        # Every group the STANDING PLAN names must be priceable, whether or not it made the candidate
+        # cut. A target is an instruction to hold something, and a group that cannot be priced cannot
+        # be bought — so an unpriced target is a plan line that silently does nothing, forever. This
+        # also feeds the extra arms, which have no candidate pipeline of their own and must be able to
+        # act on the same plan against the same quotes.
+        plan_syms: list[str] = []
+        for _t in ((blob.get("last_strategy_note") or {}).get("targets") or []):
+            _g = _exposure_group(str(_t.get("exposure_group") or ""))
+            # "assume priceable" — we are deciding WHAT to fetch, so the real price map does not
+            # exist yet and a truthful price_of here would reject every candidate representative.
+            _rep = sandbox_job.group_representative(
+                _g, positions=blob["positions"], price_of=lambda _s: 1.0, group_of=_exposure_group,
+                preferred_btc_etf=pref_etf or "FBTC")
+            if _rep and _rep not in plan_syms:
+                plan_syms.append(_rep)
+        # Arms other than main hold their own book; those symbols need marks too or their NAV is
+        # computed from stale prices and the curves stop being comparable.
+        arm_held: list[str] = []
+        for _a in sandbox_store.list_arms():
+            if _a == sandbox_store.MAIN_ARM:
+                continue
+            for _p in sandbox_store.get(_a).get("positions") or []:
+                _s = _p["symbol"].upper()
+                if _s not in arm_held:
+                    arm_held.append(_s)
+        for _s in plan_syms + arm_held:
+            if _s not in price_syms and _s not in held:
+                price_syms.append(_s)
+
         prices = await _sandbox_prices(held, price_syms)
         def price_of(sym: str):
             return prices.get(sym.upper())
@@ -3062,8 +3198,10 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         weekly_ran = False
         posture = ""
         # Bound on every path — the exit-date and weekly-cadence branches below skip the decision
-        # entirely, and the fill recorder after validate_and_fill still reads this.
+        # entirely, and the fill recorder after validate_and_fill still reads this. `macro_block` is
+        # bound here for the same reason: the extra arms read it after this block on every path.
         candidates: list[dict] = []
+        macro_block = None
 
         flat = sandbox_job.exit_date_flatten_orders(blob, price_of)
         if flat is not None:
@@ -3211,9 +3349,29 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                          "thesis": r.get("reason")},
                 model=settings_store.get()["scan_model"], origin="sandbox",
             )
-        return {"status": "ok", "date": nav["date"], "posture": posture,
-                "orders_filled": filled, "orders_skipped": skipped, "nav": nav,
-                "weekly_review_ran": weekly_ran, "warnings": warnings}
+        # ---- comparison arms, on the snapshot main just used ----
+        # Only once main has proceeded, because that is where the prices come from. A day main sat
+        # out (closed, already run, disabled) is a day no arm advances either — which keeps the
+        # curves aligned rather than giving one arm an extra observation the others never got.
+        arms: list[dict] = []
+        for _arm in sandbox_store.list_arms():
+            if _arm == sandbox_store.MAIN_ARM:
+                continue
+            try:
+                arms.append(await _run_extra_arm(
+                    _arm, now=now, price_of=price_of, spy_price=spy_price,
+                    shared_plan=new_blob.get("last_strategy_note"), candidates=candidates,
+                    macro_block=macro_block, force=force))
+            except Exception as e:  # noqa: BLE001 — a side arm must never break the real account
+                _log.exception("sandbox arm %s failed", _arm)
+                arms.append({"arm": _arm, "status": "error", "warnings": [str(e)]})
+
+        out = {"status": "ok", "date": nav["date"], "posture": posture,
+               "orders_filled": filled, "orders_skipped": skipped, "nav": nav,
+               "weekly_review_ran": weekly_ran, "warnings": warnings}
+        if arms:
+            out["arms"] = arms
+        return out
 
 
 class SandboxTickRequest(BaseModel):
@@ -3266,12 +3424,24 @@ async def sandbox_tick_endpoint(req: SandboxTickRequest = SandboxTickRequest()) 
     return await run_sandbox_tick(force=req.force, manual=req.manual)
 
 
+def _arm_or_400(arm: str) -> str:
+    """Validate an arm id from the query string. A bad id is the caller's error, not a 500 — and it
+    must never reach the filesystem, since the id becomes a directory name."""
+    try:
+        return sandbox_store.validate_arm(arm)
+    except sandbox_store.ArmError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @app.get("/sandbox/state")
-async def sandbox_state_endpoint() -> dict:
+async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
     """Live-marked snapshot: cash, positions (with unrealized P/L), equity, return vs the S&P shadow,
-    settings, cursors, and the latest strategy note."""
+    settings, cursors, and the latest strategy note.
+
+    `arm` defaults to `main`, so every existing caller (the app, the timer) is unaffected."""
     assert _http is not None
-    blob = sandbox_store.get()
+    arm = _arm_or_400(arm)
+    blob = sandbox_store.get(arm)
     held = [p["symbol"].upper() for p in blob["positions"]]
     prices = await _sandbox_prices(held, []) if (held or blob["benchmark"]["shares"]) else {}
     def price_of(sym: str):
@@ -3302,6 +3472,7 @@ async def sandbox_state_endpoint() -> dict:
     bench_val = round(bench["shares"] * spy, 2) if spy and bench["shares"] else None
     funded = blob.get("funded_total") or 0.0
     return {
+        "arm": arm, "label": blob.get("label") or arm, "engine": blob.get("engine", "llm"),
         "cash": cash, "equity": equity, "positions_value": round(pv, 2),
         "funded_total": round(funded, 2), "realized_pl_total": blob.get("realized_pl_total", 0.0),
         "interest_total": round(float(blob.get("interest_total") or 0.0), 2),
@@ -3318,13 +3489,109 @@ async def sandbox_state_endpoint() -> dict:
 
 
 @app.get("/sandbox/nav")
-async def sandbox_nav_endpoint(days: int = 120) -> dict:
-    return {"series": sandbox_store.read_nav(days)}
+async def sandbox_nav_endpoint(days: int = 120, arm: str = sandbox_store.MAIN_ARM) -> dict:
+    return {"series": sandbox_store.read_nav(days, _arm_or_400(arm))}
 
 
 @app.get("/sandbox/trades")
-async def sandbox_trades_endpoint(limit: int = 100) -> dict:
-    return {"trades": sandbox_store.read_trades(limit)}
+async def sandbox_trades_endpoint(limit: int = 100, arm: str = sandbox_store.MAIN_ARM) -> dict:
+    return {"trades": sandbox_store.read_trades(limit, _arm_or_400(arm))}
+
+
+class SandboxArmCreate(BaseModel):
+    arm: str
+    engine: str = "rules"
+    label: str | None = None
+    fund: float = 0.0
+    enabled: bool = True
+    settings: dict | None = None
+    # Start from another arm's book (usually "main") so the two share a starting line and everything
+    # after it is attributable to the strategy rather than to a head start.
+    clone_from: str | None = None
+
+
+@app.get("/sandbox/arms")
+async def sandbox_arms_endpoint() -> dict:
+    """Every arm with a comparable scoreboard: equity, return, and return vs its OWN benchmark shadow.
+
+    Comparing arms to each other on raw equity would be meaningless when they were funded with
+    different amounts on different days, so the honest cross-arm number is each arm's excess over the
+    same-money-in-the-S&P shadow it carries."""
+    assert _http is not None
+    ids = sandbox_store.list_arms()
+    blobs = {a: sandbox_store.get(a) for a in ids}
+    held = sorted({p["symbol"].upper() for b in blobs.values() for p in b.get("positions") or []})
+    prices = await _sandbox_prices(held, [])
+    def price_of(sym: str):
+        return prices.get(sym.upper())
+    spy = price_of("^GSPC")
+
+    out = []
+    for a in ids:
+        b = blobs[a]
+        pv = sandbox_job.positions_value(b.get("positions") or [], price_of)
+        cash = round(float(b.get("cash") or 0.0), 2)
+        equity = round(cash + pv, 2)
+        funded = float(b.get("funded_total") or 0.0)
+        bench = b.get("benchmark") or {}
+        bval = round(float(bench.get("shares") or 0.0) * spy, 2) if spy and bench.get("shares") else None
+        out.append({
+            "arm": a, "label": b.get("label") or a, "engine": b.get("engine", "llm"),
+            "enabled": bool((b.get("settings") or {}).get("master_enabled")),
+            "cash": cash, "equity": equity, "positions_value": round(pv, 2),
+            "funded_total": round(funded, 2), "positions": len(b.get("positions") or []),
+            "cash_pct": round(cash / equity * 100, 1) if equity else None,
+            "total_return_pct": round((equity / funded - 1) * 100, 2) if funded else None,
+            "benchmark_value": bval,
+            "vs_benchmark_pct": round((equity - bval) / bval * 100, 2) if bval else None,
+            "last_tick_date": b.get("last_tick_date"), "created_at": b.get("created_at"),
+        })
+    return {"arms": out}
+
+
+@app.post("/sandbox/arms")
+async def sandbox_create_arm_endpoint(req: SandboxArmCreate) -> dict:
+    """Create a comparison arm, optionally funding and enabling it in the same call.
+
+    Funding buys the benchmark shadow at today's price exactly as /sandbox/fund does, so the arm's
+    "same money in the S&P" line starts on the day the arm did."""
+    assert _http is not None
+    async with _sandbox_lock:
+        try:
+            blob = sandbox_store.create_arm(
+                req.arm, engine=req.engine, label=req.label, settings=req.settings,
+                clone_from=req.clone_from)
+        except sandbox_store.ArmError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        arm = blob["arm"]
+        if req.fund > 0:
+            spy = (await market_now.fetch_quotes(_http, ["^GSPC"])).get("^GSPC", {}).get("price")
+            if not spy:
+                # Refuse rather than fund a book whose benchmark leg silently never started — that
+                # would flatter every comparison this arm exists to produce.
+                sandbox_store.delete_arm(arm)
+                raise HTTPException(status_code=503, detail="no benchmark quote — arm not created")
+            blob["cash"] = round(float(blob.get("cash") or 0.0) + req.fund, 2)
+            blob["funded_total"] = round(float(blob.get("funded_total") or 0.0) + req.fund, 2)
+            blob["benchmark"]["shares"] = round(req.fund / spy, 6)
+            blob["benchmark"]["cost_basis"] = round(req.fund, 2)
+            sandbox_store.append_trade({
+                "ts": time.time(), "date": sandbox_job.today_et_str(), "symbol": "CASH",
+                "side": "deposit", "status": "filled", "shares": 0.0, "price": None,
+                "gross": round(req.fund, 2), "cash_after": blob["cash"], "source": "fund",
+                "reason": f"Arm funded with ${req.fund:,.0f}"}, arm)
+        blob["settings"]["master_enabled"] = bool(req.enabled)
+        return sandbox_store.save(blob, arm)
+
+
+@app.delete("/sandbox/arms/{arm}")
+async def sandbox_delete_arm_endpoint(arm: str) -> dict:
+    async with _sandbox_lock:
+        try:
+            sandbox_store.delete_arm(_arm_or_400(arm))
+        except sandbox_store.ArmError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return {"status": "deleted", "arm": arm}
 
 
 @app.get("/sandbox/settings")
