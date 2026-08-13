@@ -1018,8 +1018,12 @@ Return a `SandboxDecision`:
 - posture: ONE sentence — what today's plan does and why (e.g. "Trim extended NVDA, start a half-position \
 in a strong-RS healthcare name, hold the rest").
 - orders: a SMALL list (usually 0-4) of concrete orders. For each: symbol, side (buy|sell), an approximate \
-`dollars` notional and `shares` (whole for stocks, fractional for crypto — the server re-sizes to the \
-available cash, so approximate is fine), a 0-100 `conviction`, and a `reason` grounded in ITS numbers. \
+`dollars` notional and `shares` (whole for stocks, fractional for crypto), a 0-100 `conviction`, and a \
+`reason` grounded in ITS numbers. The server cuts a buy to whatever the cash floor, the per-group cap \
+and the turnover budget actually leave, then settles it into whole shares — so ask for the size you \
+want and let it cut. Size a stock buy as WHOLE shares' worth of dollars at or above the last price: a \
+buy worth less than one share does not fill, so a name you want a small starter position in still needs \
+at least one share's cash behind it. \
 Keep the reason to ONE short sentence under 140 characters — it is read on a phone, in a list. Give \
 the one or two numbers that actually drove the decision, not an inventory of every metric you were \
 shown. "Golden cross, RSI 53, filling the 25% SP500 target" is right; a semicolon-chained recital of \

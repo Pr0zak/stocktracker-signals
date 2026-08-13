@@ -42,6 +42,39 @@ def round_shares(symbol: str, shares: float) -> float:
     return round(shares, 6) if is_crypto(symbol) else float(int(shares))
 
 
+# A whole-share buy sized at or above this fraction of one share rounds UP to one, provided a whole
+# share clears every limit. Below it, the order stands as written and floors to zero.
+#
+# Sizing floors everywhere else, because flooring can only ever leave a limit further away. The one
+# place it cannot is the last share: floor turns "just under one" into NOTHING, and an order that
+# buys nothing is not a smaller version of the order — it is the absence of it. Measured 2026-08-13:
+# a GOOGL buy of $346 against a $346.39 fill evaporated, on a book holding $6,032 of idle cash with
+# an $862 target for that name and no limit within reach. The model was told upstream that "the
+# server re-sizes to the available cash, so approximate is fine", which is true downward and false
+# here — so it approximated, and the order silently ceased to exist.
+#
+# 0.9, not 0.5. Round-to-NEAREST would be the tidier rule, but it hands back up to a 2x overspend on
+# the analyst's stated size, and this codebase already has a considered position on that: the
+# 2026-08-03 skip-reason test uses a $200 order against a $374 share as its example of an order that
+# is "simply smaller than one share" and ought not to fill. It should still not fill. This rescue is
+# only for an order that MEANT a whole share and missed — on slippage, on intraday drift between the
+# model's snapshot and the fill, or on shading the figure to a round number. A 10% band covers all
+# three; past it, the fraction was deliberate. Keeping it narrow also keeps it from becoming an
+# incentive: a model that learns a small number buys a whole share will write small numbers.
+#
+# It applies to the FRACTIONAL REMAINDER, not just to the zero case, because the same arithmetic bites
+# at every size. An order sized the obvious way — N shares times the last price — divides by a fill
+# that slippage has already pushed above that price, so it lands at N − 0.0005 and floors to N−1. At
+# N=1 that is the GOOGL order vanishing; at N=10 it is nine shares and a silently unspent share's
+# worth of cash. Same cause, same fix.
+ROUND_UP_MIN_SHARE = 0.9
+
+
+def _usd(x: float) -> str:
+    """Dollars for a human. Cents below $100, because `:,.0f` renders a $0.40 order as "$0"."""
+    return f"${x:,.2f}" if abs(x) < 100 else f"${x:,.0f}"
+
+
 # Spot-bitcoin ETFs. Every one holds the same asset, so which you own is a question about custody,
 # liquidity and fees — the user's call, not the model's.
 BTC_ETFS = frozenset({"IBIT", "FBTC", "GBTC", "BITB", "ARKB", "BTCO", "HODL", "BRRR", "EZBC", "BTCW"})
@@ -545,7 +578,10 @@ def validate_and_fill(
                         "skip_reason": why})
 
     def _fill(o: dict, side: str, shares: float, price: float, realized: float, cash_after: float,
-              pos_after: dict | None) -> None:
+              pos_after: dict | None, size_note: str | None = None) -> None:
+        # `size_note` records any case where the executed size is not the size the analyst asked for.
+        # A fill row that shows $346.39 against a $346 order has to say why on its face, or the trade
+        # log is quietly answering a question nobody can see it was asked.
         filled.append({
             "ts": now_ts, "date": today_et_str(), "symbol": o["symbol"].upper(), "side": side,
             "status": "filled", "shares": round(shares, 6), "price": round(price, 4),
@@ -554,6 +590,7 @@ def validate_and_fill(
             "realized_pl": round(realized, 2), "exposure_group": group_of(o["symbol"]),
             "conviction": o.get("conviction"), "source": source, "reason": o.get("reason", ""),
             "entry_low": o.get("entry_low"), "entry_high": o.get("entry_high"),
+            "size_note": size_note,
         })
 
     def _side(o: dict) -> str:
@@ -608,7 +645,7 @@ def validate_and_fill(
             _skip(o, "max_trades_per_tick reached"); continue
         sym = o["symbol"].upper()
         px = price_of(sym)
-        if not px:
+        if not px or px <= 0:   # a negative quote would book a sale as a cash outflow
             _skip(o, "no fresh price"); continue
         pos = _find(positions, sym)
         if not pos or pos["shares"] <= 0:
@@ -683,7 +720,10 @@ def validate_and_fill(
         if int(o.get("conviction") or 0) < min_conv:
             _skip(o, f"below conviction floor ({min_conv})"); continue
         px = price_of(sym)
-        if not px:
+        # `not px` already rejects None and 0.0; the `<= 0` is for a NEGATIVE quote, which a bad feed
+        # can produce and which every downstream comparison here mis-handles — a negative `fill` makes
+        # the round-up guard trivially true and turns `cash -= cost` into a deposit.
+        if not px or px <= 0:
             _skip(o, "no fresh price"); continue
         # Entry-zone discipline: don't chase. If the analyst named a zone and the market is above its
         # top, defer the buy — it stays a candidate on later ticks instead of filling at any price.
@@ -703,8 +743,13 @@ def validate_and_fill(
                 _skip(o, f"wash-sale window ({30 - int(days)}d left since the loss sale)"); continue
         available = min(cash, buying_power) - floor
         if available <= 0:
+            # Same rule as the ladder below: blame T+1 only when settling would actually fix it.
+            # Unsettled proceeds being present is not enough — if the cash floor swallows the balance
+            # even fully settled, next session is identical and "funds free next session" is a
+            # forecast that never comes true, repeated daily.
+            settles_into_a_share = buying_power < cash - 0.01 and cash - floor >= px * (1 + slip)
             _skip(o, "unsettled proceeds (T+1) — funds free next session"
-                  if buying_power < cash - 0.01 else "at cash floor")
+                  if settles_into_a_share else "at cash floor")
             continue
         g = group_of(sym)
         cap_room = max_pos_pct / 100.0 * equity - group_value.get(g, 0.0)
@@ -730,38 +775,61 @@ def validate_and_fill(
                 want_dollars = want_shares * fill
             else:
                 _skip(o, "buy order specified neither dollars nor shares"); continue
-        spend = min(want_dollars, available, cap_room, room)
-        shares = round_shares(sym, spend / fill)
+        headroom = min(available, cap_room, room)
+        spend = min(want_dollars, headroom)
+        size_note: str | None = None
+        if is_crypto(sym):
+            shares = round_shares(sym, spend / fill)
+        else:
+            # Rescue the last share — see ROUND_UP_MIN_SHARE. Rounding up is only ever safe when the
+            # UPSIZED cost still clears every limit, which is what `(shares + 1) * fill <= headroom`
+            # asserts; because `spend` collapses to `headroom` whenever a limit is the binding term,
+            # that test also fails automatically for any order a limit already cut. The rescue can
+            # therefore only fire when the analyst's own number was the constraint — the one case
+            # where honouring it cannot breach anything.
+            exact = spend / fill
+            shares = float(int(exact))
+            if exact - shares >= ROUND_UP_MIN_SHARE and (shares + 1) * fill <= headroom:
+                shares += 1
+                size_note = (f"analyst asked for {_usd(want_dollars)} ({exact:.3f} shares); "
+                             f"rounded up to {int(shares)} at ${fill:,.2f}")
         if shares <= 0:
             # Name the constraint that actually bound. "cash/cap/turnover" covered three unrelated
             # causes, so the blocked-trade log could not answer the one question it exists for —
             # and a T+1 hold looked identical to simply being out of money.
             #
-            # `spend` is a min() of four terms, so the binding one is whichever term it EQUALS. The
-            # order-size case has to be tested FIRST and explicitly: when the model simply asked for
-            # less than one share, none of the limit branches match and the old `else` blamed the
-            # cash floor regardless. Measured 2026-08-03 — a VTI buy was logged as "cash floor left
-            # room for less than one share" while cash held $5,000 of headroom against a $534 floor,
-            # thirteen shares' worth. Blocked reasons feed the weekly strategy review, so a wrong one
-            # teaches the strategist that the wrong constraint is binding and it re-plans around a
-            # limit that was never in the way.
-            if want_dollars <= spend + 0.01 and want_dollars < fill:
-                why = (f"order was for ${want_dollars:,.0f}, under one share at ${fill:,.2f} "
+            # Two rules keep this honest. First, `fill <= headroom` decides IF a limit was involved
+            # at all: a whole share fitting inside every limit means nothing but the order's own size
+            # stopped it. Testing the order size directly instead gets this wrong in both directions
+            # — a too-small order matched no branch and the old `else` blamed the cash floor
+            # regardless (measured 2026-08-03: a VTI buy logged as "cash floor left room for less
+            # than one share" while cash held $5,000 against a $534 floor, thirteen shares' worth),
+            # and a full-size order under a tight cap read as "no limit was binding" when the cap was
+            # the whole story. Second, WHICH limit gets named is decided by equality against
+            # `headroom`, so it is the TIGHTEST one — the constraint that would still bind if the
+            # others were lifted — rather than whichever branch happens to be tested first.
+            #
+            # Blocked reasons feed the weekly strategy review, so a wrong one teaches the strategist
+            # that the wrong constraint is binding and it re-plans around a limit that was never in
+            # the way. They are also GROUPed BY in memory.blocked_summary(), so the cap and turnover
+            # strings stay free of per-event dollar figures — a varying number in there splits one
+            # recurring problem into a column of counts of 1.
+            if fill <= headroom:
+                why = (f"order was for {_usd(want_dollars)}, under one share at ${fill:,.2f} "
                        f"— no limit was binding")
-            elif is_cash_account and unsettled_total > 0.01 and spend >= available - 0.01:
-                why = (f"unsettled proceeds (T+1) — ${unsettled_total:,.0f} frees up next session")
-            elif spend >= cap_room - 0.01:
-                why = f"exposure '{g}' cap left room for less than one share"
-            elif spend >= room - 0.01:
-                why = f"turnover cap ({turnover_pct:.0f}% of equity) left room for less than one share"
-            elif spend >= available - 0.01:
+            # T+1 is only the answer if settling WOULD fix it. `available` is already net of the cash
+            # floor, so an account short of a share on the floor alone is short of one regardless of
+            # settlement — and "frees up next session" is then a promise the next session cannot keep.
+            elif (available == headroom and is_cash_account and unsettled_total > 0.01
+                  and cash - floor >= fill):
+                why = "unsettled proceeds (T+1) — frees up next session"
+            elif available == headroom:
                 why = (f"cash floor ({cash_floor_pct:.0f}% of equity) left "
-                       f"${available:,.0f} — under one share at ${fill:,.2f}")
+                       f"under one share at ${fill:,.2f}")
+            elif cap_room == headroom:
+                why = f"exposure '{g}' cap left room for less than one share"
             else:
-                # Every named limit exceeded `spend` — so none of them bound and the shortfall is
-                # something this branch does not model. Say that rather than picking a scapegoat.
-                why = (f"sized to ${spend:,.0f}, under one share at ${fill:,.2f} "
-                       f"— no single limit was binding")
+                why = f"turnover cap ({turnover_pct:.0f}% of equity) left room for less than one share"
             _skip(o, why); continue
         cost = shares * fill
         traded_notional += cost
@@ -780,7 +848,7 @@ def validate_and_fill(
                    "exposure_group": g, "opened_at": now_ts, "last_add_at": now_ts}
             positions.append(pos)
             new_positions += 1
-        _fill(o, "buy", shares, fill, 0.0, cash, pos)
+        _fill(o, "buy", shares, fill, 0.0, cash, pos, size_note)
 
     # Keep the wash-sale clock on the ledger, pruned to the 30-day window it governs.
     b["recent_loss_sales"] = {k: v for k, v in recent_loss_sales.items() if now_ts - float(v) < 31 * 86_400}

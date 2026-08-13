@@ -106,7 +106,12 @@ def test_half_cent_boundary_does_not_abort_a_correct_tick():
               "conviction": 90, "reason": "x"}]
     nb, filled, _ = sandbox_job.validate_and_fill(
         blob, order, lambda s: 50.0, group_of=_group, source="t")
-    assert filled and filled[0]["shares"] == 19
+    # 20, not the 19 this asserted before 2026-08-13. $1,000 of a $50 stock is 19.990 shares once
+    # slippage is priced in, and the last-share round-up now settles that at 20 — the whole point of
+    # it. What this test exists to prove is unchanged and is proven by not raising: the tick
+    # completes instead of aborting on the cash-conservation assert.
+    assert filled and filled[0]["shares"] == 20
+    assert nb["cash"] == pytest.approx(5000.0 - filled[0]["gross"], abs=1e-9)
 
 
 def test_round_number_price_sweep_never_aborts():
