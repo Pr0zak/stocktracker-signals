@@ -31,7 +31,7 @@ from .analyst import (
     sandbox_decision,
     strategy_review,
 )
-from .discover import discover
+from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
 from .news import fetch_context, fetch_dated_news
 from . import macro, scan_job, sectors
@@ -2241,11 +2241,17 @@ _SANDBOX_CORE = [
     "FBTC", "IBIT",                       # spot-bitcoin ETFs (still gated by allow_crypto_etf)
 ]
 
-# One budget per channel; they do not compete. Candidate rows measure ~230 tokens each, so both full
-# is ~13k tokens on ONE Haiku call per day — cost is not the binding constraint. Anything trimmed is
-# reported by name, never dropped in silence.
+# One budget per channel; they do not compete.
+#
+# 80 screened, from the WIDE screen set — the four momentum/value angles plus two contrarian ones and
+# all eleven sector screens, so every sector is represented rather than only whichever ones moved.
+# Neither obvious cost is what bounds this: candidate rows measure ~230 tokens, so a full pool is
+# ~22k tokens on ONE Haiku call per day, and fetching 95 candidates was measured at ~7s against a
+# 25-minute window before the close. What plausibly does degrade at this size is the model's ranking
+# across a long list, and nothing here measures that — so this is a deliberate bet on coverage over
+# an unmeasured concentration effect, and it is worth revisiting with the arms once they have data.
 _SANDBOX_MAX_CORE = len(_SANDBOX_CORE)
-_SANDBOX_MAX_SCREENED = 45
+_SANDBOX_MAX_SCREENED = 80
 
 
 async def _sandbox_candidate(sym: str, bench_closes, core_set: set[str]) -> dict | None:
@@ -2675,7 +2681,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
             # slice below its size. The screeners are already fetched in full, so asking wide is free.
             discovered = [s.upper() for s in await discover(
                 _http, set(held) | set(_SANDBOX_CORE),
-                cap=_SANDBOX_MAX_SCREENED + 10)]
+                cap=_SANDBOX_MAX_SCREENED + 10, screens=WIDE_SCREENS)]
         except Exception:  # noqa: BLE001
             discovered = []
         core_set = set(_SANDBOX_CORE)
