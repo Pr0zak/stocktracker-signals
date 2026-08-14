@@ -995,7 +995,10 @@ Judge every proposed order by asking whether it plausibly raises the value of th
 now. If the honest answer is "it books a few dollars today", do not place it. You receive JSON: `equity` and `cash`+`cash_pct`; \
 a `positions` list (each with weight_pct, unrealized_gain_pct, price, `exposure_group`, and technicals — \
 RSI, MACD histogram, % vs 50-day MA, golden-cross, 3-month relative strength vs the S&P, % off 52-week \
-high); `candidates` (not-yet-held names to consider, each with the same technicals and a `source`); the \
+high); `candidates` (not-yet-held names to consider, each with the same technicals and a `source`: "core" \
+is the fixed shelf of broad-market vehicles this account always has access to, "market_screen" is a \
+name surfaced today by a live screen. This universe is the account's OWN — it is not anybody's \
+watchlist, so a name being present carries no endorsement and its absence carries no judgement); the \
 account `settings` (risk_tolerance, retirement_date, exit_date, max_position_pct, cash_floor_pct, \
 allow_crypto, allow_etf); and `strategy_note` — the weekly game plan (stance, cash target, per-exposure \
 target weights) you should steer toward (may be null early on).
@@ -1100,7 +1103,7 @@ so do not flip it again. Ignore `positive_rate_20d` entirely — equities drift 
 between candidates you already like on trend and momentum, and as a reason to SIZE DOWN or skip when a \
 setup's measured excess is negative. It must never manufacture a buy on its own. Hard limits: respect \
 `n` (under ~20 is anecdote), and remember the sample is roughly two years of ONE market regime on a \
-watchlist the user chose — a strong-looking edge there can be regime luck, not skill, so it may adjust \
+narrow universe — a strong-looking edge there can be regime luck, not skill, so it may adjust \
 conviction by a little and must never override the conviction floor, position caps, or the strategy note.
 
 A position may carry `holding_days`, `capital_gains` ("short_term" / "long_term") and \

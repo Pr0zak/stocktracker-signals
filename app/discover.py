@@ -51,7 +51,12 @@ def _raw(v) -> float:
 async def discover(client: httpx.AsyncClient, exclude: set[str], cap: int = 15) -> list[str]:
     """Candidate symbols beyond the watchlist, most interesting first. Never raises."""
     try:
-        quote_lists = await asyncio.gather(*[_screen(client, s) for s in _SCREENS])
+        # Fetch at least as many per screen as the caller wants in total. The junk filters below
+        # (quote type, sub-$5, sub-$2B) and the cross-screen dedupe both cut into the raw lists, so a
+        # fixed 15 per screen silently capped the result far under a larger `cap` — the sandbox asks
+        # for 55 and would have received barely half of it, with nothing to say it had been starved.
+        per_screen = min(100, max(15, cap))
+        quote_lists = await asyncio.gather(*[_screen(client, s, per_screen) for s in _SCREENS])
     except Exception:  # noqa: BLE001
         quote_lists = []
 

@@ -2214,26 +2214,41 @@ async def _long_term_block(sym: str, closes: list[float]) -> dict | None:
     return _compact_trend((await cycle.crypto_context(_http, sym, closes)).get("long_term_trend"))
 
 
-# The daily tick's candidate budget, one per channel. They do not compete: the total GROWS with the
-# watchlist, and the market screen always has room of its own.
+# The sandbox picks its own universe. It does NOT read the user's watchlist.
 #
-# This was a single flat `[:24]` over a watchlist-first list, which starved the screen — every symbol
-# added to the watchlist took another slot off it, and on 2026-08-14 a 25-name list cut 4 of the 8
-# screened names after paying to fetch and rank them. Reserving the screen's slice fixed that but
-# simply moved the loss: the same afternoon the watchlist grew to 49 and 21 names fell off the end,
-# which is the worse failure of the two. A ticker the user deliberately added should never be evicted
-# by the next one they add.
+# The account is meant to be an independent test of whether this system can invest, and a universe
+# borrowed from the user's watchlist quietly made it a test of something else: the sandbox could only
+# ever choose among names the user had already chosen, so a good result was partly the user's stock
+# picking and partly the model's, with no way to separate them. Both channels below are market data.
 #
-# _SANDBOX_MAX_WATCHLIST is therefore a runaway guard, not a working limit. Candidate rows measure
-# ~230 tokens each, so both budgets full is ~17k tokens on ONE Haiku call per day — the cost is not
-# the constraint. Ranking quality plausibly is, at some size, but nothing here measures it, so the
-# ceiling sits where a list stops looking hand-curated rather than at a number invented to sound
-# careful. Anything past it is reported, never dropped in silence.
-_SANDBOX_MAX_WATCHLIST = 60
-_SANDBOX_MAX_DISCOVERED = 12
+# _SANDBOX_CORE is the broad-market shelf a long-horizon plan is mostly built from, and it is curated
+# rather than screened because no screener returns it. Yahoo's `top_etfs_us` was tried on 2026-08-14
+# and ranks by recent performance — it returned GDX, XME, ESPO, RING: thematic and sector funds, the
+# opposite of a core holding. Without this shelf the daily screen (actives, gainers, growth tech,
+# undervalued large caps) surfaces essentially no broad index funds, which would leave the standing
+# plan's US_EQUITY 25% / VXUS 12% / SCHD 12% targets — 49% of the book — permanently unfillable. That
+# exact failure is on record: on 2026-08-07 an unreachable VTI target fired a blocked buy every day
+# and let cash drift to 58.1%.
+#
+# So: a fixed shelf of vehicles, and a screen for individual names. The shelf is deliberately vehicles
+# only, never single stocks — picking which COMPANIES to consider is the model's job, and a curated
+# name here would be a thumb on that scale.
+_SANDBOX_CORE = [
+    "VTI", "VOO", "SPY", "QQQM", "IWM",   # US broad market / large cap / small cap
+    "VXUS", "VEA", "VWO",                 # international developed + emerging
+    "SCHD", "VYM",                        # dividend / quality tilt
+    "GLD",                                # non-equity diversifier
+    "FBTC", "IBIT",                       # spot-bitcoin ETFs (still gated by allow_crypto_etf)
+]
+
+# One budget per channel; they do not compete. Candidate rows measure ~230 tokens each, so both full
+# is ~13k tokens on ONE Haiku call per day — cost is not the binding constraint. Anything trimmed is
+# reported by name, never dropped in silence.
+_SANDBOX_MAX_CORE = len(_SANDBOX_CORE)
+_SANDBOX_MAX_SCREENED = 45
 
 
-async def _sandbox_candidate(sym: str, bench_closes, watch_set: set[str]) -> dict | None:
+async def _sandbox_candidate(sym: str, bench_closes, core_set: set[str]) -> dict | None:
     """A LIGHT candidate snapshot (core technicals only — no news/shorts/insider enrichment) so the
     daily tick stays fast. Returns None for unfetchable symbols."""
     async with _SANDBOX_CAND_SEM:
@@ -2244,7 +2259,7 @@ async def _sandbox_candidate(sym: str, bench_closes, watch_set: set[str]) -> dic
         except Exception:  # noqa: BLE001 — an unfetchable candidate is just dropped
             return None
         row = {
-            "symbol": sym, "source": "watchlist" if sym in watch_set else "market_screen",
+            "symbol": sym, "source": "core" if sym in core_set else "market_screen",
             "price": round(summ["price"], 4), "exposure_group": _exposure_group(sym),
             **({"expense_ratio_pct": _expense_ratio(sym)} if _expense_ratio(sym) is not None else {}),
             "technicals": {k: summ.get(k) for k in _SANDBOX_TECH_KEYS if summ.get(k) is not None},
@@ -2653,31 +2668,28 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         exclude = {s.upper() for s in (settings.get("exclusions") or [])}
 
         held = [p["symbol"].upper() for p in blob["positions"]]
-        watch = [s.upper() for s in (cfg.get("watchlist") or [])]
-        cwatch = [_crypto_symbol(c) for c in (cfg.get("crypto_watchlist") or [])]
+        # NOT cfg["watchlist"]. The sandbox's universe is its own — see _SANDBOX_CORE.
         try:
-            # Ask for more than the reservation: the vehicle and exclusion filters below run AFTER
-            # this cap, so requesting exactly the reservation lets a couple of excluded names shrink
-            # the screen's slice below what was reserved for it. The screeners are already fetched in
-            # full, so the wider ask costs nothing.
+            # Ask for more than the budget: the vehicle and exclusion filters below run AFTER this
+            # cap, so requesting exactly the budget lets a few filtered names shrink the screen's
+            # slice below its size. The screeners are already fetched in full, so asking wide is free.
             discovered = [s.upper() for s in await discover(
-                _http, set(held) | set(watch) | set(cwatch),
-                cap=_SANDBOX_MAX_DISCOVERED + 6)]
+                _http, set(held) | set(_SANDBOX_CORE),
+                cap=_SANDBOX_MAX_SCREENED + 10)]
         except Exception:  # noqa: BLE001
             discovered = []
-        watch_set = set(watch) | set(cwatch)
+        core_set = set(_SANDBOX_CORE)
         candidate_syms, dropped_syms = sandbox_job.select_candidates(
-            watchlist=watch + cwatch, discovered=discovered, held=held, exclusions=exclude,
+            watchlist=_SANDBOX_CORE, discovered=discovered, held=held, exclusions=exclude,
             allow_crypto=bool(settings.get("allow_crypto", False)),
             allow_crypto_etf=bool(settings.get("allow_crypto_etf", True)),
             group_of=_exposure_group,
-            max_watchlist=_SANDBOX_MAX_WATCHLIST, max_discovered=_SANDBOX_MAX_DISCOVERED)
+            max_watchlist=_SANDBOX_MAX_CORE, max_discovered=_SANDBOX_MAX_SCREENED)
         if dropped_syms:
             # Never truncate in silence. A shortened list looks exactly like a short list from the
             # inside, and the names that fall off the end are the ones nobody is watching for.
             warnings.append(
-                f"watchlist truncated — {len(dropped_syms)} symbol(s) past the "
-                f"{_SANDBOX_MAX_WATCHLIST}-name watchlist ceiling were not considered: "
+                f"universe truncated — {len(dropped_syms)} symbol(s) were not considered: "
                 f"{', '.join(dropped_syms)}")
 
         # The preferred bitcoin ETF must always be priced, even when it didn't make the candidate
@@ -2775,7 +2787,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
             except Exception:  # noqa: BLE001
                 bench_closes = None
             candidates = [c for c in await asyncio.gather(
-                *[_sandbox_candidate(s, bench_closes, watch_set) for s in candidate_syms]) if c]
+                *[_sandbox_candidate(s, bench_closes, core_set) for s in candidate_syms]) if c]
             source = "haiku_tick"
             # Exogenous risk overlay (NEWS-4). None when there is no usable read, which the prompt
             # is told to treat as "backdrop unknown" rather than "backdrop clear".
