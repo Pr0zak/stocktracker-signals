@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import time
-from typing import Callable
+from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
 
 from . import market_calendar
@@ -81,6 +81,64 @@ def settings_for_prompt(settings: dict, today: dt.date | None = None) -> dict:
     if age is not None:
         out["current_age"] = age
     return out
+
+
+def select_candidates(
+    *,
+    watchlist: list[str],
+    discovered: list[str],
+    held: Iterable[str],
+    exclusions: Iterable[str],
+    allow_crypto: bool,
+    allow_crypto_etf: bool,
+    group_of: Callable[[str], str],
+    max_candidates: int,
+    max_discovered: int,
+) -> tuple[list[str], list[str]]:
+    """The symbols the daily tick puts in front of the model. Returns (candidates, dropped).
+
+    Two channels feed the pool: the user's watchlist, and `discovered` — names from the live market
+    screen, the only channel that can surface something the user has never heard of. They compete for
+    one budget, and the ORDER OF TRUNCATION decides which one loses.
+
+    It used to be a flat slice over watchlist-then-discovered, so the screen got whatever the
+    watchlist did not want. That degrades monotonically in the worst direction: every symbol the user
+    adds to their watchlist takes another slot off the screen, so the channel that finds new ideas
+    shrinks precisely as the user does more work. Measured 2026-08-14, a 25-name watchlist left 4 of
+    8 screened names cut — fetched, ranked, then dropped before the model saw one.
+
+    So the screen's slice is RESERVED and the watchlist is trimmed to the remainder. This costs the
+    watchlist nothing on a normal day (it is smaller than the budget) and costs it nothing at all on
+    a day the screeners are down, since an empty `discovered` hands the whole budget back.
+
+    Anything trimmed is RETURNED rather than dropped quietly. A truncated list is indistinguishable
+    from a short one once you are downstream of it, and "the model did not buy it" and "the model
+    never saw it" are the same shape in the trade log.
+    """
+    held_set = {s.upper() for s in held}
+    exclude = {s.upper() for s in exclusions}
+    seen: set[str] = set()
+
+    def eligible(syms: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in syms:
+            s = str(raw).upper()
+            if not s or s in seen or s in held_set:
+                continue
+            if not allow_crypto and is_crypto(s):
+                continue                                  # direct spot crypto (BTC-USD)
+            if not allow_crypto_etf and not is_crypto(s) and group_of(s) in ("BTC", "ETH"):
+                continue                                  # spot-crypto ETFs (IBIT/FBTC/FETH…)
+            if s in exclude or s.removesuffix("-USD") in exclude:
+                continue                                  # never even show the AI an excluded ticker
+            seen.add(s)
+            out.append(s)
+        return out
+
+    watch_syms = eligible(watchlist)
+    disc_syms = eligible(discovered)[:max_discovered]
+    budget = max(0, max_candidates - len(disc_syms))
+    return watch_syms[:budget] + disc_syms, watch_syms[budget:]
 
 
 def is_crypto(symbol: str) -> bool:

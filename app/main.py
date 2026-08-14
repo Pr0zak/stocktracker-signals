@@ -2187,6 +2187,22 @@ async def _long_term_block(sym: str, closes: list[float]) -> dict | None:
     return _compact_trend((await cycle.crypto_context(_http, sym, closes)).get("long_term_trend"))
 
 
+# How many symbols the daily tick puts in front of the model, and how much of that budget the market
+# screen is guaranteed.
+#
+# These used to be one flat `[:24]` applied to a list ordered watchlist-first, which meant the market
+# screen was whatever survived after the watchlist had taken what it wanted. Measured 2026-08-14: a
+# 25-name watchlist filled 20 slots and 4 of the 8 screened names were cut — the tick paid to fetch
+# and rank them, then dropped them before the model ever saw one. Worse, it degraded silently and
+# monotonically: every symbol added to the watchlist took another slot off the screen, so the one
+# channel that can surface a name the user has never heard of shrinks as the user does more work.
+#
+# A reserved slice fixes the ordering dependency outright. The screen cannot be crowded out, and the
+# watchlist still gets the whole budget on days the screeners return nothing.
+_SANDBOX_MAX_CANDIDATES = 34
+_SANDBOX_MAX_DISCOVERED = 12
+
+
 async def _sandbox_candidate(sym: str, bench_closes, watch_set: set[str]) -> dict | None:
     """A LIGHT candidate snapshot (core technicals only — no news/shorts/insider enrichment) so the
     daily tick stays fast. Returns None for unfetchable symbols."""
@@ -2610,23 +2626,29 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         watch = [s.upper() for s in (cfg.get("watchlist") or [])]
         cwatch = [_crypto_symbol(c) for c in (cfg.get("crypto_watchlist") or [])]
         try:
-            discovered = [s.upper() for s in await discover(_http, set(held) | set(watch) | set(cwatch))][:8]
+            # Ask for more than the reservation: the vehicle and exclusion filters below run AFTER
+            # this cap, so requesting exactly the reservation lets a couple of excluded names shrink
+            # the screen's slice below what was reserved for it. The screeners are already fetched in
+            # full, so the wider ask costs nothing.
+            discovered = [s.upper() for s in await discover(
+                _http, set(held) | set(watch) | set(cwatch),
+                cap=_SANDBOX_MAX_DISCOVERED + 6)]
         except Exception:  # noqa: BLE001
             discovered = []
         watch_set = set(watch) | set(cwatch)
-        candidate_syms: list[str] = []
-        for s in watch + cwatch + discovered:
-            if s not in candidate_syms and s not in held:
-                candidate_syms.append(s)
-        if not settings.get("allow_crypto", False):      # direct spot crypto (BTC-USD)
-            candidate_syms = [s for s in candidate_syms if not s.endswith("-USD")]
-        if not settings.get("allow_crypto_etf", True):  # spot-crypto ETFs (IBIT/FBTC/FETH…)
-            candidate_syms = [s for s in candidate_syms
-                              if s.endswith("-USD") or _exposure_group(s) not in ("BTC", "ETH")]
-        if exclude:  # never even show the AI an excluded ticker
-            candidate_syms = [s for s in candidate_syms
-                              if s.upper() not in exclude and s.upper().removesuffix("-USD") not in exclude]
-        candidate_syms = candidate_syms[:24]
+        candidate_syms, dropped_syms = sandbox_job.select_candidates(
+            watchlist=watch + cwatch, discovered=discovered, held=held, exclusions=exclude,
+            allow_crypto=bool(settings.get("allow_crypto", False)),
+            allow_crypto_etf=bool(settings.get("allow_crypto_etf", True)),
+            group_of=_exposure_group,
+            max_candidates=_SANDBOX_MAX_CANDIDATES, max_discovered=_SANDBOX_MAX_DISCOVERED)
+        if dropped_syms:
+            # Never truncate in silence. A shortened list looks exactly like a short list from the
+            # inside, and the names that fall off the end are the ones nobody is watching for.
+            warnings.append(
+                f"watchlist truncated — {len(dropped_syms)} symbol(s) past the "
+                f"{_SANDBOX_MAX_CANDIDATES}-candidate budget were not considered: "
+                f"{', '.join(dropped_syms)}")
 
         # The preferred bitcoin ETF must always be priced, even when it didn't make the candidate
         # cut — sandbox_job.prefer_btc_etf can only route a buy onto something it can fill, so
