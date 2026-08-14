@@ -142,6 +142,10 @@ DEFAULT_SETTINGS = {
     "max_turnover_pct": 25.0,
     # App-side preference, stored here so it rides with the account: push a notification per trade.
     "notify_on_trade": True,
+    # Per-arm LLM backbone. None = whatever the service's scan_model is set to, which is what every
+    # arm should use unless the BACKBONE is the thing being compared — an arm that pins a model and
+    # also changes a limit has two variables and measures neither.
+    "model": None,
 }
 
 

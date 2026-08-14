@@ -3010,9 +3010,12 @@ async def _run_extra_arm(
                     {"total_value": blob["cash"], "cash_pct": 100.0, "positions": []})
             if holdings and settings.get("taxable_account", True):
                 sandbox_job.annotate_holding_period(book.get("positions", []), blob["positions"])
+            # Per-arm backbone. None = the service's configured scan model, so an arm that does not
+            # set one is a true copy of main rather than a second variable.
             decision, usage = await sandbox_decision(
                 book, candidates, cash=blob["cash"], settings=settings,
-                strategy_note=shared_plan, macro=macro_block, deep=False)
+                strategy_note=shared_plan, macro=macro_block, deep=False,
+                model=(str(settings.get("model")).strip() or None) if settings.get("model") else None)
             usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
             orders, posture = [o.model_dump() for o in decision.orders], decision.posture
             source = "haiku_tick"

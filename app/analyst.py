@@ -333,10 +333,16 @@ def _is_thinking_model(model: str) -> bool:
     return "haiku" not in (model or "").lower()
 
 
-async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tokens: int = 4096):
-    """One structured-output Claude call on the configured scan/deep model. Returns (parsed, usage)."""
+async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tokens: int = 4096,
+                 model: str | None = None):
+    """One structured-output Claude call on the configured scan/deep model. Returns (parsed, usage).
+
+    `model` overrides the configured tier for this call only. It exists for the sandbox comparison
+    arms, where the backbone is the variable under test and has to differ per arm rather than per
+    service. Everything downstream — the thinking gate, the cli/api provider toggle — keys off the
+    resolved model, so an override behaves exactly as if it had been configured."""
     cfg = settings_store.get()
-    model = cfg["deep_model"] if deep else cfg["scan_model"]
+    model = model or (cfg["deep_model"] if deep else cfg["scan_model"])
     # Adaptive thinking is for the reasoning tier. Gate by EXCLUDING the deliberate no-thinking scan
     # model rather than allow-listing model names: an allow-list silently drops thinking the moment a
     # new frontier model ships (e.g. "claude-opus-5" matched none of the old opus-4/sonnet-5/fable
@@ -1157,6 +1163,7 @@ invent news or prices. Plain reasons, no markdown."""
 async def sandbox_decision(
     book: dict, candidates: list[dict], *, cash: float, settings: dict,
     strategy_note: dict | None, macro: dict | None = None, deep: bool = False,
+    model: str | None = None,
 ) -> tuple[SandboxDecision, dict]:
     """The daily sandbox decision (Haiku by default): a unified order list to steer the book toward the
     strategy within the risk limits. The server validates/clamps/fills afterward — this only proposes."""
@@ -1178,7 +1185,8 @@ async def sandbox_decision(
         + json.dumps(payload, indent=2, default=str)
         + "\n\nReturn the SandboxDecision (a short, concrete order list; empty if nothing clears the bar)."
     )
-    return await _parse(SANDBOX_SYSTEM, prompt, SandboxDecision, deep=deep, max_tokens=2048)
+    return await _parse(SANDBOX_SYSTEM, prompt, SandboxDecision, deep=deep, max_tokens=2048,
+                        model=model)
 
 
 class TargetWeight(BaseModel):
