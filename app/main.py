@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import gaps, market_calendar, memory, rebalance_check, heatmap, sandbox_job, sandbox_store, screener, smartmoney, universe, valuetrap
+from . import dashboard, gaps, market_calendar, memory, rebalance_check, heatmap, sandbox_job, sandbox_store, screener, smartmoney, universe, valuetrap
 from .analyst import (
     analyze,
     daily_brief,
@@ -87,538 +87,9 @@ async def _timing_middleware(request: Request, call_next):
 
 # --- settings UI + API ---
 
-_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>StockTracker Signals</title>
-<style>
-  :root { color-scheme: light dark; --accent:#2563eb; --ok:#16a34a; --err:#dc2626; --muted:#888; }
-  * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, sans-serif; max-width: 60rem; margin: 1.5rem auto;
-         padding: 0 1rem; line-height: 1.5; }
-  /* dashboard layout: cards flow into responsive columns (masonry) — 2-up on desktop, 1 on mobile.
-     column width drives the breakpoint; the 60rem body cap keeps it at 2 columns max. */
-  .masonry { columns: 27rem; column-gap: 1.2rem; }
-  .masonry > * { -webkit-column-break-inside: avoid; page-break-inside: avoid; break-inside: avoid; }
-  form#f { margin-bottom: 1.1rem; }
-  h1 { font-size: 1.4rem; margin: 0 0 .2rem; }
-  .sub { color: var(--muted); margin: 0 0 1.4rem; }
-  .card { border: 1px solid #8883; border-radius: .9rem; padding: 1rem 1.1rem; margin-bottom: 1.1rem;
-          background: rgba(127,127,127,.045); }
-  .card h2 { font-size: 1rem; margin: 0 0 .8rem; }
-  label { display: block; margin: .85rem 0 .3rem; font-weight: 600; font-size: .88rem; }
-  .card label:first-of-type { margin-top: 0; }
-  input, select { width: 100%; padding: .55rem .65rem; font-size: 1rem; border: 1px solid #8886;
-          border-radius: .5rem; background: transparent; color: inherit; }
-  select { appearance: auto; }
-  .hint { font-size: .8rem; color: var(--muted); font-weight: 400; }
-  .row { display: flex; gap: .5rem; align-items: center; }
-  .row input { flex: 1; }
-  button { padding: .55rem 1.1rem; font-size: .95rem; border: 0; border-radius: .5rem;
-           background: var(--accent); color: #fff; cursor: pointer; white-space: nowrap; }
-  button.secondary { background: #8883; color: inherit; }
-  button.ok { background: var(--ok); }
-  .chips { margin-top: .6rem; min-height: 1.1rem; }
-  .chip { display: inline-flex; align-items: center; background: rgba(37,99,235,.15);
-          border-radius: 1rem; padding: .22rem .7rem; margin: .15rem .25rem .15rem 0; font-size: .85rem; }
-  .empty { color: var(--muted); font-size: .82rem; }
-  .synced { font-size: .85rem; margin: .1rem 0 .5rem; color: var(--muted); }
-  .synced.fresh { color: var(--ok); }
-  .synced.stale { color: #d97706; }
-  .usage-totals { font-size: 1rem; margin: .1rem 0 .3rem; }
-  .usage-totals b { color: var(--accent); }
-  #usage-chart svg { display: block; width: 100%; height: auto; margin: .5rem 0 .2rem; }
-  #usage-chart .bar { fill: var(--accent); }
-  #usage-chart .bar.zero { fill: rgba(136,136,136,.28); }
-  #usage-chart .axis { fill: var(--muted); font-size: 9px; }
-  .save { margin-top: .4rem; }
-  #status, #upstatus { font-size: .88rem; min-height: 1.1rem; margin-top: .6rem; }
-  .ok-t { color: var(--ok); } .err-t { color: var(--err); }
-  code { background: #8882; padding: .1rem .3rem; border-radius: .3rem; font-size: .85em; }
-  .empty { color: var(--muted); font-size: .82rem; }
-  .loading { color: var(--muted); font-size: .85rem; }
-  /* status header */
-  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: .8rem .9rem; }
-  .stat .k { font-size: .7rem; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
-  .stat .v { font-size: 1.05rem; font-weight: 600; margin-top: .1rem; }
-  .stat .d { font-size: .78rem; color: var(--muted); margin-top: .1rem; }
-  .countdown { font-variant-numeric: tabular-nums; }
-  .meter { height: .45rem; background: #8883; border-radius: .3rem; overflow: hidden; margin-top: .35rem; }
-  .meter > span { display: block; height: 100%; width: 0; background: var(--accent); }
-  .meter.warn > span { background: #d97706; }
-  .meter.err > span { background: var(--err); }
-  /* signal colors + change badges */
-  .sig-buy { color: var(--ok); font-weight: 600; }
-  .sig-sell { color: var(--err); font-weight: 600; }
-  .sig-hold { color: var(--muted); font-weight: 600; }
-  .badge { display: inline-block; font-size: .66rem; padding: .04rem .38rem; border-radius: .8rem;
-           margin-left: .22rem; font-weight: 700; vertical-align: middle; }
-  .badge.flip { background: rgba(217,119,6,.18); color: #d97706; }
-  .badge.dip { background: rgba(22,163,74,.16); color: var(--ok); }
-  .badge.cross { background: rgba(220,38,38,.16); color: var(--err); }
-  /* compact tables */
-  .scroll { overflow-x: auto; margin: .3rem -.2rem 0; }
-  table.tbl { width: 100%; border-collapse: collapse; font-size: .82rem; }
-  table.tbl th, table.tbl td { text-align: left; padding: .3rem .45rem; border-bottom: 1px solid #8882;
-                               white-space: nowrap; }
-  table.tbl th { color: var(--muted); font-weight: 600; font-size: .7rem; text-transform: uppercase; }
-  table.tbl td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  table.tbl td.thesis { max-width: 13rem; overflow: hidden; text-overflow: ellipsis; }
-  table.tbl tr.changed td:first-child { border-left: 3px solid #d97706; padding-left: calc(.45rem - 3px); }
-  /* data sources */
-  .src { display: flex; align-items: center; gap: .5rem; padding: .3rem 0; border-bottom: 1px solid #8882; }
-  .dot { width: .6rem; height: .6rem; border-radius: 50%; flex: none; background: var(--muted); }
-  .dot.ok { background: var(--ok); } .dot.warn { background: #d97706; } .dot.down { background: var(--err); }
-  .src .nm { font-weight: 600; font-size: .85rem; }
-  .src .lat { color: var(--muted); font-size: .76rem; }
-  .src .dt { color: var(--muted); font-size: .76rem; flex: 1; text-align: right;
-             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ivp { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .4rem; }
-  .ivp .pill { font-size: .73rem; background: #8882; border-radius: .8rem; padding: .12rem .5rem; }
-  .ivp .pill.done { background: rgba(22,163,74,.16); color: var(--ok); }
-  /* cost */
-  .cost-head { font-size: 1rem; margin: .1rem 0 .4rem; }
-  .cost-head b { color: var(--accent); }
-  /* activity log */
-  .logrow { display: flex; gap: .5rem; font-size: .77rem; font-family: ui-monospace, SFMono-Regular, monospace;
-            padding: .13rem 0; border-bottom: 1px solid #8881; }
-  .logrow.bad { color: var(--err); }
-  .logrow .m { width: 3.2rem; color: var(--muted); }
-  .logrow .p { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .logrow .st { width: 2.4rem; text-align: right; }
-  .logrow .ms { width: 4rem; text-align: right; color: var(--muted); }
-</style></head>
-<body>
-<h1>StockTracker Signals</h1>
-<p class="sub">Tier-2 Claude analyst — operations &amp; configuration</p>
-
-<div class="masonry">
-<div class="card" id="status-card">
-  <h2>Status <span class="hint" id="uptime"></span></h2>
-  <div class="stat-grid">
-    <div class="stat"><div class="k">Last scan</div><div class="v" id="scan-when">…</div>
-      <div class="d" id="scan-detail"></div></div>
-    <div class="stat"><div class="k">Next scan</div><div class="v countdown" id="next-scan">…</div>
-      <div class="d">06:30 America/Chicago</div></div>
-    <div class="stat"><div class="k">Disk</div><div class="v" id="disk-v">…</div>
-      <div class="meter" id="disk-meter"><span></span></div></div>
-  </div>
-  <div class="row" style="margin-top:.8rem">
-    <button type="button" class="secondary" id="prune">Prune cache</button>
-    <span class="hint" id="prune-status" style="flex:1"></span>
-  </div>
-  <div class="hint" id="cache-detail" style="margin-top:.5rem"></div>
-</div>
-
-<div class="card">
-  <h2>AI usage</h2>
-  <div id="usage-totals" class="usage-totals">loading…</div>
-  <div id="usage-chart"></div>
-  <div class="hint">Daily tokens over the last 30 days (hover a bar for the day's detail).</div>
-  <div id="usage-models" class="hint"></div>
-</div>
-
-<div class="card">
-  <h2>Latest scan <span class="hint" id="scan-count"></span></h2>
-  <div class="scroll"><table class="tbl" id="scan-tbl">
-    <thead><tr><th>Sym</th><th>Signal</th><th>Conv</th><th>Dip</th><th>Sqz</th><th>&lt;200w</th><th>Thesis</th></tr></thead>
-    <tbody id="scan-body"><tr><td colspan="7" class="loading">loading…</td></tr></tbody>
-  </table></div>
-  <div class="hint" style="margin-top:.5rem">Changed rows are badged: <span class="badge flip">flip</span>
-  signal flipped · <span class="badge dip">dip+</span> new/deeper dip · <span class="badge cross">×200w</span>
-  crossed below the 200-week line.</div>
-</div>
-
-<div class="card">
-  <h2>Data sources <span class="hint" id="src-as-of"></span></h2>
-  <div id="sources"><div class="loading">probing…</div></div>
-  <div class="hint" style="margin-top:.8rem">IV-rank progress — days of ATM-IV logged toward the
-  <span id="iv-target">20</span>-day rank window (nightly, per stock):</div>
-  <div class="ivp" id="iv-progress"><span class="empty">no IV history yet</span></div>
-</div>
-
-<div class="card">
-  <h2>Cost breakdown</h2>
-  <div class="cost-head" id="cost-head">loading…</div>
-  <div class="scroll"><table class="tbl" id="cost-tbl">
-    <thead><tr><th>Kind</th><th class="num">Calls</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead>
-    <tbody id="cost-body"></tbody>
-  </table></div>
-  <div class="hint" id="cost-avg" style="margin-top:.6rem"></div>
-</div>
-
-<form id="f">
-  <div class="card">
-    <h2>Connection &amp; models</h2>
-    <label for="provider">LLM backend</label>
-    <select id="provider">
-      <option value="api">Anthropic API — per-token billing</option>
-      <option value="cli">Claude CLI — this machine's subscription (no per-token cost)</option>
-    </select>
-    <div class="hint">CLI mode shells out to the local <code>claude</code> CLI signed in to your
-    subscription — no per-token billing, but it draws on your Max rate-limit budget and needs the CLI
-    + OAuth present on the server. Keep a key set too, so API mode still works.</div>
-    <div class="hint" id="cli-auth" style="margin-top:.5rem"></div>
-    <div class="row" style="margin-top:.3rem">
-      <button type="button" class="secondary" id="cli-test">Test CLI auth</button>
-      <span class="hint" id="cli-test-status" style="flex:1"></span>
-    </div>
-    <div class="hint" style="margin-top:.35rem">Set up: run <code>claude setup-token</code> on any machine
-    (subscription login) and paste the token below — a dedicated token that won't rotate or get logged out.
-    Stored server-side and used immediately (no restart, no <code>.env</code> edit).</div>
-    <label for="clitoken">CLI subscription token</label>
-    <input id="clitoken" type="password" autocomplete="off" placeholder="paste to set/replace — leave blank to keep current">
-    <label for="key">Anthropic API key</label>
-    <input id="key" type="password" autocomplete="off" placeholder="leave blank to keep current">
-    <div class="hint" id="keyhint"></div>
-    <label for="fkey">Finnhub API key <span class="hint">— optional, adds news + earnings context</span></label>
-    <input id="fkey" type="password" autocomplete="off" placeholder="leave blank to keep current">
-    <div class="hint" id="fkeyhint"></div>
-    <label for="deep">Deep model <span class="hint">— on-demand deep dives</span></label>
-    <input id="deep" autocomplete="off">
-    <label for="scan">Scan model <span class="hint">— cheap watchlist scans</span></label>
-    <input id="scan" autocomplete="off">
-    <label for="ttl">Verdict cache TTL <span class="hint">— seconds</span></label>
-    <input id="ttl" type="number" min="0" autocomplete="off">
-  </div>
-
-  <div class="card">
-    <h2>Nightly watchlist <span class="hint">— synced from the app</span></h2>
-    <div id="synced" class="synced">checking sync…</div>
-    <label>Stocks</label>
-    <div class="chips" id="watch-chips"></div>
-    <label style="margin-top:.7rem">Crypto</label>
-    <div class="chips" id="cwatch-chips"></div>
-    <div class="hint" style="margin-top:.7rem">The app is the source of truth — it pushes your watchlist
-    here automatically, so add/remove symbols in the app, not on this page. Scanned nightly at 06:30;
-    the app notifies you when a signal flips.</div>
-  </div>
-
-  <button class="save" type="submit">Save settings</button>
-  <div id="status"></div>
-</form>
-
-<div class="card">
-  <h2>Service</h2>
-  <div id="version" class="hint">version …</div>
-  <div class="row" style="margin-top:.8rem">
-    <button type="button" class="secondary" id="check">Check for updates</button>
-    <button type="button" class="ok" id="update" style="display:none">Update &amp; restart</button>
-  </div>
-  <div id="upstatus"></div>
-  <div class="hint" style="margin-top:.8rem">
-    <a href="https://github.com/Pr0zak/stocktracker-signals" target="_blank" rel="noopener">github.com/Pr0zak/stocktracker-signals</a>
-  </div>
-</div>
-
-<div class="card">
-  <h2>Recent activity <span class="hint">— last requests, in-memory since restart</span></h2>
-  <div id="logs"><div class="loading">loading…</div></div>
-  <div class="hint" id="errs-head" style="margin-top:.7rem"></div>
-  <div id="errs"></div>
-</div>
-</div><!-- /masonry -->
-
-<p class="hint">API: <code>GET /signal/{symbol}</code> · <code>GET /plan/{symbol}?cash=</code> · <code>POST /recommendations</code> ·
-<code>POST /scan/run</code> · <code>GET /scan/latest</code> · <code>GET /health</code>.
-Decision support only — not investment advice.</p>
-
-<script>
-  const $ = (id) => document.getElementById(id);
-
-  // Read-only chips — the watchlist is owned by the app and synced up via POST /api/settings.
-  function renderChips(kind, syms) {
-    const box = $(kind + "-chips");
-    box.innerHTML = "";
-    if (!syms.length) { box.innerHTML = '<span class="empty">none yet — connect the app to sync</span>'; return; }
-    syms.forEach((sym) => {
-      const chip = document.createElement("span");
-      chip.className = "chip";
-      const b = document.createElement("b"); b.textContent = sym; chip.appendChild(b);
-      box.appendChild(chip);
-    });
-  }
-
-  function agoText(sec) {
-    const d = Math.max(0, Date.now() / 1000 - sec);
-    if (d < 90) return "just now";
-    if (d < 3600) return Math.round(d / 60) + " min ago";
-    if (d < 86400) return Math.round(d / 3600) + " hr ago";
-    const days = Math.round(d / 86400); return days + " day" + (days > 1 ? "s" : "") + " ago";
-  }
-  function renderSynced(ts) {
-    const el = $("synced");
-    if (!ts) {
-      el.textContent = "Last synced: never — set this service's URL in the app's Settings to connect.";
-      el.className = "synced stale"; return;
-    }
-    const fresh = (Date.now() / 1000 - ts) < 1800; // the app re-syncs every ~15 min
-    el.textContent = (fresh ? "● " : "○ ") + "Last synced from the app: " + agoText(ts);
-    el.className = "synced " + (fresh ? "fresh" : "stale");
-  }
-  // Refresh just the heartbeat line (never the form inputs — the user may be mid-edit).
-  async function refreshSynced() {
-    try { renderSynced((await (await fetch("/api/settings")).json()).watchlist_synced_at); } catch (e) {}
-  }
-
-  const fmt = (n) => Number(n).toLocaleString();
-  function drawUsageChart(series) {
-    const box = $("usage-chart");
-    const W = 520, H = 130, padL = 6, padT = 8, padB = 18;
-    const n = series.length;
-    const max = Math.max(1, ...series.map((d) => d.tokens));
-    const bw = (W - padL) / n;
-    const bars = series.map((d, i) => {
-      const h = (d.tokens / max) * (H - padT - padB);
-      const x = padL + i * bw, y = H - padB - h;
-      const t = d.date + ": " + fmt(d.tokens) + " tokens · $" + d.cost_usd.toFixed(4) +
-        " · " + d.calls + " call" + (d.calls === 1 ? "" : "s");
-      return '<rect class="bar' + (d.tokens ? '' : ' zero') + '" x="' + x.toFixed(1) +
-        '" y="' + y.toFixed(1) + '" width="' + Math.max(1, bw - 1.5).toFixed(1) +
-        '" height="' + Math.max(1, h).toFixed(1) + '" rx="1"><title>' + t + '</title></rect>';
-    }).join("");
-    const md = (s) => s.slice(5);
-    const lbl = '<text class="axis" x="' + padL + '" y="' + (H - 5) + '">' + md(series[0].date) + '</text>' +
-      '<text class="axis" x="' + (W / 2) + '" y="' + (H - 5) + '" text-anchor="middle">' + md(series[Math.floor(n / 2)].date) + '</text>' +
-      '<text class="axis" x="' + W + '" y="' + (H - 5) + '" text-anchor="end">' + md(series[n - 1].date) + '</text>';
-    box.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="daily AI token usage">' + bars + lbl + '</svg>';
-  }
-  async function loadUsage() {
-    try {
-      const u = await (await fetch("/api/usage?days=30")).json();
-      const bp = u.by_provider || {};
-      const billed = (bp.api && bp.api.cost_usd) || 0;
-      const notional = (bp.cli && bp.cli.cost_usd) || 0;
-      let cost = "<b>$" + billed.toFixed(4) + "</b> billed";
-      if (notional > 0) cost += ' · <span class="hint">$' + notional.toFixed(4) + " notional (subscription)</span>";
-      $("usage-totals").innerHTML = "<b>" + fmt(u.total_tokens) + "</b> tokens · " + cost + " · " +
-        fmt(u.total_calls) + " calls" +
-        ' <span class="hint">(' + fmt(u.total_input_tokens) + " in / " + fmt(u.total_output_tokens) + " out, all-time)</span>";
-      drawUsageChart(u.series);
-      const models = Object.entries(u.by_model).sort((a, b) => b[1].cost_usd - a[1].cost_usd)
-        .map(([m, v]) => m + " — " + fmt(v.calls) + " calls · $" + v.cost_usd.toFixed(4)).join("<br>");
-      $("usage-models").innerHTML = models || "No calls recorded yet.";
-    } catch (e) { $("usage-totals").textContent = "usage unavailable"; }
-  }
-
-  async function load() {
-    const s = await (await fetch("/api/settings")).json();
-    $("deep").value = s.deep_model; $("scan").value = s.scan_model; $("ttl").value = s.verdict_ttl_seconds;
-    $("provider").value = s.llm_provider || "api";
-    $("cli-auth").innerHTML = s.cli_token_set
-      ? 'CLI subscription token: <b class="ok-t">set</b> (' + esc(s.cli_token_hint) + ') — used when LLM backend is CLI.'
-      : 'CLI subscription token: <b class="err-t">not set</b> — CLI mode will fail until you add one.';
-    renderChips("watch", s.watchlist || []); renderChips("cwatch", s.crypto_watchlist || []);
-    renderSynced(s.watchlist_synced_at);
-    $("keyhint").textContent = s.anthropic_api_key_set
-      ? "Key is set (" + s.anthropic_api_key_hint + "). Leave blank to keep it."
-      : "No key set — the analyst can't run until you add one.";
-    $("fkeyhint").textContent = s.finnhub_api_key_set
-      ? "Key is set. Leave blank to keep it." : "No Finnhub key — news/earnings context is off.";
-  }
-  $("f").onsubmit = async (e) => {
-    e.preventDefault();
-    const body = { deep_model: $("deep").value, scan_model: $("scan").value,
-                   verdict_ttl_seconds: Number($("ttl").value), llm_provider: $("provider").value };
-    if ($("key").value) body.anthropic_api_key = $("key").value;
-    if ($("fkey").value) body.finnhub_api_key = $("fkey").value;
-    if ($("clitoken").value) body.cli_oauth_token = $("clitoken").value;
-    const r = await fetch("/api/settings", { method: "POST",
-      headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    const st = $("status");
-    st.textContent = r.ok ? "Saved ✓" : "Save failed"; st.className = r.ok ? "ok-t" : "err-t";
-    $("key").value = ""; $("fkey").value = ""; $("clitoken").value = ""; load();
-  };
-
-  async function checkVersion() {
-    $("version").textContent = "checking…";
-    const v = await (await fetch("/api/version")).json();
-    let label = "version " + v.version;
-    if (!v.git) label += " · (not a git checkout — updates disabled)";
-    else if (v.update_available) label += " · " + v.behind + " update" + (v.behind > 1 ? "s" : "") + " available";
-    else label += " · up to date";
-    $("version").textContent = label;
-    $("update").style.display = v.update_available ? "inline-block" : "none";
-  }
-  $("check").onclick = checkVersion;
-  $("update").onclick = async () => {
-    $("upstatus").textContent = "Updating — the service will restart…"; $("upstatus").className = "";
-    try { await fetch("/api/update", { method: "POST" }); } catch (e) {}
-    setTimeout(() => { $("upstatus").textContent = "Restarted. Reloading…"; location.reload(); }, 6000);
-  };
-
-  // ---- ops dashboard ----
-  const pad2 = (n) => String(n).padStart(2, "0");
-  function fmtDur(s) {
-    s = Math.max(0, Math.floor(s));
-    const d = Math.floor(s / 86400); s -= d * 86400;
-    const h = Math.floor(s / 3600); s -= h * 3600;
-    const m = Math.floor(s / 60); const sec = s - m * 60;
-    if (d > 0) return d + "d " + h + "h " + m + "m";
-    if (h > 0) return h + "h " + m + "m " + pad2(sec) + "s";
-    return m + "m " + pad2(sec) + "s";
-  }
-  function fmtBytes(n) {
-    if (n == null) return "–";
-    const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; n = Number(n);
-    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-    return (i === 0 ? n : n.toFixed(1)) + " " + u[i];
-  }
-  const money = (n) => "$" + Number(n || 0).toFixed(4);
-  const esc = (s) => { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML.replace(/"/g, "&quot;"); };
-
-  let nextScanTs = null;
-  function tickCountdown() {
-    const el = $("next-scan"); if (!el || !nextScanTs) return;
-    const left = nextScanTs - Date.now() / 1000;
-    el.textContent = left <= 0 ? "due now" : "in " + fmtDur(left);
-  }
-  function renderIvProgress(ivp) {
-    const box = $("iv-progress"); const target = ivp.target || 20;
-    $("iv-target").textContent = target;
-    const syms = ivp.symbols || {}; const keys = Object.keys(syms);
-    if (!keys.length) { box.innerHTML = '<span class="empty">no IV history yet — the nightly scan logs one point per stock</span>'; return; }
-    box.innerHTML = keys.map((k) => {
-      const n = syms[k]; const done = n >= target;
-      return '<span class="pill' + (done ? " done" : "") + '">' + esc(k) + " " + (done ? "✓ " + n : n + "/" + target) + "</span>";
-    }).join("");
-  }
-  function renderStatus(s) {
-    $("uptime").textContent = "· up " + fmtDur(s.uptime_s);
-    const sc = s.scan || {};
-    if (sc.generated_at) {
-      $("scan-when").textContent = agoText(sc.generated_at);
-      const c = sc.counts || {};
-      let d = (c.buy || 0) + " buy · " + (c.hold || 0) + " hold · " + (c.sell || 0) + " sell";
-      if (sc.total_cost != null) d += " · " + money(sc.total_cost);
-      if (sc.changed && sc.changed.length) d += " · " + sc.changed.length + " changed";
-      $("scan-detail").textContent = d;
-    } else { $("scan-when").textContent = "never"; $("scan-detail").textContent = "no scan yet"; }
-    nextScanTs = s.next_scan_at || null; tickCountdown();
-    const dk = s.disk || {};
-    $("disk-v").textContent = dk.pct != null ? dk.pct + "% · " + fmtBytes(dk.used) + " / " + fmtBytes(dk.total) : "–";
-    const meter = $("disk-meter"); const bar = meter.firstElementChild;
-    bar.style.width = (dk.pct != null ? Math.min(100, dk.pct) : 0) + "%";
-    meter.className = "meter" + (dk.pct >= 90 ? " err" : dk.pct >= 75 ? " warn" : "");
-    const ca = s.cache || {};
-    $("cache-detail").textContent = "Cache: " + fmtBytes(ca.shorts_bytes) + " in " + (ca.shorts_files || 0) +
-      " shorts files · " + (ca.iv_history_days_total || 0) + " IV-history rows";
-    renderIvProgress(s.iv_progress || {});
-  }
-  async function loadStatus() {
-    try { renderStatus(await (await fetch("/api/status")).json()); }
-    catch (e) { $("uptime").textContent = "· status unavailable"; }
-  }
-
-  const sigClass = (sig) => (sig && sig.indexOf("buy") >= 0) ? "sig-buy" : (sig && sig.indexOf("sell") >= 0) ? "sig-sell" : "sig-hold";
-  function scanBadges(r) {
-    let b = "";
-    if (r.flipped) b += '<span class="badge flip">flip</span>';
-    if (r.dip_new) b += '<span class="badge dip">dip+</span>';
-    if (r.crossed_below_200wma) b += '<span class="badge cross">×200w</span>';
-    return b;
-  }
-  async function loadScan() {
-    let data; try { data = await (await fetch("/scan/latest")).json(); } catch (e) { $("scan-body").innerHTML = '<tr><td colspan="7" class="empty">scan unavailable</td></tr>'; return; }
-    const rows = (data.results || []).filter((r) => !r.error);
-    const errs = (data.results || []).filter((r) => r.error);
-    $("scan-count").textContent = data.generated_at
-      ? "· " + rows.length + " scored" + (errs.length ? " · " + errs.length + " err" : "") : "· none yet";
-    const body = $("scan-body");
-    if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="empty">no scan results yet — runs nightly at 06:30, or POST /scan/run</td></tr>'; return; }
-    body.innerHTML = rows.map((r) => {
-      const changed = r.flipped || r.dip_new || r.crossed_below_200wma;
-      const th = esc(r.thesis || "");
-      return '<tr class="' + (changed ? "changed" : "") + '">' +
-        "<td><b>" + esc(r.symbol) + "</b>" + scanBadges(r) + "</td>" +
-        '<td class="' + sigClass(r.signal) + '">' + esc(r.signal) + "</td>" +
-        '<td class="num">' + (r.conviction != null ? esc(r.conviction) : "–") + "</td>" +
-        "<td>" + esc(r.dip || "–") + "</td>" +
-        "<td>" + esc(r.squeeze || "–") + "</td>" +
-        "<td>" + (r.below_200wma ? "yes" : "–") + "</td>" +
-        '<td class="thesis" title="' + th + '">' + th + "</td></tr>";
-    }).join("");
-  }
-
-  async function loadSources() {
-    let data;
-    try { data = await (await fetch("/api/sources")).json(); }
-    catch (e) { $("sources").innerHTML = '<div class="empty">sources unavailable</div>'; return; }
-    $("src-as-of").textContent = "· checked " + agoText(data.as_of);
-    $("sources").innerHTML = (data.sources || []).map((s) =>
-      '<div class="src"><span class="dot ' + esc(s.status) + '"></span>' +
-      '<span class="nm">' + esc(s.name) + "</span>" +
-      '<span class="lat">' + (s.latency_ms != null ? Math.round(s.latency_ms) + " ms" : "") + "</span>" +
-      '<span class="dt" title="' + esc(s.detail) + '">' + esc(s.detail) + "</span></div>"
-    ).join("") || '<div class="empty">no sources</div>';
-  }
-
-  async function loadCost() {
-    let c; try { c = await (await fetch("/api/cost")).json(); } catch (e) { $("cost-head").textContent = "cost unavailable"; return; }
-    let head = "Billed (API) — MTD <b>" + money(c.month_to_date_usd) + "</b> · projected <b>" +
-      money(c.projected_month_usd) + "</b> · all-time <b>" + money(c.all_time_usd) + "</b>";
-    if (c.cli_notional_usd > 0)
-      head += '<br><span class="hint">Subscription (CLI): <b>$0 billed</b> · ' +
-        money(c.cli_notional_usd) + " notional all-time (what it would’ve cost on the API)</span>";
-    $("cost-head").innerHTML = head;
-    const kinds = Object.entries(c.by_kind || {}).sort((a, b) => b[1].usd - a[1].usd);
-    $("cost-body").innerHTML = kinds.length ? kinds.map(([k, v]) =>
-      "<tr><td>" + esc(k) + '</td><td class="num">' + fmt(v.calls) + '</td><td class="num">' +
-      fmt(v.tokens) + '</td><td class="num">' + money(v.usd) + "</td></tr>").join("")
-      : '<tr><td colspan="4" class="empty">no calls recorded yet</td></tr>';
-    const bits = [];
-    if (c.per_scan_avg_usd != null) bits.push("per scan-call " + money(c.per_scan_avg_usd));
-    if (c.per_deep_avg_usd != null) bits.push("per deep-call " + money(c.per_deep_avg_usd));
-    $("cost-avg").textContent = bits.join(" · ");
-  }
-
-  async function loadLogs() {
-    let data; try { data = await (await fetch("/api/logs?limit=30")).json(); } catch (e) { $("logs").innerHTML = '<div class="empty">logs unavailable</div>'; return; }
-    const reqs = data.requests || [];
-    $("logs").innerHTML = reqs.length ? reqs.map((r) => {
-      const bad = r.status >= 400 || r.error;
-      return '<div class="logrow' + (bad ? " bad" : "") + '"><span class="m">' + esc(r.method) +
-        '</span><span class="p" title="' + esc(r.path) + '">' + esc(r.path) + '</span><span class="st">' +
-        r.status + '</span><span class="ms">' + Math.round(r.ms) + " ms</span></div>";
-    }).join("") : '<div class="empty">no requests recorded yet</div>';
-    const errs = data.errors || [];
-    $("errs-head").textContent = errs.length ? "Recent errors (" + errs.length + "):" : "No errors since restart.";
-    $("errs").innerHTML = errs.map((r) =>
-      '<div class="logrow bad"><span class="p">' + esc(r.method) + " " + esc(r.path) +
-      '</span><span class="st">' + r.status + "</span></div>").join("");
-  }
-
-  $("prune").onclick = async () => {
-    const ps = $("prune-status"); ps.textContent = "pruning…";
-    try {
-      const r = await (await fetch("/api/prune-cache", { method: "POST" })).json();
-      ps.textContent = "freed " + fmtBytes(r.bytes_freed) + " (" + r.deleted_files + " file" + (r.deleted_files === 1 ? "" : "s") + ")";
-    } catch (e) { ps.textContent = "prune failed"; }
-    loadStatus();
-  };
-
-  $("cli-test").onclick = async () => {
-    const st = $("cli-test-status"); st.textContent = "testing…"; st.className = "hint";
-    try {
-      const r = await (await fetch("/api/cli-auth-test")).json();
-      st.textContent = r.ok ? "✓ authenticated" : "✗ " + (r.detail || "failed");
-      st.className = r.ok ? "ok-t" : "err-t";
-    } catch (e) { st.textContent = "✗ request failed"; st.className = "err-t"; }
-  };
-
-  load(); checkVersion(); loadUsage();
-  loadStatus(); loadScan(); loadSources(); loadCost(); loadLogs();
-  setInterval(() => { refreshSynced(); loadUsage(); loadCost(); }, 60000); // heartbeat + usage/cost
-  setInterval(() => { loadStatus(); loadScan(); loadLogs(); }, 30000);     // live ops cards
-  setInterval(loadSources, 60000);                                          // source probes (heavier)
-  setInterval(tickCountdown, 1000);                                         // next-scan countdown
-</script>
-</body></html>"""
-
-
 @app.get("/", response_class=HTMLResponse)
 async def home() -> str:
-    return _PAGE
+    return dashboard.PAGE
 
 
 def _cli_token() -> str:
@@ -3418,6 +2889,11 @@ class SandboxSettingsPatch(BaseModel):
     min_conviction_to_trade: int | None = None
     respect_entry_zones: bool | None = None
     slippage_bps: int | None = None
+    # Arm-scoped. `model` pins the LLM backbone for this arm ("" / null = the service default);
+    # label and engine identify the experiment rather than configure it.
+    model: str | None = None
+    label: str | None = None
+    engine: str | None = None
 
 
 @app.post("/sandbox/tick")
@@ -3598,14 +3074,18 @@ async def sandbox_delete_arm_endpoint(arm: str) -> dict:
 
 
 @app.get("/sandbox/settings")
-async def sandbox_get_settings_endpoint() -> dict:
-    return sandbox_store.get()["settings"]
+async def sandbox_get_settings_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
+    return sandbox_store.get(_arm_or_400(arm))["settings"]
 
 
 @app.post("/sandbox/settings")
-async def sandbox_set_settings_endpoint(patch: SandboxSettingsPatch) -> dict:
+async def sandbox_set_settings_endpoint(
+    patch: SandboxSettingsPatch, arm: str = sandbox_store.MAIN_ARM,
+) -> dict:
+    """Patch one arm's settings. `arm` defaults to main, so every existing caller is unaffected."""
+    arm = _arm_or_400(arm)
     async with _sandbox_lock:
-        blob = sandbox_store.get()
+        blob = sandbox_store.get(arm)
         s = blob["settings"]
         d = patch.model_dump(exclude_none=True)
         if d.get("risk_tolerance") in ("conservative", "balanced", "aggressive"):
@@ -3659,9 +3139,28 @@ async def sandbox_set_settings_endpoint(patch: SandboxSettingsPatch) -> dict:
             s["max_new_positions_per_tick"] = max(0, min(20, int(d["max_new_positions_per_tick"])))
         if "slippage_bps" in d:
             s["slippage_bps"] = max(0, min(200, int(d["slippage_bps"])))
+        if "model" in d:
+            # Free text on purpose — model ids ship faster than any allow-list here could track, and
+            # an allow-list that lags is how a new frontier model becomes unusable. Empty = inherit
+            # the service's configured scan model, which is the right default for every arm that is
+            # not specifically testing a backbone.
+            v = str(d["model"] or "").strip()
+            s["model"] = v or None
         blob["settings"] = s
-        sandbox_store.save(blob)
-        return s
+        # Label and engine live on the BLOB, not in settings — they identify the experiment rather
+        # than configure it. Engine is validated here because an unknown value would silently fall
+        # through to the analyst path and quietly turn a control arm into another copy of main.
+        if d.get("label"):
+            blob["label"] = str(d["label"]).strip()[:48]
+        if d.get("engine"):
+            e = str(d["engine"]).strip().lower()
+            if e not in sandbox_store.ENGINES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"engine must be one of {', '.join(sandbox_store.ENGINES)}")
+            blob["engine"] = e
+        sandbox_store.save(blob, arm)
+        return {**s, "arm": arm, "label": blob.get("label"), "engine": blob.get("engine")}
 
 
 @app.post("/sandbox/fund")
