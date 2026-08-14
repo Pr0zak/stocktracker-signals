@@ -86,7 +86,13 @@ DEFAULT_SETTINGS = {
     "retirement_date": None,           # ISO yyyy-mm-dd; biases the glidepath (de-risk as it nears)
     # Age-based glidepath — clearer than a date for "how much runway is left". Drives the growth-vs-
     # income tilt (see the dividend research in research/README.md).
-    "current_age": None,
+    #
+    # `birth_date` is the input; `current_age` is the legacy one and now only a fallback. An age is a
+    # fact with a one-year shelf life, and this one is load-bearing — the runway is (retirement_age -
+    # current_age), so a number typed once keeps reporting the runway it had on the day it was typed.
+    # sandbox_job.effective_age() derives the age per tick and prefers the date whenever it is set.
+    "birth_date": None,                # ISO yyyy-mm-dd; server-side only, never sent to the model
+    "current_age": None,               # legacy static age; used only when birth_date is unset
     "retirement_age": 65,
     "exit_date": None,                 # ISO yyyy-mm-dd; flatten to cash by this date
     "max_position_pct": 20.0,          # cap per EXPOSURE GROUP (BTC+FBTC count as one)

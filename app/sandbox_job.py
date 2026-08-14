@@ -33,6 +33,56 @@ def today_et_str(now: dt.datetime | None = None) -> str:
     return (now or now_et()).date().isoformat()
 
 
+def age_on(birth_date: str | None, today: dt.date | None = None) -> int | None:
+    """Whole years from `birth_date` (ISO yyyy-mm-dd) to `today`. None if unset or unparseable.
+
+    The account's age is stored as a DATE rather than a number because an age is only true for a
+    year. `current_age` was written once, by hand, and then aged silently into a lie — and it is not
+    a cosmetic field: the glidepath the entire strategy hangs off is (retirement_age - current_age),
+    so a stale age quietly lengthens the runway by however long ago it was typed. A birth date is
+    the same fact with the drift taken out.
+    """
+    if not birth_date:
+        return None
+    try:
+        born = dt.date.fromisoformat(str(birth_date).strip())
+    except (ValueError, TypeError):
+        return None
+    today = today or now_et().date()
+    if born > today:
+        return None
+    # Take a year off when this year's birthday has not arrived. Comparing (month, day) tuples also
+    # settles Feb 29 without a special case: in a common year the birthday turns over on Mar 1.
+    return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+
+
+def effective_age(settings: dict, today: dt.date | None = None) -> int | None:
+    """The account's age now: derived from `birth_date` when one is set, else the stored number.
+
+    birth_date WINS wherever both exist, because the stored number is the stale one by construction.
+    The fallback is what lets an account configured before birth_date existed keep working untouched
+    until someone sets a date — until then it behaves exactly as it did.
+    """
+    derived = age_on(settings.get("birth_date"), today)
+    # Explicit None check, not `or`: age 0 is a real answer and would be swallowed by truthiness.
+    return derived if derived is not None else settings.get("current_age")
+
+
+def settings_for_prompt(settings: dict, today: dt.date | None = None) -> dict:
+    """What the analyst sees: `current_age` refreshed from `birth_date`, and `birth_date` dropped.
+
+    The whole settings dict is json.dumps'd into both the daily and weekly prompts, so every key
+    left in it is sent to the model verbatim. The model reasons about RUNWAY, which the derived age
+    already carries in full; an exact date of birth adds nothing to the decision and is the more
+    personal of the two facts. So derive it here, then drop the source.
+    """
+    out = {k: v for k, v in settings.items() if k != "birth_date"}
+    age = effective_age(settings, today)
+    if age is not None:
+        out["current_age"] = age
+    return out
+
+
 def is_crypto(symbol: str) -> bool:
     return symbol.upper().endswith("-USD")
 

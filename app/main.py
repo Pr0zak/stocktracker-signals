@@ -2366,7 +2366,8 @@ async def _maybe_weekly_review(
     except Exception:  # noqa: BLE001 — enrichment, never a blocker
         pass
     try:
-        note, usage = await strategy_review(context, settings=settings, deep=True)
+        note, usage = await strategy_review(
+            context, settings=sandbox_job.settings_for_prompt(settings), deep=True)
         usage_store.record(usage, symbol="SANDBOX", kind="sandbox_strategy")
         # Resolve the targets onto today's exposure groups BEFORE anything stores or reads them, so a
         # plan can never carry two labels for one group past this line. One dict from here on: the
@@ -2484,7 +2485,8 @@ async def _run_extra_arm(
             # Per-arm backbone. None = the service's configured scan model, so an arm that does not
             # set one is a true copy of main rather than a second variable.
             decision, usage = await sandbox_decision(
-                book, candidates, cash=blob["cash"], settings=settings,
+                book, candidates, cash=blob["cash"],
+                settings=sandbox_job.settings_for_prompt(settings),
                 strategy_note=shared_plan, macro=macro_block, deep=False,
                 model=(str(settings.get("model")).strip() or None) if settings.get("model") else None)
             usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
@@ -2731,7 +2733,8 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 macro_block = None
             try:
                 decision, usage = await sandbox_decision(
-                    book, candidates, cash=blob["cash"], settings=settings,
+                    book, candidates, cash=blob["cash"],
+                    settings=sandbox_job.settings_for_prompt(settings),
                     strategy_note=blob.get("last_strategy_note"), macro=macro_block, deep=False)
                 usage_store.record(usage, symbol="SANDBOX", kind="sandbox_tick")
                 orders = [o.model_dump() for o in decision.orders]
@@ -2865,6 +2868,7 @@ class SandboxSettingsPatch(BaseModel):
     master_enabled: bool | None = None
     risk_tolerance: str | None = None
     retirement_date: str | None = None
+    birth_date: str | None = None
     current_age: int | None = None
     retirement_age: int | None = None
     account_type: str | None = None
@@ -2960,7 +2964,12 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
         "benchmark_value": bench_val,
         "vs_benchmark_pct": round((equity - bench_val) / bench_val * 100, 2) if bench_val else None,
         "positions": sorted(positions, key=lambda x: -x["value"]),
-        "settings": blob["settings"], "enabled": blob["settings"]["master_enabled"],
+        # `current_age` is derived here so a client renders today's age rather than whatever was
+        # stored — the stored key is None once a birth_date exists. birth_date itself is kept in the
+        # response (unlike in the prompt) so a settings UI can show and edit the field it owns.
+        "settings": {**blob["settings"],
+                     "current_age": sandbox_job.effective_age(blob["settings"])},
+        "enabled": blob["settings"]["master_enabled"],
         "last_tick_date": blob.get("last_tick_date"),
         "last_weekly_review_date": blob.get("last_weekly_review_date"),
         "last_strategy_note": blob.get("last_strategy_note"), "created_at": blob.get("created_at"),
@@ -3132,6 +3141,26 @@ async def sandbox_set_settings_endpoint(
         for k in ("retirement_date", "exit_date", "goal_date"):
             if k in d:
                 s[k] = d[k] or None
+        if "birth_date" in d:
+            # Validated, unlike the date fields above, because this one is ARITHMETIC rather than a
+            # bias. An unparseable retirement_date is inert; an unparseable birth_date makes age_on()
+            # return None, the account falls back to the stored `current_age`, and the exact drift
+            # this field exists to remove comes back silently. So refuse the write instead.
+            raw = str(d["birth_date"] or "").strip()
+            if not raw:
+                s["birth_date"] = None
+            else:
+                age = sandbox_job.age_on(raw)
+                if age is None or age > 120:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"birth_date {raw!r} must be an ISO yyyy-mm-dd date in the past "
+                               f"implying an age of 120 or under")
+                s["birth_date"] = raw
+                # One source of truth. The stored number is what went stale; keeping a copy of it
+                # next to the date invites some later reader to pick the wrong one. Absent beats
+                # stale — every consumer goes through sandbox_job.effective_age() now.
+                s["current_age"] = None
         if "account_type" in d and str(d["account_type"]).lower() in ("cash", "margin"):
             s["account_type"] = str(d["account_type"]).lower()
         if "preferred_btc_etf" in d:
