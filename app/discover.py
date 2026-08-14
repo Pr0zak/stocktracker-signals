@@ -80,7 +80,7 @@ def _raw(v) -> float:
 
 
 async def discover(client: httpx.AsyncClient, exclude: set[str], cap: int = 15,
-                   screens: tuple[str, ...] = _SCREENS) -> list[str]:
+                   screens: tuple[str, ...] = _SCREENS, allow_etf: bool = True) -> list[str]:
     """Candidate symbols beyond the caller's own list, most interesting first. Never raises.
 
     `screens` defaults to the four momentum/value angles. Pass [WIDE_SCREENS] for a pool that also
@@ -111,6 +111,10 @@ async def discover(client: httpx.AsyncClient, exclude: set[str], cap: int = 15,
                 continue
             qt = q.get("quoteType", "EQUITY")
             if qt not in ("EQUITY", "ETF"):
+                continue
+            # Applied here because `quoteType` is only available inside this loop -- the function
+            # returns bare symbols, so a caller cannot filter on something it never sees.
+            if not allow_etf and qt == "ETF":
                 continue
             price = _raw(q.get("regularMarketPrice"))
             mktcap = _raw(q.get("marketCap"))

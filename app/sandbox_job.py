@@ -97,26 +97,20 @@ def select_candidates(
 ) -> tuple[list[str], list[str]]:
     """The symbols the daily tick puts in front of the model. Returns (candidates, dropped).
 
-    Two channels feed the pool: the user's watchlist, and `discovered` — names from the live market
-    screen, the only channel that can surface something the user has never heard of. They get
-    SEPARATE budgets and never compete, so the total grows as the watchlist grows.
+    Two channels feed the pool and they get SEPARATE budgets, so neither is ever trimmed to make room
+    for the other. `watchlist` is the caller's standing list — for the sandbox, its own fixed shelf of
+    broad-market vehicles — and `discovered` is the live market screen.
 
-    Both halves of that matter, and each fixes a distinct failure:
+    Sharing one budget between them means one side always loses, and both ways of losing shipped on
+    2026-08-14. Slicing a watchlist-first list starved the SCREEN: a 25-name list left 4 of 8 screened
+    names cut, so the only channel that can surface an unfamiliar name shrank as the list grew.
+    Reserving the screen's slice moved the loss onto the LIST: within the hour it reached 49 names and
+    21 fell off the end. The second is the worse failure — adding one entry silently evicted another.
 
-    - One shared budget sliced watchlist-first starved the screen. Every symbol the user added took
-      another slot off it, so the channel that finds new ideas shrank precisely as the user curated
-      more. Measured 2026-08-14: a 25-name watchlist left 4 of 8 screened names cut.
-    - A shared budget with the screen's slice reserved fixed that, and moved the loss onto the
-      watchlist instead. On the same day, the list grew to 49 and 21 names — every ticker added that
-      afternoon — fell off the end. A cap the user has to know about to avoid is not a cap, it is a
-      trap; adding a ticker should never silently evict another.
-
-    Separate budgets mean the watchlist is bounded only by [max_watchlist], which is a runaway guard
-    rather than a working limit: at roughly 230 tokens per candidate row, even both budgets full is
-    a five-figure token count on ONE Haiku call per day. The thing that actually degrades at that
-    size is ranking quality, not cost, and there is no measurement here to site a quality limit on —
-    so the ceiling is set where a list stops being plausibly hand-curated, not where a guess says
-    the model gets worse.
+    Separate budgets mean [max_watchlist] is a runaway guard, not a working limit: at roughly 230
+    tokens per candidate row, both budgets full is a five-figure token count on ONE call per day. What
+    plausibly degrades at that size is ranking quality, and nothing here measures it — so the ceiling
+    sits where a list stops looking deliberate, not where a guess says the model gets worse.
 
     Anything trimmed is RETURNED rather than dropped quietly. A truncated list is indistinguishable
     from a short one once you are downstream of it, and "the model did not buy it" and "the model
@@ -145,6 +139,43 @@ def select_candidates(
     watch_syms = eligible(watchlist)
     disc_syms = eligible(discovered)[:max_discovered]
     return watch_syms[:max_watchlist] + disc_syms, watch_syms[max_watchlist:]
+
+
+def unaffordable(
+    symbols: list[str],
+    *,
+    price_of: Callable[[str], float | None],
+    equity: float,
+    max_position_pct: float,
+) -> list[str]:
+    """Candidates whose ONE share costs more than the position cap could ever buy.
+
+    A single BRK-A share is around $700,000 against a book of $10,800. The model has no way to know
+    that: it sees a well-run company with real technicals, proposes it, and the order is refused by
+    the per-group cap. Then it happens again tomorrow, because nothing about the refusal changes what
+    the screen returns. The name is not a bad idea that was rejected — it is an idea this account is
+    structurally incapable of acting on, and it should never have occupied a candidate slot.
+
+    The ceiling is the per-exposure-group cap, not the cash balance. Cash is today's constraint and
+    moves; the cap is what the account may EVER put into one group, so a share priced above it can
+    never fill however the book grows from here.
+
+    Two things are deliberately not filtered:
+    - Crypto, which fills fractionally, so no minimum-lot problem exists.
+    - Symbols with no price. Absent is not the same as expensive, and dropping an unpriced candidate
+      would quietly shrink the universe every time a quote failed.
+    """
+    ceiling = max(0.0, equity) * max(0.0, max_position_pct) / 100.0
+    if ceiling <= 0:
+        return []
+    out = []
+    for sym in symbols:
+        if is_crypto(sym):
+            continue
+        px = price_of(sym)
+        if px is not None and px > ceiling:
+            out.append(sym)
+    return out
 
 
 def is_crypto(symbol: str) -> bool:
@@ -791,7 +822,10 @@ def validate_and_fill(
     max_new = int(s.get("max_new_positions_per_tick", 2))
     allow_crypto = bool(s.get("allow_crypto", False))          # direct spot (BTC-USD)
     allow_crypto_etf = bool(s.get("allow_crypto_etf", True))   # spot-crypto ETFs (IBIT/FBTC/FETH)
-    allow_etf = bool(s.get("allow_etf", True))  # ETF filtering is best-effort (source-tagged upstream)
+    # NOTE: allow_etf is NOT enforced here. It is applied UPSTREAM, where the universe is built --
+    # main.py empties the ETF shelf and tells discover() to skip ETF quote types. This layer only
+    # sees a ticker string and has no way to tell an ETF from a stock, so the check it used to hold
+    # was a local variable that nothing read: the setting looked enforced and was not.
     respect_zones = bool(s.get("respect_entry_zones", True))
     # Brokerage realism. CASH accounts settle T+1 (US moved from T+2 on 2024-05-28), so proceeds from
     # today's sales cannot fund today's buys — reusing them is a good-faith violation that a real broker

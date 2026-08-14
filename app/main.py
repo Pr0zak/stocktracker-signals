@@ -2250,7 +2250,6 @@ _SANDBOX_CORE = [
 # 25-minute window before the close. What plausibly does degrade at this size is the model's ranking
 # across a long list, and nothing here measures that — so this is a deliberate bet on coverage over
 # an unmeasured concentration effect, and it is worth revisiting with the arms once they have data.
-_SANDBOX_MAX_CORE = len(_SANDBOX_CORE)
 _SANDBOX_MAX_SCREENED = 80
 
 
@@ -2675,22 +2674,37 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
 
         held = [p["symbol"].upper() for p in blob["positions"]]
         # NOT cfg["watchlist"]. The sandbox's universe is its own — see _SANDBOX_CORE.
+        #
+        # The shelf is entirely ETFs, so `allow_etf` empties it outright. That setting had been DEAD
+        # since it was added — sandbox_job read it into a local and never used it — which mattered
+        # little while the universe was the user's watchlist and matters a lot now that switching it
+        # off would otherwise still serve nine index funds a day.
+        core = list(_SANDBOX_CORE) if settings.get("allow_etf", True) else []
+        # One bitcoin ETF, the one the user picked. Every vehicle in the BTC group holds the same
+        # asset, so offering all of them is not a choice between exposures — it is an invitation to
+        # fragment one position across three tickers. prefer_btc_etf already reroutes a stray BUY,
+        # but a candidate slot spent on a vehicle that will be redirected anyway is a wasted slot
+        # and a confusing line of reasoning in the trade log.
+        _pref = str(settings.get("preferred_btc_etf") or "").strip().upper()
+        if _pref in sandbox_job.BTC_ETFS:
+            core = [s for s in core if s not in sandbox_job.BTC_ETFS or s == _pref]
         try:
             # Ask for more than the budget: the vehicle and exclusion filters below run AFTER this
             # cap, so requesting exactly the budget lets a few filtered names shrink the screen's
             # slice below its size. The screeners are already fetched in full, so asking wide is free.
             discovered = [s.upper() for s in await discover(
                 _http, set(held) | set(_SANDBOX_CORE),
-                cap=_SANDBOX_MAX_SCREENED + 10, screens=WIDE_SCREENS)]
+                cap=_SANDBOX_MAX_SCREENED + 10, screens=WIDE_SCREENS,
+                allow_etf=bool(settings.get("allow_etf", True)))]
         except Exception:  # noqa: BLE001
             discovered = []
-        core_set = set(_SANDBOX_CORE)
+        core_set = set(core)
         candidate_syms, dropped_syms = sandbox_job.select_candidates(
-            watchlist=_SANDBOX_CORE, discovered=discovered, held=held, exclusions=exclude,
+            watchlist=core, discovered=discovered, held=held, exclusions=exclude,
             allow_crypto=bool(settings.get("allow_crypto", False)),
             allow_crypto_etf=bool(settings.get("allow_crypto_etf", True)),
             group_of=_exposure_group,
-            max_watchlist=_SANDBOX_MAX_CORE, max_discovered=_SANDBOX_MAX_SCREENED)
+            max_watchlist=len(core), max_discovered=_SANDBOX_MAX_SCREENED)
         if dropped_syms:
             # Never truncate in silence. A shortened list looks exactly like a short list from the
             # inside, and the names that fall off the end are the ones nobody is watching for.
@@ -2740,6 +2754,21 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         def price_of(sym: str):
             return prices.get(sym.upper())
         spy_price = prices.get("^GSPC")
+
+        # Drop candidates one share of which costs more than the position cap could ever buy. This
+        # runs HERE rather than at selection because it needs live prices, which only exist now.
+        # Logged, not warned: unlike a truncation this removes nothing the account could have used,
+        # and a daily warning naming the same structurally-impossible ticker is noise that would
+        # teach the reader to skim the warnings that do matter.
+        _equity = blob["cash"] + sandbox_job.positions_value(blob["positions"], price_of)
+        _too_dear = sandbox_job.unaffordable(
+            candidate_syms, price_of=price_of, equity=_equity,
+            max_position_pct=float(settings.get("max_position_pct", 20.0)))
+        if _too_dear:
+            _log.info("sandbox: dropping unaffordable candidates %s (one share exceeds the %.0f%% "
+                      "cap on $%.0f equity)", ", ".join(_too_dear),
+                      float(settings.get("max_position_pct", 20.0)), _equity)
+            candidate_syms = [s for s in candidate_syms if s not in set(_too_dear)]
 
         weekly_ran = False
         posture = ""
