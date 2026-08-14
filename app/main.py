@@ -2695,7 +2695,8 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
             discovered = [s.upper() for s in await discover(
                 _http, set(held) | set(_SANDBOX_CORE),
                 cap=_SANDBOX_MAX_SCREENED + 10, screens=WIDE_SCREENS,
-                allow_etf=bool(settings.get("allow_etf", True)))]
+                allow_etf=bool(settings.get("allow_etf", True)),
+                min_market_cap=float(settings.get("min_market_cap", 2_000_000_000.0) or 0.0))]
         except Exception:  # noqa: BLE001
             discovered = []
         core_set = set(core)
@@ -2982,6 +2983,7 @@ class SandboxSettingsPatch(BaseModel):
     allow_crypto_etf: bool | None = None
     preferred_btc_etf: str | None = None
     allow_etf: bool | None = None
+    min_market_cap: float | None = None
     exclusions: list[str] | None = None
     cadence: str | None = None
     allow_after_hours: bool | None = None
@@ -3277,6 +3279,11 @@ async def sandbox_set_settings_endpoint(
             if k in d:
                 v = d[k]
                 s[k] = max(0, min(120, int(v))) if v else None
+        if "min_market_cap" in d:
+            # Clamped, not rejected. This is a coarse dial the user drags on a chip row, and refusing
+            # a value there would surface as a failed save with nothing on screen explaining which
+            # bound was crossed. 0 means no floor at all, which is a legitimate choice.
+            s["min_market_cap"] = max(0.0, min(5e12, float(d["min_market_cap"])))
         if "goal_amount" in d:
             v = float(d["goal_amount"])
             s["goal_amount"] = v if v > 0 else None

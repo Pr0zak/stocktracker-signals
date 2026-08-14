@@ -108,6 +108,12 @@ DEFAULT_SETTINGS = {
     # sandbox_job.prefer_btc_etf); sells are never redirected, since you can only sell what you hold.
     "preferred_btc_etf": "FBTC",
     "allow_etf": True,
+    # Smallest company the market screen may propose, in USD of market cap. The universe reaches the
+    # whole market now, and the screens that give it breadth (actives, gainers, small-cap growth) are
+    # also where the speculative end lives — this is the dial between "every listed name above the
+    # junk floor" and "only established companies". ETFs are unaffected: they report AUM, not market
+    # cap, and filtering a broad index fund by company size is a category error.
+    "min_market_cap": 2_000_000_000.0,
     "slippage_bps": 5,                 # modeled fill slippage (buys up, sells down)
     "max_trades_per_tick": 4,
     "max_new_positions_per_tick": 2,

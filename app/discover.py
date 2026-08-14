@@ -80,7 +80,8 @@ def _raw(v) -> float:
 
 
 async def discover(client: httpx.AsyncClient, exclude: set[str], cap: int = 15,
-                   screens: tuple[str, ...] = _SCREENS, allow_etf: bool = True) -> list[str]:
+                   screens: tuple[str, ...] = _SCREENS, allow_etf: bool = True,
+                   min_market_cap: float = 2_000_000_000.0) -> list[str]:
     """Candidate symbols beyond the caller's own list, most interesting first. Never raises.
 
     `screens` defaults to the four momentum/value angles. Pass [WIDE_SCREENS] for a pool that also
@@ -120,12 +121,23 @@ async def discover(client: httpx.AsyncClient, exclude: set[str], cap: int = 15,
             mktcap = _raw(q.get("marketCap"))
             if price and price < 5:  # skip penny-ish names
                 continue
-            if qt == "EQUITY" and mktcap and mktcap < 2_000_000_000:  # skip micro caps
+            # Skip anything below the caller's size floor. `mktcap and` keeps a name whose cap the
+            # screener did not report: absent is not the same as small, and a missing field is a fact
+            # about Yahoo's response rather than about the company. That does mean a raised floor
+            # leaks the occasional unreported name — the alternative silently drops real companies on
+            # a data gap, which is the worse trade for a universe this is meant to widen.
+            if qt == "EQUITY" and mktcap and mktcap < min_market_cap:
                 continue
             seen.add(sym)
             out.append(sym)
             if len(out) >= cap:
                 return out
-    if len(out) < 5:  # screeners down/blocked — use the curated universe
+    # Fall back ONLY when the screeners returned nothing at all. The trigger used to be "fewer than
+    # five names survived", which conflates two unrelated situations: the API being unreachable, and
+    # the caller's own filters being strict. Raise min_market_cap high enough and the second one
+    # fires — silently replacing a deliberately narrow universe with a hardcoded list that the floor
+    # was never applied to. A configuration doing exactly what it was told is not a failure, and the
+    # user gets no signal that their setting stopped being honoured.
+    if not any(quote_lists):
         out = [s for s in FALLBACK if s not in exclude]
     return out[:cap]
