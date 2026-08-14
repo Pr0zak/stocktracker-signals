@@ -3028,6 +3028,41 @@ async def sandbox_arms_endpoint() -> dict:
     return {"arms": out}
 
 
+@app.get("/sandbox/arms/nav")
+async def sandbox_arms_nav_endpoint(days: int = 180) -> dict:
+    """Every arm's equity curve on ONE shared date axis, for charting them against each other.
+
+    Aligned here rather than on the client because the arms do not share a history: `main` has weeks
+    the others do not, an arm created today has one point, and a day any arm sat out is a gap in that
+    arm alone. Charting those raw would draw curves that step through different dates at the same x
+    position — a picture that looks like a comparison and isn't. Each arm's `equity` is padded to the
+    union of all dates with nulls where that arm has no observation, so index i is the same day in
+    every series.
+
+    `common_start` is the first date on which EVERY arm has a value. That is the only honest place to
+    base an indexed comparison: before it, at least one arm did not exist, and normalising there would
+    credit or blame it for a period it never traded."""
+    ids = sandbox_store.list_arms()
+    series = {a: sandbox_store.read_nav(days, a) for a in ids}
+    dates = sorted({str(r.get("date")) for rows in series.values() for r in rows if r.get("date")})
+    out = []
+    for a in ids:
+        blob = sandbox_store.get(a)
+        by_date = {str(r.get("date")): r for r in series[a] if r.get("date")}
+        eq, bench = [], []
+        for d in dates:
+            r = by_date.get(d)
+            eq.append(round(float(r["equity"]), 2) if r and r.get("equity") is not None else None)
+            bv = r.get("benchmark_value") if r else None
+            bench.append(round(float(bv), 2) if bv is not None else None)
+        out.append({"arm": a, "label": blob.get("label") or a, "engine": blob.get("engine", "llm"),
+                    "equity": eq, "benchmark_value": bench})
+    common = next((i for i, _ in enumerate(dates)
+                   if all(s["equity"][i] is not None for s in out)), None)
+    return {"dates": dates, "common_start": dates[common] if common is not None else None,
+            "common_start_index": common, "arms": out}
+
+
 @app.post("/sandbox/arms")
 async def sandbox_create_arm_endpoint(req: SandboxArmCreate) -> dict:
     """Create a comparison arm, optionally funding and enabling it in the same call.
