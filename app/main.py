@@ -817,6 +817,33 @@ async def universe_endpoint(limit: int = 25) -> dict:
     }
 
 
+@app.get("/sectors")
+async def sectors_endpoint(symbols: str = "") -> dict:
+    """{SYMBOL: {sector, industry}} for the requested tickers. Free — NO LLM.
+
+    The same disk-cached classification the heat map groups by, exposed so the watchlist can section
+    itself the same way. A company's sector changes approximately never, so this is a write-once cost
+    per symbol and almost always a pure cache read.
+
+    A symbol that cannot be classified comes back present with a null sector rather than missing from
+    the map. The two mean different things to a caller — "we looked and it is unclassified" versus
+    "we never looked" — and only the first one is safe to render as "Other".
+    """
+    assert _http is not None
+    want = [s.strip().upper() for s in symbols.split(",") if s.strip()][:200]
+    if not want:
+        return {"sectors": {}}
+    try:
+        found = await sectors.lookup(_http, want)
+    except Exception as e:  # noqa: BLE001
+        # 502 rather than an empty map. An empty map is indistinguishable from "none of these could
+        # be classified", which would file the caller's entire watchlist under Other and look like an
+        # answer. A failure has to read as a failure.
+        raise HTTPException(status_code=502, detail=f"sector lookup failed: {e}")
+    return {"sectors": {s: {"sector": (found.get(s) or {}).get("sector"),
+                            "industry": (found.get(s) or {}).get("industry")} for s in want}}
+
+
 @app.get("/heatmap")
 async def heatmap_endpoint(mode: str = "market", limit: int = 80, refresh: bool = False) -> dict:
     """Tile data for the market heat map. Free — NO LLM.
@@ -2187,19 +2214,22 @@ async def _long_term_block(sym: str, closes: list[float]) -> dict | None:
     return _compact_trend((await cycle.crypto_context(_http, sym, closes)).get("long_term_trend"))
 
 
-# How many symbols the daily tick puts in front of the model, and how much of that budget the market
-# screen is guaranteed.
+# The daily tick's candidate budget, one per channel. They do not compete: the total GROWS with the
+# watchlist, and the market screen always has room of its own.
 #
-# These used to be one flat `[:24]` applied to a list ordered watchlist-first, which meant the market
-# screen was whatever survived after the watchlist had taken what it wanted. Measured 2026-08-14: a
-# 25-name watchlist filled 20 slots and 4 of the 8 screened names were cut — the tick paid to fetch
-# and rank them, then dropped them before the model ever saw one. Worse, it degraded silently and
-# monotonically: every symbol added to the watchlist took another slot off the screen, so the one
-# channel that can surface a name the user has never heard of shrinks as the user does more work.
+# This was a single flat `[:24]` over a watchlist-first list, which starved the screen — every symbol
+# added to the watchlist took another slot off it, and on 2026-08-14 a 25-name list cut 4 of the 8
+# screened names after paying to fetch and rank them. Reserving the screen's slice fixed that but
+# simply moved the loss: the same afternoon the watchlist grew to 49 and 21 names fell off the end,
+# which is the worse failure of the two. A ticker the user deliberately added should never be evicted
+# by the next one they add.
 #
-# A reserved slice fixes the ordering dependency outright. The screen cannot be crowded out, and the
-# watchlist still gets the whole budget on days the screeners return nothing.
-_SANDBOX_MAX_CANDIDATES = 34
+# _SANDBOX_MAX_WATCHLIST is therefore a runaway guard, not a working limit. Candidate rows measure
+# ~230 tokens each, so both budgets full is ~17k tokens on ONE Haiku call per day — the cost is not
+# the constraint. Ranking quality plausibly is, at some size, but nothing here measures it, so the
+# ceiling sits where a list stops looking hand-curated rather than at a number invented to sound
+# careful. Anything past it is reported, never dropped in silence.
+_SANDBOX_MAX_WATCHLIST = 60
 _SANDBOX_MAX_DISCOVERED = 12
 
 
@@ -2641,13 +2671,13 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
             allow_crypto=bool(settings.get("allow_crypto", False)),
             allow_crypto_etf=bool(settings.get("allow_crypto_etf", True)),
             group_of=_exposure_group,
-            max_candidates=_SANDBOX_MAX_CANDIDATES, max_discovered=_SANDBOX_MAX_DISCOVERED)
+            max_watchlist=_SANDBOX_MAX_WATCHLIST, max_discovered=_SANDBOX_MAX_DISCOVERED)
         if dropped_syms:
             # Never truncate in silence. A shortened list looks exactly like a short list from the
             # inside, and the names that fall off the end are the ones nobody is watching for.
             warnings.append(
                 f"watchlist truncated — {len(dropped_syms)} symbol(s) past the "
-                f"{_SANDBOX_MAX_CANDIDATES}-candidate budget were not considered: "
+                f"{_SANDBOX_MAX_WATCHLIST}-name watchlist ceiling were not considered: "
                 f"{', '.join(dropped_syms)}")
 
         # The preferred bitcoin ETF must always be priced, even when it didn't make the candidate

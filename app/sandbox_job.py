@@ -92,24 +92,31 @@ def select_candidates(
     allow_crypto: bool,
     allow_crypto_etf: bool,
     group_of: Callable[[str], str],
-    max_candidates: int,
+    max_watchlist: int,
     max_discovered: int,
 ) -> tuple[list[str], list[str]]:
     """The symbols the daily tick puts in front of the model. Returns (candidates, dropped).
 
     Two channels feed the pool: the user's watchlist, and `discovered` — names from the live market
-    screen, the only channel that can surface something the user has never heard of. They compete for
-    one budget, and the ORDER OF TRUNCATION decides which one loses.
+    screen, the only channel that can surface something the user has never heard of. They get
+    SEPARATE budgets and never compete, so the total grows as the watchlist grows.
 
-    It used to be a flat slice over watchlist-then-discovered, so the screen got whatever the
-    watchlist did not want. That degrades monotonically in the worst direction: every symbol the user
-    adds to their watchlist takes another slot off the screen, so the channel that finds new ideas
-    shrinks precisely as the user does more work. Measured 2026-08-14, a 25-name watchlist left 4 of
-    8 screened names cut — fetched, ranked, then dropped before the model saw one.
+    Both halves of that matter, and each fixes a distinct failure:
 
-    So the screen's slice is RESERVED and the watchlist is trimmed to the remainder. This costs the
-    watchlist nothing on a normal day (it is smaller than the budget) and costs it nothing at all on
-    a day the screeners are down, since an empty `discovered` hands the whole budget back.
+    - One shared budget sliced watchlist-first starved the screen. Every symbol the user added took
+      another slot off it, so the channel that finds new ideas shrank precisely as the user curated
+      more. Measured 2026-08-14: a 25-name watchlist left 4 of 8 screened names cut.
+    - A shared budget with the screen's slice reserved fixed that, and moved the loss onto the
+      watchlist instead. On the same day, the list grew to 49 and 21 names — every ticker added that
+      afternoon — fell off the end. A cap the user has to know about to avoid is not a cap, it is a
+      trap; adding a ticker should never silently evict another.
+
+    Separate budgets mean the watchlist is bounded only by [max_watchlist], which is a runaway guard
+    rather than a working limit: at roughly 230 tokens per candidate row, even both budgets full is
+    a five-figure token count on ONE Haiku call per day. The thing that actually degrades at that
+    size is ranking quality, not cost, and there is no measurement here to site a quality limit on —
+    so the ceiling is set where a list stops being plausibly hand-curated, not where a guess says
+    the model gets worse.
 
     Anything trimmed is RETURNED rather than dropped quietly. A truncated list is indistinguishable
     from a short one once you are downstream of it, and "the model did not buy it" and "the model
@@ -137,8 +144,7 @@ def select_candidates(
 
     watch_syms = eligible(watchlist)
     disc_syms = eligible(discovered)[:max_discovered]
-    budget = max(0, max_candidates - len(disc_syms))
-    return watch_syms[:budget] + disc_syms, watch_syms[budget:]
+    return watch_syms[:max_watchlist] + disc_syms, watch_syms[max_watchlist:]
 
 
 def is_crypto(symbol: str) -> bool:
