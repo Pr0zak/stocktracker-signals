@@ -12,6 +12,7 @@ asserts cash conservation before the caller commits.
 from __future__ import annotations
 
 import datetime as dt
+import math
 import time
 from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
@@ -178,6 +179,23 @@ def unaffordable(
     return out
 
 
+# The lowest quote a fill will act on, for instruments that trade in whole shares.
+#
+# `not px or px <= 0` already rejects an absent, zero or negative quote — but not a garbage one just
+# ABOVE zero, and a feed glitch does not politely return exactly 0.0. Measured 2026-08-14 by fuzzing:
+# a quote of 1e-9 turned a $100 order into 99,950,024,987 shares, logged the fill price as $0.00
+# (2dp rounding of 1e-9), and cash stayed conserved the whole way, so the cash-conservation assert
+# that guards this module saw nothing wrong. The damage lands the NEXT day: once the feed recovers to
+# a real price, marking that position produced a NAV point of $23,128,435,791,892 against $10,000
+# funded. sandbox_nav.jsonl is APPEND-ONLY, so that point can never be retracted — one bad quote
+# permanently destroys the equity curve and every benchmark comparison drawn from it.
+#
+# A penny is the floor because US equities and ETFs quote in pennies; a sub-penny print for a name
+# that cleared the universe's $5 filter is a broken quote, not a cheap stock. Crypto is exempt and
+# fills fractionally, so a genuine sub-penny coin (SHIB at ~$0.00001) is unaffected.
+MIN_FILL_PRICE = 0.01
+
+
 def is_crypto(symbol: str) -> bool:
     return symbol.upper().endswith("-USD")
 
@@ -213,6 +231,27 @@ def round_shares(symbol: str, shares: float) -> float:
 # N=1 that is the GOOGL order vanishing; at N=10 it is nine shares and a silently unspent share's
 # worth of cash. Same cause, same fix.
 ROUND_UP_MIN_SHARE = 0.9
+
+
+def _round_price(px: float | None) -> float | None:
+    """Round a price for the LOG without flattening a sub-penny asset to zero.
+
+    A flat `round(px, 4)` is right for anything quoting in dollars and wrong for everything below a
+    penny: SHIB trades near $0.000012, so a real $500 fill was recorded as `price: 0.0` and
+    `avg_cost_after: 0.0`. The POSITION kept full precision, so no money was lost and the unrealized
+    P/L stayed correct -- but sandbox_trades.jsonl is the append-only audit record, and it was
+    asserting that a purchase happened at zero. That is the same defect class this codebase keeps
+    fixing in the UI: a confident number that is simply untrue, indistinguishable from a real one.
+
+    Four significant figures below a penny, four decimals at or above it.
+    """
+    if px is None:
+        return None
+    if px == 0 or not math.isfinite(px):
+        return px
+    if abs(px) >= 0.01:
+        return round(px, 4)
+    return round(px, -math.floor(math.log10(abs(px))) + 3)
 
 
 def _usd(x: float) -> str:
@@ -863,9 +902,9 @@ def validate_and_fill(
         # log is quietly answering a question nobody can see it was asked.
         filled.append({
             "ts": now_ts, "date": today_et_str(), "symbol": o["symbol"].upper(), "side": side,
-            "status": "filled", "shares": round(shares, 6), "price": round(price, 4),
+            "status": "filled", "shares": round(shares, 6), "price": _round_price(price),
             "gross": round(shares * price, 2), "cash_after": round(cash_after, 2),
-            "avg_cost_after": round(pos_after["avg_cost"], 4) if pos_after else None,
+            "avg_cost_after": _round_price(pos_after["avg_cost"]) if pos_after else None,
             "realized_pl": round(realized, 2), "exposure_group": group_of(o["symbol"]),
             "conviction": o.get("conviction"), "source": source, "reason": o.get("reason", ""),
             "entry_low": o.get("entry_low"), "entry_high": o.get("entry_high"),
@@ -926,6 +965,11 @@ def validate_and_fill(
         px = price_of(sym)
         if not px or px <= 0:   # a negative quote would book a sale as a cash outflow
             _skip(o, "no fresh price"); continue
+        if not is_crypto(sym) and px < MIN_FILL_PRICE:
+            # Printed with real precision, not via _usd: a 1e-9 quote renders as "$0.00" there,
+            # so the reason would read "$0.00 is below $0.01" and hide the number that explains it.
+            _skip(o, f"quote {px:.10g} is below the ${MIN_FILL_PRICE:.2f} sub-penny floor — "
+                     f"treating it as a broken feed, not a price"); continue
         pos = _find(positions, sym)
         if not pos or pos["shares"] <= 0:
             _skip(o, "not held"); continue
@@ -1004,6 +1048,12 @@ def validate_and_fill(
         # the round-up guard trivially true and turns `cash -= cost` into a deposit.
         if not px or px <= 0:
             _skip(o, "no fresh price"); continue
+        # A quote just above zero is a broken feed, not a bargain. See MIN_FILL_PRICE.
+        if not is_crypto(sym) and px < MIN_FILL_PRICE:
+            # Printed with real precision, not via _usd: a 1e-9 quote renders as "$0.00" there,
+            # so the reason would read "$0.00 is below $0.01" and hide the number that explains it.
+            _skip(o, f"quote {px:.10g} is below the ${MIN_FILL_PRICE:.2f} sub-penny floor — "
+                     f"treating it as a broken feed, not a price"); continue
         # Entry-zone discipline: don't chase. If the analyst named a zone and the market is above its
         # top, defer the buy — it stays a candidate on later ticks instead of filling at any price.
         # (Below the zone is fine: cheaper than it wanted to pay.)
@@ -1156,6 +1206,17 @@ def nav_row(blob: dict, *, positions_val: float, spy_price: float | None, now_ts
     now_ts = now_ts or time.time()
     cash = round(float(blob.get("cash", 0.0)), 2)
     equity = round(cash + positions_val, 2)
+    # Fail closed on a non-finite point, the same way the cash-conservation assert does.
+    #
+    # sandbox_nav.jsonl is APPEND-ONLY: a NaN or inf equity written here is permanent, and it poisons
+    # every chart, trend fit and benchmark comparison drawn from the series afterwards. There is no
+    # sensible substitute value either — 0 would read as a wiped-out account and the last known
+    # equity would be a fabrication — so refuse to produce the row and let the caller abort the tick
+    # with the ledger unsaved. A missing point is recoverable on the next tick; a poisoned one is not.
+    if not math.isfinite(equity):
+        raise AssertionError(
+            f"refusing to write a non-finite NAV point (cash={cash}, positions_value={positions_val}) "
+            f"— the equity log is append-only, so this row could never be retracted")
     bench = blob.get("benchmark") or {}
     bench_val = round(float(bench.get("shares", 0.0)) * spy_price, 2) if spy_price else None
     return {
