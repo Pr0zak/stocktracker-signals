@@ -27,9 +27,20 @@ from .news import fetch_context
 log = logging.getLogger("signals.scan")
 
 # How many newly-tracked symbols to seed base rates for per nightly run. Each costs one 2y Yahoo
-# fetch plus a few hundred cheap inserts, so a handful a night is invisible; the cap only matters
-# when a batch of names is added at once.
-_BACKFILL_PER_RUN = 4
+# fetch plus a few hundred cheap inserts and NO model call, so the cap is about being a polite
+# client rather than about cost.
+#
+# Raised from 4 on 2026-08-15. The cap only bites when a batch of names is added at once, which is
+# exactly when it matters most: 24 tickers were added on 08-14 and at four a night the newest of
+# them would have gone six nights without a measured base rate. That is not a cosmetic delay — until
+# a symbol is seeded, the analyst's conviction on it rests on nothing, and a track record the model
+# is told to weigh is worse than absent when it is silently empty for some names and populated for
+# others.
+#
+# 12 clears a 24-name backlog in two nights. It stays a cap rather than becoming unbounded because
+# the seeding loop is SEQUENTIAL (unlike score_memory's semaphore of 4), so this is a straight
+# multiplier on how long the nightly run holds a connection open to Yahoo.
+_BACKFILL_PER_RUN = 12
 
 LATEST = Path(__file__).resolve().parent.parent / "data" / "scan_latest.json"
 
