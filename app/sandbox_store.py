@@ -60,12 +60,13 @@ def validate_arm(arm: str) -> str:
     return arm
 
 
-def _paths(arm: str) -> tuple[Path, Path, Path, Path]:
-    """(ledger, ledger.bak, trades, nav) for an arm. `main` keeps the original flat layout."""
+def _paths(arm: str) -> tuple[Path, Path, Path, Path, Path]:
+    """(ledger, ledger.bak, trades, nav, changes) for an arm. `main` keeps the original flat layout."""
     arm = validate_arm(arm)
     d = _DATA_DIR if arm == MAIN_ARM else _DATA_DIR / "arms" / arm
     return (d / "sandbox.json", d / "sandbox.json.bak",
-            d / "sandbox_trades.jsonl", d / "sandbox_nav.jsonl")
+            d / "sandbox_trades.jsonl", d / "sandbox_nav.jsonl",
+            d / "sandbox_changes.jsonl")
 
 
 def list_arms() -> list[str]:
@@ -118,6 +119,14 @@ DEFAULT_SETTINGS = {
     "max_trades_per_tick": 4,
     "max_new_positions_per_tick": 2,
     "min_conviction_to_trade": 55,     # 0-100 floor for a buy
+    # Second-opinion layer. A deeper model reads the proposed orders before they reach the ledger and
+    # can drop individual ones or reject the lot. validate_and_fill checks ARITHMETIC; this checks
+    # the argument, which is where both of this account's worst decisions went wrong (2026-08-03
+    # IBIT, 2026-08-06 SPY->VTI) -- each was mechanically legal and each was reasoned badly.
+    #
+    # OFF by default. It costs one extra deep call per tick, and whether it earns that is exactly the
+    # kind of question the comparison arms exist to answer -- so it ships switchable, per arm.
+    "review_enabled": False,
     # Honour the analyst's per-buy entry zone: skip (and retry a later day) when the market is above
     # the zone's top, instead of chasing an extended price. Sells always execute at the market.
     "respect_entry_zones": True,
@@ -191,7 +200,7 @@ def _defaults(arm: str = MAIN_ARM, *, engine: str = "llm", label: str | None = N
 def _load(arm: str = MAIN_ARM) -> dict:
     """Load an arm's ledger, falling back to its .bak (last-known-good) then to fresh defaults.
     Settings are merged over DEFAULT_SETTINGS so a new setting key always has a value."""
-    f, bak, _, _ = _paths(arm)
+    f, bak = _paths(arm)[:2]   # slice, not a fixed-width unpack: the tuple grows
     for p in (f, bak):
         if p.exists():
             try:
@@ -244,7 +253,7 @@ def save(blob: dict, arm: str | None = None) -> dict:
     The arm comes from the blob itself unless overridden, so a caller that read one arm and wrote it
     back cannot silently land it on another."""
     arm = validate_arm(arm or blob.get("arm") or MAIN_ARM)
-    f, bak, _, _ = _paths(arm)
+    f, bak = _paths(arm)[:2]   # slice, not a fixed-width unpack: the tuple grows
     with _lock:
         f.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(f, bak, blob)
@@ -285,6 +294,24 @@ def _read_jsonl(path: Path) -> list[dict]:
 def read_trades(limit: int = 200, arm: str = MAIN_ARM) -> list[dict]:
     """Most recent trade rows first (filled + skipped)."""
     rows = _read_jsonl(_paths(arm)[2])
+    return list(reversed(rows))[: max(1, limit)]
+
+
+def append_change(row: dict, arm: str = MAIN_ARM) -> None:
+    """Record one settings change. Append-only, like the trade and NAV logs.
+
+    Nothing recorded configuration changes, and the ledger is where their effect shows up. On
+    2026-08-17 five settings were changed in an afternoon -- the candidate universe, the screen
+    width, the market-cap floor, the affordability filter, the memory backfill rate -- and none of it
+    left a trace. When the comparison arms then diverge, there is no way to tell strategy from
+    configuration, which is the one question the arms exist to answer.
+    """
+    _append_jsonl(_paths(arm)[4], row)
+
+
+def read_changes(limit: int = 100, arm: str = MAIN_ARM) -> list[dict]:
+    """Most recent settings changes first."""
+    rows = _read_jsonl(_paths(arm)[4])
     return list(reversed(rows))[: max(1, limit)]
 
 

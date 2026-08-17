@@ -1163,6 +1163,83 @@ ahead lets you de-risk. Respect allow_crypto / allow_etf. Ground EVERY order in 
 invent news or prices. Plain reasons, no markdown."""
 
 
+class ReviewVerdict(BaseModel):
+    approve: bool                    # False = do not send these orders to the ledger
+    concerns: list[str] = []         # what is wrong, one short sentence each
+    drop_symbols: list[str] = []     # specific orders to remove, leaving the rest to proceed
+    note: str = ""                   # one line for the trade log
+
+
+REVIEW_SYSTEM = """You are a second reader on a FICTIONAL paper-trading account. Another model has \
+proposed today's orders. You do not trade and you do not propose alternatives — you decide whether \
+what it wrote should reach the ledger.
+
+The account's objective is TERMINAL VALUE at its horizon, not daily P&L. Over a long runway the \
+dominant force is compounding, and the biggest destroyers of terminal value are churn, taxes and \
+being out of the market.
+
+The ledger already enforces every MECHANICAL limit — cash floor, per-group caps, no oversell, \
+turnover, conviction floor, wash sales, settlement. Do not re-check arithmetic; it will be applied \
+after you regardless. Your job is the part no validator can see: whether the REASONING holds.
+
+Reject or drop an order when the stated reason does not support it. In particular:
+- A sell justified by funding another purchase. There are exactly two legitimate reasons to sell: \
+  taking profit from a genuinely extreme extension, or protecting from a downturn. "To fund X" is \
+  not one, and a forced sale (cap breach, exit date) is exempt because it is not a choice.
+- Selling one vehicle to buy an equivalent one — same exposure, different ticker — for a reason like \
+  fees. It realises tax to save basis points and changes nothing about what the book owns.
+- A reason that cites a number not in the data given, or that contradicts one that is.
+- Trading a recent position on a short-horizon signal when the thesis has not changed. Up 19% in \
+  four days is not a reason to sell; it is the thesis working.
+- An order whose conviction language is confident but whose cited evidence is thin or absent.
+
+Do NOT reject for being conservative. An empty order list is a valid decision and holding is free. \
+Do not reject because you would have picked something different — you are checking for a defect, not \
+substituting your judgement.
+
+Prefer `drop_symbols` over a blanket rejection: if three orders are sound and one is not, dropping \
+the one is the proportionate answer. Reserve approve=false for a decision that is wrong as a whole.
+
+Return the verdict. `concerns` is what you would tell the account owner; keep each to one sentence."""
+
+
+async def review_decision(
+    decision: SandboxDecision, book: dict, candidates: list[dict], *, cash: float,
+    settings: dict, strategy_note: dict | None, deep: bool = True,
+    model: str | None = None,
+) -> tuple[ReviewVerdict, dict]:
+    """A second model reads the proposed orders before they reach the ledger.
+
+    `validate_and_fill` is the mechanical authority and always will be, but it checks arithmetic, not
+    argument. Both of this account's worst decisions were mechanically legal: on 2026-08-03 it sold
+    IBIT on a three-month momentum reading while bitcoin sat below its 200-week line, and on
+    2026-08-06 it sold all 3 SPY to buy VTI on expense-ratio grounds, realising a short-term gain to
+    save about $1.50 a year — and the replacement buy was then cap-blocked, so the net effect was
+    39.9% cash becoming 58.3%. Two separate prompt rules forbade the second one explicitly. Both were
+    ignored, and nothing between the model and the ledger was looking at the reasoning.
+
+    Deep by default: this is the layer that is supposed to catch what the cheap pass missed, and
+    running it on the same model class as the thing it reviews defeats the point.
+    """
+    payload = {
+        "proposed": decision.model_dump(),
+        "equity": book.get("total_value"),
+        "cash": round(cash, 2),
+        "cash_pct": book.get("cash_pct"),
+        "positions": book.get("positions", []),
+        "candidates": candidates,
+        "settings": settings,
+        "strategy_note": strategy_note,
+    }
+    prompt = (
+        "Review these proposed orders before they reach the ledger.\n"
+        + json.dumps(payload, indent=2, default=str)
+        + "\n\nReturn the ReviewVerdict."
+    )
+    return await _parse(REVIEW_SYSTEM, prompt, ReviewVerdict, deep=deep, max_tokens=1024,
+                        model=model)
+
+
 async def sandbox_decision(
     book: dict, candidates: list[dict], *, cash: float, settings: dict,
     strategy_note: dict | None, macro: dict | None = None, deep: bool = False,

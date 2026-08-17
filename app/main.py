@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import math
+import copy
 import time
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ from .analyst import (
     plan_entry,
     rebalance_portfolio,
     recommend,
+    review_decision,
     review_portfolio,
     sandbox_decision,
     strategy_review,
@@ -2840,6 +2842,31 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 usage_store.record(usage, symbol="SANDBOX", kind="sandbox_tick")
                 orders = [o.model_dump() for o in decision.orders]
                 posture = decision.posture
+
+                # Second opinion, when enabled and when there is something to review. A deeper model
+                # reads the ORDERS before the ledger does. Skipped entirely on an empty list: there
+                # is no argument to check in a decision to hold, and paying for a deep call to be
+                # told so is the over-verification Anthropic's own Opus 5 guidance warns against.
+                if settings.get("review_enabled") and orders:
+                    try:
+                        verdict, rusage = await review_decision(
+                            decision, book, candidates, cash=blob["cash"],
+                            settings=sandbox_job.settings_for_prompt(settings),
+                            strategy_note=blob.get("last_strategy_note"), deep=True)
+                        usage_store.record(rusage, symbol="SANDBOX", kind="sandbox_review")
+                        orders, dropped = sandbox_job.apply_review(orders, verdict.model_dump())
+                        if dropped:
+                            warnings.append(
+                                f"review dropped {len(dropped)} order(s): {', '.join(dropped)}"
+                                + (f" — {'; '.join(verdict.concerns[:2])}" if verdict.concerns else ""))
+                            posture = f"{posture} [reviewed: {verdict.note or 'orders dropped'}]"
+                    except Exception as e:  # noqa: BLE001
+                        # A failed review must not become a failed tick. It is an ADDITIONAL check,
+                        # so its absence returns the account to the behaviour it had yesterday --
+                        # whereas blocking here would let a rate limit halt trading entirely. Said
+                        # out loud, because a silently unreviewed tick looks exactly like a reviewed
+                        # one that found nothing.
+                        warnings.append(f"review model unavailable, orders NOT reviewed: {e}")
                 # Advanced only once a decision actually happened. Setting it at the TOP of this
                 # branch meant a single transient LLM failure consumed the cadence cursor: on
                 # "weekly" the account then held for another seven days having made no decision at
@@ -2999,6 +3026,7 @@ class SandboxSettingsPatch(BaseModel):
     max_trades_per_tick: int | None = None
     max_new_positions_per_tick: int | None = None
     min_conviction_to_trade: int | None = None
+    review_enabled: bool | None = None
     respect_entry_zones: bool | None = None
     slippage_bps: int | None = None
     # Arm-scoped. `model` pins the LLM backbone for this arm ("" / null = the service default);
@@ -3083,6 +3111,11 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
         # last day the account traded — a posture with no date attached reads as current whatever
         # its age, which is the stale-as-fresh problem this codebase keeps having to fix.
         "last_posture": blob.get("last_posture") or None,
+        # Return without its risk is half a sentence. Computed from the NAV log rather than tracked
+        # in the ledger: the log IS the record, and a running counter can drift from it with nothing
+        # to reconcile against. Null until the series has two points -- "no drawdown yet" and
+        # "measured, zero" are different claims.
+        **sandbox_job.drawdown_stats(sandbox_store.read_nav(arm=arm)),
         "last_weekly_review_date": blob.get("last_weekly_review_date"),
         "last_strategy_note": blob.get("last_strategy_note"), "created_at": blob.get("created_at"),
     }
@@ -3234,6 +3267,18 @@ async def sandbox_get_settings_endpoint(arm: str = sandbox_store.MAIN_ARM) -> di
     return sandbox_store.get(_arm_or_400(arm))["settings"]
 
 
+@app.get("/sandbox/changes")
+async def sandbox_changes_endpoint(limit: int = 50, arm: str = sandbox_store.MAIN_ARM) -> dict:
+    """Settings changes for an arm, newest first. Free — NO LLM.
+
+    The companion to /sandbox/trades: that log says what the account DID, this one says what it was
+    told to do it with. Reading a performance change without it means guessing whether the strategy
+    moved or the configuration did.
+    """
+    arm = _arm_or_400(arm)
+    return {"arm": arm, "changes": sandbox_store.read_changes(limit=limit, arm=arm)}
+
+
 @app.post("/sandbox/settings")
 async def sandbox_set_settings_endpoint(
     patch: SandboxSettingsPatch, arm: str = sandbox_store.MAIN_ARM,
@@ -3243,11 +3288,17 @@ async def sandbox_set_settings_endpoint(
     async with _sandbox_lock:
         blob = sandbox_store.get(arm)
         s = blob["settings"]
+        # Snapshot BEFORE the patch runs, so the changelog can record what actually changed rather
+        # than what was requested. The two differ constantly: the coercion below clamps, validates
+        # and ignores, so a request to set max_position_pct to 500 becomes 100 and a request to set
+        # it to its current value changes nothing at all. A log of requests would show edits that
+        # never happened.
+        _before = copy.deepcopy(s)
         d = patch.model_dump(exclude_none=True)
         if d.get("risk_tolerance") in ("conservative", "balanced", "aggressive"):
             s["risk_tolerance"] = d["risk_tolerance"]
         for k in ("master_enabled", "allow_crypto", "allow_crypto_etf", "allow_etf", "allow_after_hours",
-                  "respect_entry_zones", "avoid_wash_sales"):
+                  "respect_entry_zones", "avoid_wash_sales", "review_enabled"):
             if k in d:
                 s[k] = bool(d[k])
         for k in ("retirement_date", "exit_date", "goal_date"):
@@ -3340,6 +3391,15 @@ async def sandbox_set_settings_endpoint(
                     status_code=400,
                     detail=f"engine must be one of {', '.join(sandbox_store.ENGINES)}")
             blob["engine"] = e
+        # Diff the real before/after. Only keys that MOVED are recorded; an unchanged key is not an
+        # edit, and a changelog full of no-ops is one nobody reads.
+        _changed = {k: {"from": _before.get(k), "to": s[k]}
+                    for k in s if _before.get(k) != s[k]}
+        if _changed:
+            sandbox_store.append_change({
+                "ts": time.time(), "date": sandbox_job.today_et_str(),
+                "arm": arm, "source": "api", "changed": _changed,
+            }, arm)
         sandbox_store.save(blob, arm)
         return {**s, "arm": arm, "label": blob.get("label"), "engine": blob.get("engine")}
 

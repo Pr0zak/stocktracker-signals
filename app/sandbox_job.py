@@ -1201,6 +1201,92 @@ def validate_and_fill(
     return b, filled, skipped
 
 
+def apply_review(orders: list[dict], verdict: dict) -> tuple[list[dict], list[str]]:
+    """Apply a review verdict to the proposed orders. Returns (surviving_orders, dropped_symbols).
+
+    Two shapes, and the narrow one is the default on purpose. `drop_symbols` removes named orders and
+    leaves the rest to proceed, which is the proportionate answer when three orders are sound and one
+    is not. `approve: false` drops everything, and is for a decision that is wrong as a whole.
+
+    A reviewer that names symbols but forgets to clear `approve` is taken at its narrower word: the
+    drops are honoured and the rest proceed. The alternative reading -- treat approve=true as
+    overriding the drops -- would silently discard the only specific finding the reviewer made.
+
+    Nothing is added here. The reviewer cannot introduce an order, only remove one: a second model
+    proposing trades is a second trader, and this layer exists to be a check rather than another
+    source of orders.
+    """
+    if not orders:
+        return [], []
+    drop = {str(x).upper() for x in (verdict.get("drop_symbols") or [])}
+    if not verdict.get("approve", True) and not drop:
+        # Whole-decision rejection. Every symbol is reported, so the trade log and the warning name
+        # what was lost rather than just how much.
+        return [], [str(o.get("symbol", "")).upper() for o in orders]
+    kept = [o for o in orders if str(o.get("symbol", "")).upper() not in drop]
+    dropped = [str(o.get("symbol", "")).upper() for o in orders
+               if str(o.get("symbol", "")).upper() in drop]
+    if not verdict.get("approve", True):
+        return [], [str(o.get("symbol", "")).upper() for o in orders]
+    return kept, dropped
+
+
+def drawdown_stats(nav_rows: list[dict]) -> dict:
+    """Peak-to-trough risk from the equity curve. Returns zeros for a series too short to have one.
+
+    The account reported "+2.48% return, -1.80pp vs the S&P" and nothing else, which is a return
+    without its risk: a book that got there in a straight line and one that was 20% underwater on the
+    way look identical in those two numbers. Drawdown is the standard second half of that sentence
+    and the curve to compute it from was already on disk.
+
+    Peak is running-maximum equity, so `max_drawdown_pct` is the worst peak-to-trough fall ever
+    suffered and `current_drawdown_pct` is how far below the all-time high the account sits right
+    now. Both are reported as POSITIVE percentages of the peak — a drawdown is a magnitude, and
+    signing it invites a reader to add it to a return.
+
+    Deliberately computed from the NAV log rather than tracked incrementally in the ledger: the log
+    is the record, and a running counter can drift from it with nothing to reconcile against.
+    """
+    equities = [float(r["equity"]) for r in nav_rows
+                if r.get("equity") is not None and math.isfinite(float(r["equity"]))]
+    if len(equities) < 2:
+        # One point cannot have a drawdown. None, not 0.0 — "no drawdown yet" and "measured, zero"
+        # are different claims and only the second one is an achievement.
+        return {"max_drawdown_pct": None, "current_drawdown_pct": None,
+                "peak_equity": equities[0] if equities else None, "days_underwater": None}
+
+    peak = equities[0]
+    max_dd = 0.0
+    peak_idx = trough_idx = 0
+    worst_peak_idx = 0
+    for i, eq in enumerate(equities):
+        if eq > peak:
+            peak, peak_idx = eq, i
+        dd = (peak - eq) / peak * 100.0 if peak > 0 else 0.0
+        if dd > max_dd:
+            max_dd, trough_idx, worst_peak_idx = dd, i, peak_idx
+
+    all_time_high = max(equities)
+    cur_dd = (all_time_high - equities[-1]) / all_time_high * 100.0 if all_time_high > 0 else 0.0
+
+    # How many observations since the account was last at a high. Counted in NAV POINTS, which are
+    # trading days here — calendar days would overstate it across every weekend.
+    underwater = 0
+    for eq in reversed(equities):
+        if eq >= all_time_high:
+            break
+        underwater += 1
+
+    return {
+        "max_drawdown_pct": round(max_dd, 2),
+        "current_drawdown_pct": round(cur_dd, 2),
+        "peak_equity": round(all_time_high, 2),
+        "days_underwater": underwater,
+        "max_drawdown_from": (nav_rows[worst_peak_idx] or {}).get("date") if nav_rows else None,
+        "max_drawdown_to": (nav_rows[trough_idx] or {}).get("date") if nav_rows else None,
+    }
+
+
 def nav_row(blob: dict, *, positions_val: float, spy_price: float | None, now_ts: float | None = None) -> dict:
     """One equity-curve point: total equity (cash + marked positions) + the benchmark's shadow value."""
     now_ts = now_ts or time.time()
