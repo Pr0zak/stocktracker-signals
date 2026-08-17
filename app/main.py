@@ -2581,6 +2581,7 @@ async def _run_extra_arm(
     pv = sandbox_job.positions_value(new_blob["positions"], price_of)
     nav = sandbox_job.nav_row(new_blob, positions_val=pv, spy_price=spy_price)
     new_blob["last_tick_date"] = sandbox_job.today_et_str(now)
+    new_blob["last_posture"] = posture or ""     # see the main path; arms need it for the same reason
     sandbox_store.save(new_blob, arm)
     for r in filled + skipped:
         sandbox_store.append_trade(r, arm)
@@ -2881,6 +2882,12 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         pv = sandbox_job.positions_value(new_blob["positions"], price_of)
         nav = sandbox_job.nav_row(new_blob, positions_val=pv, spy_price=spy_price)
         new_blob["last_tick_date"] = sandbox_job.today_et_str(now)
+        # The posture is the only record of WHY a tick did what it did, and until now it was returned
+        # to the caller and then dropped. That made a no-trade day unexplainable after the fact: the
+        # trade log shows the orders that existed, so a tick that proposed nothing left nothing at
+        # all behind, and "the model declined" was indistinguishable from "the model was blocked"
+        # without re-running it. Saved with last_tick_date in the same write, so the two cannot drift.
+        new_blob["last_posture"] = posture or ""
         sandbox_store.save(new_blob)
 
         for r in filled + skipped:
@@ -3072,6 +3079,10 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
                      "current_age": sandbox_job.effective_age(blob["settings"])},
         "enabled": blob["settings"]["master_enabled"],
         "last_tick_date": blob.get("last_tick_date"),
+        # Paired with last_tick_date so a client can tell whether the posture describes TODAY or the
+        # last day the account traded — a posture with no date attached reads as current whatever
+        # its age, which is the stale-as-fresh problem this codebase keeps having to fix.
+        "last_posture": blob.get("last_posture") or None,
         "last_weekly_review_date": blob.get("last_weekly_review_date"),
         "last_strategy_note": blob.get("last_strategy_note"), "created_at": blob.get("created_at"),
     }
