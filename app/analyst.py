@@ -1045,7 +1045,7 @@ to fill at any price. Sells always execute at the market (an exit shouldn't wait
 `max_position_pct`%; only BUY with genuine conviction (skip weak setups — cash is a fine position). \
 Do NOT churn — if nothing clears the bar, return an empty `orders` list and explain in `posture`.
 
-SELL DISCIPLINE — there are exactly TWO legitimate reasons to sell, and "to fund something else" is \
+SELL DISCIPLINE — there are exactly THREE legitimate reasons to sell, and "to fund something else" is \
 not one of them:
   (1) TAKE PROFIT, but only from a genuinely EXTREME extension — a parabolic run far above the \
       name's own long-cycle norms (a `mayer_multiple` well over 1, price stretched vs the 200-week \
@@ -1054,6 +1054,20 @@ not one of them:
       not scalp it.
   (2) PROTECT FROM A DOWNTURN — the thesis is breaking (relative strength rolling over, lost the \
       50-day, momentum gone), or the macro/long-cycle picture has turned against it.
+  (3) THE PLAN NO LONGER NAMES THIS EXPOSURE — `strategy_note` dropped its group, so the position is \
+      an orphan of a plan that has been replaced. Say exactly that. This one is about the PLAN \
+      changing, never about the price moving, so it needs no view on the name at all — and it does \
+      not license a fire sale: an orphan is not urgent, so exit it as an ordinary trade rather than \
+      dumping it the day the plan changes.
+
+TAX-LOSS HARVESTING IS NOT ON THAT LIST, and neither is any variant of "book the loss while it is \
+small". This is a paper account: there is no tax return, so a realised loss buys nothing and costs \
+two legs of slippage plus a 30-day wash-sale lockout on a name you may want back. Measured \
+2026-08-18: a position bought four days earlier to fill a plan target was sold at -2.5% for \
+"short-term loss harvesting" — $12.33 of loss, and the plan had in fact dropped that exposure the \
+same day, which was reason (3) sitting unused. Reach for the real reason. The ledger now REFUSES a \
+sell that books a small loss on a position days old, so an order written this way does not trade — \
+it is logged as a skip with your reasoning attached to it.
 A sell must stand on its own merits as one of those. An exposure that is over its cap because two \
 holdings were RECLASSIFIED into one group is a special case: the risk was always there and is now \
 merely visible, so resolve it GRADUALLY — stop adding to that group and let new cash and the other \

@@ -232,6 +232,27 @@ def round_shares(symbol: str, shares: float) -> float:
 # worth of cash. Same cause, same fix.
 ROUND_UP_MIN_SHARE = 0.9
 
+# A sell that books a SMALL loss on a position bought DAYS ago is refused, unless it is forced.
+#
+# The two legitimate reasons to sell are taking profit from an extreme extension and protecting from
+# a downturn. Neither describes what happened on 2026-08-18: MSFT was bought on the 14th because the
+# plan wanted 8% of it, and sold four days later at -2.5% for "short-term loss harvesting" -- $12.33
+# of loss, in a PAPER account with no tax to harvest, costing two legs of slippage and locking the
+# name out for 30 days under the wash-sale rule. The prompt covers the mirror image ("up 19% in four
+# days is not a reason to sell") and said nothing about the downside version.
+#
+# TWO conditions, not one, because a blanket ban on short-hold loss sales would block the legitimate
+# case. Protecting from a genuine downturn also realises a loss and can also be right on day two --
+# what separates it from churn is the SIZE. A position down 15% in a week is a thesis failing; one
+# down 2.5% is noise being traded.
+#
+# Both numbers are judgement, not measurement. 7 days is long enough that a same-week round trip
+# cannot happen and short enough that a real stop still works; 8% is well outside ordinary weekly
+# noise for the large caps this account holds and well inside a real break. Neither is derived from
+# a backtest, and they should be revisited if the arms produce evidence either way.
+MIN_HOLD_DAYS_FOR_SMALL_LOSS = 7
+SMALL_LOSS_PCT = 8.0
+
 
 def _round_price(px: float | None) -> float | None:
     """Round a price for the LOG without flattening a sub-penny asset to zero.
@@ -985,9 +1006,19 @@ def validate_and_fill(
         if shares <= 0:
             _skip(o, "nothing to sell (or turnover cap left no room)"); continue
         fill = px * (1 - slip)
+        realized = shares * (fill - pos["avg_cost"])
+        # Churn guard. Computed BEFORE anything is committed, so a refusal leaves the position and
+        # the cash exactly as they were. Exempt when `liquidation` is set: an exit-date flatten is
+        # the user's instruction, not the strategy's choice.
+        if not liquidation and realized < 0 and pos.get("avg_cost"):
+            loss_pct = 100.0 * (pos["avg_cost"] - fill) / pos["avg_cost"]
+            held_days = (now_ts - float(pos.get("last_add_at") or pos.get("opened_at") or 0)) / 86_400.0
+            if held_days < MIN_HOLD_DAYS_FOR_SMALL_LOSS and loss_pct < SMALL_LOSS_PCT:
+                _skip(o, f"selling a {loss_pct:.1f}% loss after {held_days:.0f} day(s) — under the "
+                         f"{SMALL_LOSS_PCT:.0f}% / {MIN_HOLD_DAYS_FOR_SMALL_LOSS}-day churn guard; "
+                         f"a small loss on a new position is noise, not a broken thesis"); continue
         traded_notional += shares * fill
         proceeds = shares * fill
-        realized = shares * (fill - pos["avg_cost"])
         cash += proceeds
         sell_notional += proceeds
         pos["shares"] = round(pos["shares"] - shares, 8)
