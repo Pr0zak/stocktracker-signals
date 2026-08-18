@@ -41,7 +41,11 @@ _lock = threading.RLock()
 VERSION = 1
 
 MAIN_ARM = "main"
-ENGINES = ("llm", "rules")
+# "rejects" takes another arm's REVIEW-REJECTED orders and executes them. It is the control group
+# for the review model: without it, a reviewer that quietly cuts good trades and one that saves the
+# account from bad ones produce the same visible result -- a slightly different equity curve with no
+# way to attribute it. This arm makes the rejected trades observable instead of counterfactual.
+ENGINES = ("llm", "rules", "rejects")
 # An arm id becomes a DIRECTORY NAME, so it is validated as one before it is ever joined to a path.
 # Whitelist rather than blacklist: `..`, absolute paths, separators, NUL and unicode lookalikes are
 # all excluded by construction instead of by remembering to check for each of them.
@@ -127,6 +131,8 @@ DEFAULT_SETTINGS = {
     # OFF by default. It costs one extra deep call per tick, and whether it earns that is exactly the
     # kind of question the comparison arms exist to answer -- so it ships switchable, per arm.
     "review_enabled": False,
+    # For an engine="rejects" arm: whose rejected orders to take. Ignored by every other engine.
+    "rejects_from": "",
     # Honour the analyst's per-buy entry zone: skip (and retry a later day) when the market is above
     # the zone's top, instead of chasing an extended price. Sells always execute at the market.
     "respect_entry_zones": True,

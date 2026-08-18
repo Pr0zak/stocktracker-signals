@@ -2483,6 +2483,7 @@ async def _maybe_weekly_review(
 async def _run_extra_arm(
     arm: str, *, now, price_of, spy_price: float | None, shared_plan: dict | None,
     candidates: list[dict], macro_block, force: bool,
+    rejected: dict[str, list[dict]] | None = None,
 ) -> dict:
     """One decision cycle for a NON-main arm, against the market snapshot main already fetched.
 
@@ -2541,6 +2542,17 @@ async def _run_extra_arm(
         d = sandbox_job.rules_decision(
             blob, plan=shared_plan, group_of=_exposure_group, price_of=price_of)
         orders, source, posture = d["orders"], "rules_tick", d["posture"]
+    elif engine == "rejects":
+        # The review model's control group. Takes exactly what the reviewer refused on its source
+        # arm, so the two books differ by the review verdict and nothing else. No model call: the
+        # orders were written by the source arm's analyst and this arm only executes them.
+        src = str(settings.get("rejects_from") or "").strip().lower()
+        orders = list((rejected or {}).get(src) or [])
+        source = "rejects_tick"
+        posture = (f"Taking the {len(orders)} order(s) the review model rejected on '{src}'."
+                   if orders else
+                   f"Nothing rejected on '{src}' today." if src else
+                   "No source arm configured (settings.rejects_from is unset).")
     else:
         holdings = [Holding(symbol=p["symbol"], shares=p["shares"], avg_cost=p["avg_cost"])
                     for p in blob["positions"]]
@@ -2558,7 +2570,34 @@ async def _run_extra_arm(
                 strategy_note=shared_plan, macro=macro_block, deep=False,
                 model=(str(settings.get("model")).strip() or None) if settings.get("model") else None)
             usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
-            orders, posture = [o.model_dump() for o in decision.orders], decision.posture
+            _arm_orders = [o.model_dump() for o in decision.orders]
+            # Review on the arm path too. This was implemented on main only, so review_enabled on an
+            # arm silently did nothing — a setting that reads as on and changes no behaviour is worse
+            # than one that is off, because the experiment it configures looks like it ran.
+            if settings.get("review_enabled") and _arm_orders:
+                try:
+                    verdict, rusage = await review_decision(
+                        decision, book, candidates, cash=blob["cash"],
+                        settings=sandbox_job.settings_for_prompt(settings),
+                        strategy_note=shared_plan, deep=True)
+                    usage_store.record(rusage, symbol=f"SANDBOX:{arm}", kind="sandbox_review")
+                    kept, dropped_syms = sandbox_job.apply_review(_arm_orders, verdict.model_dump())
+                    if dropped_syms and rejected is not None:
+                        # Handed to any arm configured to take them. The rejected ORDERS, not just
+                        # their symbols: the control arm has to execute the same trade that was
+                        # refused, at the same size and zone, or it is testing something else.
+                        rejected[arm] = [o for o in _arm_orders
+                                         if str(o.get("symbol", "")).upper() in set(dropped_syms)]
+                    if dropped_syms:
+                        warnings.append(f"review dropped {len(dropped_syms)} order(s): "
+                                        f"{', '.join(dropped_syms)}")
+                    _arm_orders = kept
+                except Exception as e:  # noqa: BLE001
+                    warnings.append(f"review model unavailable, orders NOT reviewed: {e}")
+            # _arm_orders, not decision.orders: the reviewed list is the one that trades. Reading
+            # decision.orders here would run the review, log its verdict, and then send the original
+            # orders anyway -- the most expensive possible way to change nothing.
+            orders, posture = _arm_orders, decision.posture
             source = "haiku_tick"
             blob["last_decision_date"] = sandbox_job.today_et_str(now)
         except Exception as e:  # noqa: BLE001 — a failed decision = no trades, still mark NAV
@@ -2781,6 +2820,10 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         # bound here for the same reason: the extra arms read it after this block on every path.
         candidates: list[dict] = []
         macro_block = None
+        # Orders the review model refused, per arm, for this tick only. Consumed by any engine
+        # "rejects" arm further down. Never persisted: a rejected order is a statement about today's
+        # decision, and carrying it forward would execute a trade nobody re-proposed.
+        rejected_by_arm: dict[str, list[dict]] = {}
 
         flat = sandbox_job.exit_date_flatten_orders(blob, price_of)
         if flat is not None:
@@ -2854,7 +2897,12 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                             settings=sandbox_job.settings_for_prompt(settings),
                             strategy_note=blob.get("last_strategy_note"), deep=True)
                         usage_store.record(rusage, symbol="SANDBOX", kind="sandbox_review")
+                        _pre = list(orders)
                         orders, dropped = sandbox_job.apply_review(orders, verdict.model_dump())
+                        if dropped:
+                            rejected_by_arm[sandbox_store.MAIN_ARM] = [
+                                o for o in _pre
+                                if str(o.get("symbol", "")).upper() in set(dropped)]
                         if dropped:
                             warnings.append(
                                 f"review dropped {len(dropped)} order(s): {', '.join(dropped)}"
@@ -2965,14 +3013,17 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         # out (closed, already run, disabled) is a day no arm advances either — which keeps the
         # curves aligned rather than giving one arm an extra observation the others never got.
         arms: list[dict] = []
-        for _arm in sandbox_store.list_arms():
-            if _arm == sandbox_store.MAIN_ARM:
-                continue
+        # A "rejects" arm consumes what an earlier arm's review refused, so it has to run after its
+        # source. Ordered explicitly rather than relying on the alphabet: `fast` sorts before
+        # `rejects` today by luck, and a rename would silently empty the control group.
+        _ids = [a for a in sandbox_store.list_arms() if a != sandbox_store.MAIN_ARM]
+        _ids.sort(key=lambda a: sandbox_store.get(a).get("engine") == "rejects")
+        for _arm in _ids:
             try:
                 arms.append(await _run_extra_arm(
                     _arm, now=now, price_of=price_of, spy_price=spy_price,
                     shared_plan=new_blob.get("last_strategy_note"), candidates=candidates,
-                    macro_block=macro_block, force=force))
+                    macro_block=macro_block, force=force, rejected=rejected_by_arm))
             except Exception as e:  # noqa: BLE001 — a side arm must never break the real account
                 _log.exception("sandbox arm %s failed", _arm)
                 arms.append({"arm": _arm, "status": "error", "warnings": [str(e)]})
@@ -3027,6 +3078,7 @@ class SandboxSettingsPatch(BaseModel):
     max_new_positions_per_tick: int | None = None
     min_conviction_to_trade: int | None = None
     review_enabled: bool | None = None
+    rejects_from: str | None = None
     respect_entry_zones: bool | None = None
     slippage_bps: int | None = None
     # Arm-scoped. `model` pins the LLM backbone for this arm ("" / null = the service default);
@@ -3267,6 +3319,58 @@ async def sandbox_get_settings_endpoint(arm: str = sandbox_store.MAIN_ARM) -> di
     return sandbox_store.get(_arm_or_400(arm))["settings"]
 
 
+@app.post("/sandbox/fill_parked")
+async def sandbox_fill_parked_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
+    """Re-check today's parked buys against the live price and fill any whose zone is now met.
+
+    NO model call. These orders were already decided — the analyst approved them this morning and
+    the ledger refused them on price alone — so this is execution, not a second decision. That is
+    also why it cannot churn: it can only ever fill something already proposed, at a price the
+    proposer named, and every cap in validate_and_fill still applies on the way through.
+
+    The gap it closes: with one look per trading day, an entry zone had to contain the market at
+    15:35 ET or the buy waited a full session and was re-derived from scratch the next afternoon. A
+    zone is a limit order in everything but name, and this is the part that was missing.
+
+    Parked orders are same-day only. A zone describes today's setup, so anything left from an
+    earlier date is dropped rather than executed against a thesis nobody re-examined.
+    """
+    assert _http is not None
+    arm = _arm_or_400(arm)
+    async with _sandbox_lock:
+        blob = sandbox_store.get(arm)
+        parked = list(blob.get("parked_orders") or [])
+        today = sandbox_job.today_et_str()
+        fresh = [o for o in parked if o.get("parked_date") == today]
+        stale = len(parked) - len(fresh)
+        if not fresh:
+            return {"arm": arm, "status": "nothing_parked", "filled": [], "still_parked": 0,
+                    "dropped_stale": stale}
+
+        # Only the parked symbols need quoting; this runs on a short timer and should stay cheap.
+        syms = sorted({str(o["symbol"]).upper() for o in fresh})
+        try:
+            prices = await _sandbox_prices([p["symbol"].upper() for p in blob["positions"]], syms)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"quote fetch failed: {e}")
+
+        def price_of(sym: str):
+            return prices.get(sym.upper())
+
+        new_blob, filled, skipped = sandbox_job.validate_and_fill(
+            blob, fresh, price_of, group_of=_exposure_group, source="parked_fill")
+        pv = sandbox_job.positions_value(new_blob["positions"], price_of)
+        # No NAV row: this is an intraday execution, not a valuation point. Writing one would put a
+        # second observation on some days and not others, and the equity series is compared
+        # point-for-point against the benchmark's.
+        sandbox_store.save(new_blob, arm)
+        for r in filled + skipped:
+            sandbox_store.append_trade(r, arm)
+        return {"arm": arm, "status": "ok", "filled": filled, "skipped": skipped,
+                "still_parked": len(new_blob.get("parked_orders") or []),
+                "dropped_stale": stale, "positions_value": round(pv, 2)}
+
+
 @app.get("/sandbox/changes")
 async def sandbox_changes_endpoint(limit: int = 50, arm: str = sandbox_store.MAIN_ARM) -> dict:
     """Settings changes for an arm, newest first. Free — NO LLM.
@@ -3324,6 +3428,19 @@ async def sandbox_set_settings_endpoint(
                 # next to the date invites some later reader to pick the wrong one. Absent beats
                 # stale — every consumer goes through sandbox_job.effective_age() now.
                 s["current_age"] = None
+        if "rejects_from" in d:
+            # Validated as an arm id, not free text: it names a directory-backed arm, and a typo
+            # would leave the control group silently empty with nothing to say why.
+            v = str(d["rejects_from"] or "").strip().lower()
+            if not v:
+                s["rejects_from"] = ""
+            elif v in sandbox_store.list_arms():
+                s["rejects_from"] = v
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"rejects_from {v!r} is not an existing arm "
+                           f"(have: {', '.join(sandbox_store.list_arms())})")
         if "account_type" in d and str(d["account_type"]).lower() in ("cash", "margin"):
             s["account_type"] = str(d["account_type"]).lower()
         if "preferred_btc_etf" in d:

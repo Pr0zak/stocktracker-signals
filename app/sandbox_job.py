@@ -882,6 +882,9 @@ def validate_and_fill(
     turnover_budget = (turnover_pct / 100.0 * start_equity) if turnover_pct > 0 else float("inf")
     traded_notional = 0.0
 
+    # Buys refused only because the market sat above their entry zone. Persisted so an intraday
+    # re-check can fill them without another model call.
+    parked: list[dict] = []
     filled: list[dict] = []
     skipped: list[dict] = []
     buy_notional = 0.0
@@ -1018,6 +1021,9 @@ def validate_and_fill(
             "settles_on": market_calendar.next_trading_day(today).isoformat(),
         })
     b["unsettled"] = unsettled
+    # Replaced wholesale each tick, never appended to: a parked order is a statement about TODAY, and
+    # accumulating them would build a queue of theses nobody re-examined.
+    b["parked_orders"] = parked
     unsettled_total = sum(float(u.get("amount") or 0.0) for u in unsettled)
     buying_power = (cash - unsettled_total) if is_cash_account else cash
     # Same marks as the equity figure above — if these two ever diverge, the cap is measured against
@@ -1064,7 +1070,17 @@ def validate_and_fill(
             except (TypeError, ValueError):
                 hi = None
             if hi and hi > 0 and px > hi:
-                _skip(o, f"price {px:.2f} above entry zone (≤{hi:.2f}) — waiting"); continue
+                # PARKED, not discarded. The order was approved on today's read and refused only on
+                # today's price, so the thesis is intact and the number is the only thing wrong.
+                # With one look per day that made the zone almost decorative: the market had to be
+                # inside it at 15:35 ET or the buy waited a full session and was re-derived from
+                # scratch. Parked here, an intraday re-check can fill it the moment the price
+                # arrives, which is what an entry zone was always describing.
+                #
+                # Same-day only. A zone is a statement about today's setup, and carrying it into
+                # tomorrow would execute a thesis nobody re-examined.
+                parked.append({**o, "parked_date": today.isoformat(), "parked_price": round(px, 4)})
+                _skip(o, f"price {px:.2f} above entry zone (≤{hi:.2f}) — parked for today"); continue
         # Wash-sale guard (IRS §1091): rebuying a name sold at a LOSS within 30 days disallows the loss.
         if avoid_wash and sym in recent_loss_sales:
             days = (now_ts - float(recent_loss_sales[sym])) / 86_400.0
