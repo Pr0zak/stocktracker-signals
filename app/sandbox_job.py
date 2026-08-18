@@ -1217,6 +1217,54 @@ def validate_and_fill(
     return b, filled, skipped
 
 
+def target_gaps(
+    positions: list[dict], *, equity: float, plan: dict | None,
+    group_of: Callable[[str], str], price_of: Callable[[str], float | None],
+) -> list[dict]:
+    """How far each of the plan's exposure targets is from being met, largest shortfall first.
+
+    The daily model was given the plan's targets and the book's positions as two separate structures
+    and left to diff them itself. Measured 2026-08-17, three weeks in: MSFT, COST and JNJ sat at
+    exactly 0.0% against targets of 8%, 7% and 6% -- 21 points of a standing plan that the tick had
+    never once acted on -- while cash sat at 43.5% against a 12% target. Nothing blocked those buys;
+    no skip row exists for any of them. They were simply never proposed.
+
+    So the arithmetic is done here and handed over already ordered. Only SHORTFALLS are returned: an
+    overweight group is not something a buy can fix, and listing it invites a sell to correct a
+    number, which is the churn this account is explicitly steered away from.
+
+    This is decision SUPPORT, not an instruction. A gap says where the plan is unmet, never that the
+    setup is worth buying today -- the conviction floor in validate_and_fill remains the thing that
+    decides, and it is deliberately left as the mechanical guard rather than restated as a rule the
+    model could talk itself past.
+    """
+    if not plan or equity <= 0:
+        return []
+    held: dict[str, float] = {}
+    for p in positions:
+        g = group_of(p["symbol"])
+        held[g] = held.get(g, 0.0) + float(p.get("shares") or 0.0) * (mark_price(p, price_of) or 0.0)
+    out = []
+    for t in (plan.get("targets") or []):
+        g = group_of(str(t.get("exposure_group") or ""))
+        try:
+            tgt = float(t.get("target_pct") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        act = 100.0 * held.get(g, 0.0) / equity
+        gap = tgt - act
+        if gap <= 0.5:                     # within half a point is met; noise is not a shortfall
+            continue
+        out.append({
+            "exposure_group": g,
+            "target_pct": round(tgt, 1),
+            "actual_pct": round(act, 1),
+            "gap_pct": round(gap, 1),
+            "gap_dollars": round(gap / 100.0 * equity, 2),
+        })
+    return sorted(out, key=lambda r: -r["gap_pct"])
+
+
 def apply_review(orders: list[dict], verdict: dict) -> tuple[list[dict], list[str]]:
     """Apply a review verdict to the proposed orders. Returns (surviving_orders, dropped_symbols).
 

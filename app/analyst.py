@@ -1068,6 +1068,17 @@ different and is fine: a hard exposure-cap breach or a scheduled exit-date liqui
 executed. Note that the account settles T+1 anyway, so today's proceeds cannot fund today's buys.
 - hold_reasons: brief notes on 1-3 notable holds.
 
+If `allocation_gaps` is present it is the arithmetic between `strategy_note`'s targets and what the \
+book actually holds, largest shortfall first, already done for you. It exists because that diff was \
+being skipped: measured over three weeks, three named targets totalling 21% of the book sat at \
+exactly 0% while cash ran at 43% against a 12% target, and nothing had blocked those buys -- they \
+were never proposed. Treat it as the answer to "where is this book furthest from its own plan".
+
+A gap is NOT a reason to buy. It tells you where the plan is unmet, not that today's setup is worth \
+taking, and a weak entry into a large gap is still a weak entry. Judge the candidate on its own \
+numbers exactly as before; the gap only decides which unmet target is worth your attention first \
+when two candidates are otherwise close.
+
 If `settings` carries `current_age`/`retirement_age`, use the YEARS OF RUNWAY (retirement_age minus \
 current_age) as the primary glidepath input — it is clearer than a date. Long runway (15+ years) favours \
 total-return GROWTH; short runway (<10) favours capital preservation and lower drawdown.
@@ -1243,7 +1254,7 @@ async def review_decision(
 async def sandbox_decision(
     book: dict, candidates: list[dict], *, cash: float, settings: dict,
     strategy_note: dict | None, macro: dict | None = None, deep: bool = False,
-    model: str | None = None,
+    model: str | None = None, gaps: list[dict] | None = None,
 ) -> tuple[SandboxDecision, dict]:
     """The daily sandbox decision (Haiku by default): a unified order list to steer the book toward the
     strategy within the risk limits. The server validates/clamps/fills afterward — this only proposes."""
@@ -1256,6 +1267,9 @@ async def sandbox_decision(
         "settings": settings,
         "strategy_note": strategy_note,
     }
+    # Where the standing plan is unmet, pre-computed and ordered. Omitted when nothing is short.
+    if gaps:
+        payload["allocation_gaps"] = gaps
     # Omitted entirely when there's no usable read — an empty macro block would assert a calm
     # backdrop on exactly the days the news pipeline is broken.
     if macro:

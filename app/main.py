@@ -2568,7 +2568,10 @@ async def _run_extra_arm(
                 book, candidates, cash=blob["cash"],
                 settings=sandbox_job.settings_for_prompt(settings),
                 strategy_note=shared_plan, macro=macro_block, deep=False,
-                model=(str(settings.get("model")).strip() or None) if settings.get("model") else None)
+                model=(str(settings.get("model")).strip() or None) if settings.get("model") else None,
+                gaps=sandbox_job.target_gaps(
+                    blob["positions"], equity=book.get("total_value") or 0.0,
+                    plan=shared_plan, group_of=_exposure_group, price_of=price_of))
             usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
             _arm_orders = [o.model_dump() for o in decision.orders]
             # Review on the arm path too. This was implemented on main only, so review_enabled on an
@@ -2881,7 +2884,11 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 decision, usage = await sandbox_decision(
                     book, candidates, cash=blob["cash"],
                     settings=sandbox_job.settings_for_prompt(settings),
-                    strategy_note=blob.get("last_strategy_note"), macro=macro_block, deep=False)
+                    strategy_note=blob.get("last_strategy_note"), macro=macro_block, deep=False,
+                    gaps=sandbox_job.target_gaps(
+                        blob["positions"], equity=book.get("total_value") or 0.0,
+                        plan=blob.get("last_strategy_note"), group_of=_exposure_group,
+                        price_of=price_of))
                 usage_store.record(usage, symbol="SANDBOX", kind="sandbox_tick")
                 orders = [o.model_dump() for o in decision.orders]
                 posture = decision.posture
