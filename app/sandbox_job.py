@@ -1296,6 +1296,33 @@ def target_gaps(
     return sorted(out, key=lambda r: -r["gap_pct"])
 
 
+def review_skip_rows(dropped_orders: list[dict], verdict: dict, *, now_ts: float) -> list[dict]:
+    """Trade-log rows for orders the review model refused. Same shape as any other skip.
+
+    A dropped order used to leave NO trace at all: apply_review removed it before validate_and_fill
+    ever saw it, so nothing wrote a row, and the only evidence a rejection had happened was the
+    control arm buying the thing. The trade log said the order was never proposed, which is the same
+    thing it says about an order that genuinely never was -- and those are very different facts.
+
+    The row carries BOTH reasons. `reason` stays the analyst's case for the trade and `skip_reason`
+    is the reviewer's case against it, so the disagreement is legible from one line rather than
+    reconstructible only by diffing two arms.
+    """
+    concerns = [str(c) for c in (verdict.get("concerns") or []) if str(c).strip()]
+    note = str(verdict.get("note") or "").strip()
+    # The note first when there is one: it is the reviewer's own summary. Concerns follow because
+    # they are what a reader needs in order to disagree with it.
+    detail = " · ".join(x for x in ([note] + concerns) if x) or "no reason given"
+    verb = "rejected the whole decision" if not verdict.get("approve", True) else "dropped this order"
+    return [{
+        "ts": now_ts, "date": today_et_str(), "symbol": str(o.get("symbol", "")).upper(),
+        "side": o.get("side"), "status": "skipped", "shares": 0.0, "price": None,
+        "conviction": o.get("conviction"), "source": "review", "reason": o.get("reason", ""),
+        "entry_low": o.get("entry_low"), "entry_high": o.get("entry_high"),
+        "skip_reason": f"review model {verb} — {detail}",
+    } for o in dropped_orders]
+
+
 def apply_review(orders: list[dict], verdict: dict) -> tuple[list[dict], list[str]]:
     """Apply a review verdict to the proposed orders. Returns (surviving_orders, dropped_symbols).
 

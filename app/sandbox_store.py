@@ -196,6 +196,9 @@ def _defaults(arm: str = MAIN_ARM, *, engine: str = "llm", label: str | None = N
         # proposed NOTHING: the trade log only holds orders, so without this a deliberate hold and a
         # blocked one leave identical traces (none).
         "last_posture": "",
+        # {date, approve, dropped, concerns, note} from the review model's last verdict, or {} if it
+        # has never run on this arm. Distinguishing "approved" from "never ran" is the point.
+        "last_review": {},
         "last_decision_date": None,       # ET yyyy-mm-dd of the last DECISION (drives weekly cadence)
         "last_deposit_month": None,       # "yyyy-mm" of the last recurring deposit
         "last_weekly_review_date": None,

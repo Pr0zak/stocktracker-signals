@@ -2535,6 +2535,9 @@ async def _run_extra_arm(
                 "gross": round(dep, 2), "cash_after": blob["cash"], "source": "recurring",
                 "reason": f"Recurring monthly deposit ${dep:,.0f}"}, arm)
 
+    # Bound before the engine fork: only the llm branch can populate it, but every branch reaches
+    # the trade-log write below, and a name defined in one arm of a fork is not defined in the others.
+    _review_skips: list[dict] = []
     flat = sandbox_job.exit_date_flatten_orders(blob, price_of)
     if flat is not None:
         orders, source, posture = flat, "exit_date", "Exit date reached — flattening to cash."
@@ -2584,7 +2587,18 @@ async def _run_extra_arm(
                         settings=sandbox_job.settings_for_prompt(settings),
                         strategy_note=shared_plan, deep=True)
                     usage_store.record(rusage, symbol=f"SANDBOX:{arm}", kind="sandbox_review")
-                    kept, dropped_syms = sandbox_job.apply_review(_arm_orders, verdict.model_dump())
+                    _v = verdict.model_dump()
+                    kept, dropped_syms = sandbox_job.apply_review(_arm_orders, _v)
+                    blob["last_review"] = {
+                        "date": sandbox_job.today_et_str(now), "approve": _v.get("approve", True),
+                        "dropped": dropped_syms, "concerns": _v.get("concerns") or [],
+                        "note": _v.get("note") or "",
+                    }
+                    if dropped_syms:
+                        _review_skips = sandbox_job.review_skip_rows(
+                            [o for o in _arm_orders
+                             if str(o.get("symbol", "")).upper() in set(dropped_syms)],
+                            _v, now_ts=time.time())
                     if dropped_syms and rejected is not None:
                         # Handed to any arm configured to take them. The rejected ORDERS, not just
                         # their symbols: the control arm has to execute the same trade that was
@@ -2627,7 +2641,7 @@ async def _run_extra_arm(
     new_blob["last_tick_date"] = sandbox_job.today_et_str(now)
     new_blob["last_posture"] = posture or ""     # see the main path; arms need it for the same reason
     sandbox_store.save(new_blob, arm)
-    for r in filled + skipped:
+    for r in filled + skipped + _review_skips:
         sandbox_store.append_trade(r, arm)
     sandbox_store.append_nav(nav, arm)
     return {"arm": arm, "label": label, "engine": engine, "status": "ok", "posture": posture,
@@ -2905,11 +2919,24 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                             strategy_note=blob.get("last_strategy_note"), deep=True)
                         usage_store.record(rusage, symbol="SANDBOX", kind="sandbox_review")
                         _pre = list(orders)
-                        orders, dropped = sandbox_job.apply_review(orders, verdict.model_dump())
+                        _v = verdict.model_dump()
+                        orders, dropped = sandbox_job.apply_review(orders, _v)
+                        # Persisted whatever the outcome, so an APPROVED review is distinguishable
+                        # from one that never ran. Both currently look like a tick with no rejection.
+                        new_blob["last_review"] = {
+                            "date": sandbox_job.today_et_str(now), "approve": _v.get("approve", True),
+                            "dropped": dropped, "concerns": _v.get("concerns") or [],
+                            "note": _v.get("note") or "",
+                        }
                         if dropped:
-                            rejected_by_arm[sandbox_store.MAIN_ARM] = [
-                                o for o in _pre
-                                if str(o.get("symbol", "")).upper() in set(dropped)]
+                            _dropped_orders = [o for o in _pre
+                                               if str(o.get("symbol", "")).upper() in set(dropped)]
+                            rejected_by_arm[sandbox_store.MAIN_ARM] = _dropped_orders
+                            # A dropped order never reaches validate_and_fill, so nothing else would
+                            # write it a row -- and a rejected order that leaves no trace is
+                            # indistinguishable in the log from one that was never proposed.
+                            skipped.extend(sandbox_job.review_skip_rows(
+                                _dropped_orders, _v, now_ts=time.time()))
                         if dropped:
                             warnings.append(
                                 f"review dropped {len(dropped)} order(s): {', '.join(dropped)}"
@@ -3170,6 +3197,10 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
         # last day the account traded — a posture with no date attached reads as current whatever
         # its age, which is the stale-as-fresh problem this codebase keeps having to fix.
         "last_posture": blob.get("last_posture") or None,
+        # The review model's last verdict, dated. Present even when it APPROVED — otherwise a tick
+        # the reviewer passed and a tick where it never ran look identical, which is the same
+        # absent-vs-negative confusion the posture field was added to fix.
+        "last_review": blob.get("last_review") or None,
         # Return without its risk is half a sentence. Computed from the NAV log rather than tracked
         # in the ledger: the log IS the record, and a running counter can drift from it with nothing
         # to reconcile against. Null until the series has two points -- "no drawdown yet" and
