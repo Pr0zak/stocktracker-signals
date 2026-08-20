@@ -250,6 +250,24 @@ ROUND_UP_MIN_SHARE = 0.9
 # cannot happen and short enough that a real stop still works; 8% is well outside ordinary weekly
 # noise for the large caps this account holds and well inside a real break. Neither is derived from
 # a backtest, and they should be revisited if the arms produce evidence either way.
+# A take-profit TRIM on a position bought days ago needs a genuinely extreme extension to justify it.
+#
+# The loss guard below has a mirror image and it shipped uncovered. Measured 2026-08-20: GLD was
+# bought on the 18th and the 19th to fill a plan target, and one lot was sold on the 20th for +$10.29
+# as a "trim parabolic run: RSI 67, stochastic 100, mayer 1.0". The mayer multiple was 1.0 -- price
+# exactly at its 200-day average, the definition of NOT extended -- and weekly RSI was 55.9. The
+# order quoted the extension rule while the numbers it quoted refuted it.
+#
+# The rule already says "a position that is simply up, even a lot, is a position that is WORKING. Do
+# not scalp it", and mayer_multiple is exactly the mechanically checkable form of "well over 1" that
+# the prose asks for. Per the 2026-08-06 lesson, that belongs in code.
+#
+# 1.15 is a judgement. It is comfortably above the ~1.0 that triggered this and comfortably below the
+# 1.3-1.5 that marks a genuine blow-off in the large caps and broad funds this account holds. It is
+# not from a backtest, and it only ever GATES a sell -- a position too new to trim is held, which is
+# the account's default posture anyway, so a wrong threshold costs patience rather than money.
+EXTREME_MAYER = 1.15
+
 MIN_HOLD_DAYS_FOR_SMALL_LOSS = 7
 SMALL_LOSS_PCT = 8.0
 
@@ -850,6 +868,7 @@ def validate_and_fill(
     source: str = "haiku_tick",
     exclude: set[str] | None = None,
     liquidation: bool = False,
+    extension_of: Callable[[str], float | None] | None = None,
 ) -> tuple[dict, list[dict], list[dict]]:
     """Apply an analyst order list to the ledger under hard risk limits. Returns (new_blob, filled_rows,
     skipped_rows). Sells run before buys (free cash / cut exposure first). The blob is copied, not mutated
@@ -1017,6 +1036,16 @@ def validate_and_fill(
                 _skip(o, f"selling a {loss_pct:.1f}% loss after {held_days:.0f} day(s) — under the "
                          f"{SMALL_LOSS_PCT:.0f}% / {MIN_HOLD_DAYS_FOR_SMALL_LOSS}-day churn guard; "
                          f"a small loss on a new position is noise, not a broken thesis"); continue
+        # The mirror: a take-profit trim on a position days old, without a genuinely extreme
+        # extension to justify it. Only applies when the extension is KNOWN -- an unmeasured name
+        # falls through to the prompt's judgement rather than being blocked on missing data.
+        if not liquidation and realized > 0 and pos.get("avg_cost"):
+            held_days = (now_ts - float(pos.get("last_add_at") or pos.get("opened_at") or 0)) / 86_400.0
+            mayer = extension_of(sym) if extension_of else None
+            if held_days < MIN_HOLD_DAYS_FOR_SMALL_LOSS and mayer is not None and mayer < EXTREME_MAYER:
+                _skip(o, f"trimming a {held_days:.0f}-day-old position at a mayer multiple of "
+                         f"{mayer:.2f} — under the {EXTREME_MAYER:.2f} extreme-extension bar; a "
+                         f"position that is simply up is working, not extended"); continue
         traded_notional += shares * fill
         proceeds = shares * fill
         cash += proceeds

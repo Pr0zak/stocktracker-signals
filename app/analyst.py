@@ -1051,7 +1051,11 @@ not one of them:
       name's own long-cycle norms (a `mayer_multiple` well over 1, price stretched vs the 200-week \
       line, weekly RSI at an extreme), where the risk of giving it back is real. A position that is \
       simply up, even a lot, in an account with years of runway is a position that is WORKING. Do \
-      not scalp it.
+      not scalp it. QUOTE THE NUMBER AND CHECK IT SUPPORTS YOU: a `mayer_multiple` of 1.0 is price \
+      sitting exactly on its own 200-day average, which is the definition of NOT extended, and being \
+      far above a 200-WEEK line after a multi-year uptrend is not a parabolic run either. The ledger \
+      refuses an early trim whose measured extension does not clear the bar, so an order argued this \
+      way does not trade — it is logged as a skip with your reasoning attached.
   (2) PROTECT FROM A DOWNTURN — the thesis is breaking (relative strength rolling over, lost the \
       50-day, momentum gone), or the macro/long-cycle picture has turned against it.
   (3) THE PLAN NO LONGER NAMES THIS EXPOSURE — `strategy_note` dropped its group, so the position is \

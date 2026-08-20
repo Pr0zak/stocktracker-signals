@@ -2480,6 +2480,27 @@ async def _maybe_weekly_review(
         return False
 
 
+def _extension_lookup(book: dict) -> "Callable[[str], float | None]":
+    """symbol -> mayer_multiple, read off the book snapshot the tick already built.
+
+    Injected into validate_and_fill rather than fetched there, so that module stays pure and
+    network-free. Returns None for anything unmeasured -- a spot-crypto ETF too young for a 200-week
+    read, or a name whose long-term block failed to build -- and the guard treats None as "do not
+    judge" rather than as "not extended". Blocking a sell on missing data would be the wrong
+    direction: absent is not a measurement.
+    """
+    ext = {}
+    for p in (book or {}).get("positions") or []:
+        lt = p.get("long_term") or {}
+        m = lt.get("mayer_multiple")
+        if m is not None:
+            try:
+                ext[str(p.get("symbol", "")).upper()] = float(m)
+            except (TypeError, ValueError):
+                pass
+    return lambda sym: ext.get(str(sym).upper())
+
+
 async def _run_extra_arm(
     arm: str, *, now, price_of, spy_price: float | None, shared_plan: dict | None,
     candidates: list[dict], macro_block, force: bool,
@@ -2624,7 +2645,8 @@ async def _run_extra_arm(
     try:
         new_blob, filled, skipped = sandbox_job.validate_and_fill(
             blob, orders, price_of, group_of=_exposure_group, source=source, exclude=exclude,
-            liquidation=(source == "exit_date"))
+            liquidation=(source == "exit_date"),
+            extension_of=_extension_lookup(locals().get("book")))
     except AssertionError as e:
         # Main is mid-tick and already persisted. Aborting the whole request over a side arm would
         # throw away a completed real tick, so this arm alone is skipped and says why.
@@ -2962,6 +2984,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         try:
             new_blob, filled, skipped = sandbox_job.validate_and_fill(
                 blob, orders, price_of, group_of=_exposure_group, source=source, exclude=exclude,
+                extension_of=_extension_lookup(locals().get("book")),
                 # An exit-date flatten is the user's scheduled instruction, not churn, so the
                 # anti-churn caps must not silently leave the account still invested on that date.
                 liquidation=(source == "exit_date"))
@@ -3397,6 +3420,7 @@ async def sandbox_fill_parked_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dic
 
         new_blob, filled, skipped = sandbox_job.validate_and_fill(
             blob, fresh, price_of, group_of=_exposure_group, source="parked_fill")
+        # No extension_of here: parked orders are buys by construction, and the guard only gates sells.
         pv = sandbox_job.positions_value(new_blob["positions"], price_of)
         # No NAV row: this is an intraday execution, not a valuation point. Writing one would put a
         # second observation on some days and not others, and the equity series is compared
