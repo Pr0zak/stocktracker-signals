@@ -3397,6 +3397,18 @@ async def sandbox_fill_parked_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dic
     earlier date is dropped rather than executed against a thesis nobody re-examined.
     """
     assert _http is not None
+    # `arm=all` sweeps every arm. The timer calls it that way because the original never did:
+    # ExecStart carried no arm parameter, so five runs a day all re-checked `main` while the arms
+    # that actually had parked orders were never looked at. An endpoint whose default is one arm is
+    # right for a hand call and wrong for a sweep, so the sweep says so explicitly.
+    if str(arm).lower() == "all":
+        out = []
+        for a in sandbox_store.list_arms():
+            try:
+                out.append(await sandbox_fill_parked_endpoint(arm=a))
+            except HTTPException as e:  # noqa: PERF203 — one arm's quote failure must not stop the rest
+                out.append({"arm": a, "status": "error", "detail": e.detail})
+        return {"arm": "all", "arms": out}
     arm = _arm_or_400(arm)
     async with _sandbox_lock:
         blob = sandbox_store.get(arm)

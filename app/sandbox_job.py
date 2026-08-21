@@ -268,6 +268,26 @@ ROUND_UP_MIN_SHARE = 0.9
 # the account's default posture anyway, so a wrong threshold costs patience rather than money.
 EXTREME_MAYER = 1.15
 
+# How far outside its own entry zone the market may sit before the ZONE is treated as the mistake.
+#
+# Measured 2026-08-21: an order to buy GLD carried an entry zone of $170-180 while GLD traded at
+# $423.43 -- the market 135% above the top of its own limit. The review model found the cause in the
+# same tick: the order cited technicals "for a ticker that appears nowhere in the candidate data", so
+# the model wrote specific price levels for a symbol it had no price for.
+#
+# A zone that far off is not a patient limit, it is evidence the order was reasoned about something
+# else, and the right response is to refuse the ORDER rather than to park it. Parking assumes the
+# thesis is sound and only the moment is wrong; that assumption does not survive a 135% gap.
+#
+# Checked in BOTH directions. A zone far ABOVE the market currently fills, since buying below the
+# zone is cheaper than the analyst asked -- but "cheaper than intended" is no comfort when the
+# intention was formed against the wrong number.
+#
+# 50% is deliberately loose. A real limit is a few percent from the market and an unusually patient
+# one is maybe twenty; nothing legitimate is half the share price away. Set wide so the guard only
+# ever catches a mistake, never a deliberately distant bid.
+MAX_ZONE_DISTANCE_PCT = 50.0
+
 MIN_HOLD_DAYS_FOR_SMALL_LOSS = 7
 SMALL_LOSS_PCT = 8.0
 
@@ -1129,6 +1149,18 @@ def validate_and_fill(
                 hi = float(hi) if hi is not None else None
             except (TypeError, ValueError):
                 hi = None
+            lo = o.get("entry_low")
+            try:
+                lo = float(lo) if lo is not None else None
+            except (TypeError, ValueError):
+                lo = None
+            # A zone the market is nowhere near is a broken order, not a patient one.
+            far_above = hi and hi > 0 and px > hi * (1 + MAX_ZONE_DISTANCE_PCT / 100.0)
+            far_below = lo and lo > 0 and px < lo * (1 - MAX_ZONE_DISTANCE_PCT / 100.0)
+            if far_above or far_below:
+                _skip(o, f"entry zone {lo}-{hi} is more than {MAX_ZONE_DISTANCE_PCT:.0f}% away from "
+                         f"the market at {px:.2f} — the zone is the error, not the timing; "
+                         f"refusing the order rather than parking it"); continue
             if hi and hi > 0 and px > hi:
                 # PARKED, not discarded. The order was approved on today's read and refused only on
                 # today's price, so the thesis is intact and the number is the only thing wrong.
