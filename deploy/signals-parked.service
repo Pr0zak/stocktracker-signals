@@ -1,0 +1,12 @@
+[Unit]
+Description=StockTracker AI sandbox — fill parked entry-zone buys
+After=network-online.target signals.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Re-check today parked buys against the live quote and fill any whose entry zone is now met.
+# NO model call — the analyst approved these at 14:35 and the ledger refused them on price alone,
+# so this is execution, not a second decision. Cheap enough to run on a short interval.
+# Exits 0 with status "nothing_parked" when there is nothing to do, which is most runs.
+ExecStart=/usr/bin/curl -fsS -m 60 -X POST http://127.0.0.1:8000/sandbox/fill_parked?arm=all

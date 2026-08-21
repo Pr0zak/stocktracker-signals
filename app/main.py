@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import dashboard, gaps, market_calendar, memory, rebalance_check, heatmap, sandbox_job, sandbox_store, screener, smartmoney, universe, valuetrap
+from . import dashboard, gaps, market_calendar, market_scan_job, memory, rebalance_check, heatmap, sandbox_job, sandbox_store, scan_store, screener, smartmoney, universe, valuetrap
 from .analyst import (
     analyze,
     daily_brief,
@@ -2144,6 +2144,299 @@ async def macro_catalysts() -> dict:
 async def macro_run(force: bool = False) -> dict:
     """Run the macro research pass now (also wired to a systemd timer a few times a day)."""
     return await run_macro(force=force)
+
+
+# ======================================================================================
+# SWT-1 — the nightly MARKET-WIDE cross-section: ~3,100 liquid US equities, the same ~25 price
+# measurements on each, stored one row per (night, symbol) in data/scan.db.
+#
+# Free. NO LLM anywhere in this section — daily bars and arithmetic, nothing else.
+#
+# CONTEXT, NOT A BUY SIGNAL, on every route below. A cross-section says where a name sits relative
+# to the rest of the market on one night. That is a description of the tape, not a recommendation,
+# and "top of the momentum ranking" is emphatically not "buy this".
+#
+# Threading: scan_store's functions are SYNCHRONOUS SQLite and are reached ONLY through
+# asyncio.to_thread (the pattern at the usage_store/selfupdate calls above). GET /memory/stats calls
+# memory.stats() straight from its async def and blocks this single-worker event loop for the
+# duration; over a 288k-row table that is not survivable, so this section does not copy it.
+#
+# Writing: the API process is a READ-ONLY consumer of scan.db. app/market_scan_job.py is its sole
+# writer, and POST /market_scan/run is the one door to it.
+# ======================================================================================
+
+_MARKET_SCAN_TTL = 900          # ~15 min. The underlying rows change once a night; this only
+                                # coalesces a tab being reopened, and the key below carries the
+                                # scan's own date so a fresh scan invalidates it outright.
+_MARKET_SCAN_LIMIT_MAX = 200    # Hard cap. The night is ~3,100 rows; that is a bulk export, not
+                                # something to hand a phone, and `limit` is the only thing between
+                                # the two.
+_MARKET_SCAN_DEFAULT_SORT = "rel_strength"
+
+# Query parameters that are NOT filters. Everything else in the query string is looked up in
+# scan_store.FILTER_NAMES and 422s if it is not there — a filter that silently does nothing returns
+# a LONGER list than was asked for and presents it as filtered.
+_MARKET_SCAN_RESERVED = frozenset({"limit", "sort", "refresh"})
+
+
+def _market_scan_summary() -> dict | None:
+    """The last run's summary JSON, or None if there isn't a readable one. Blocking file read."""
+    try:
+        return json.loads(market_scan_job.LATEST.read_text())
+    except Exception:  # noqa: BLE001 — an absent or corrupt summary means "we cannot say how the
+        # last run went". That is reported as null provenance below, never as zeros, and it must not
+        # take down a read of rows that are sitting in the database perfectly intact.
+        return None
+
+
+def _market_scan_provenance(night: str | None) -> dict:
+    """Run counters for the night being served — and nulls whenever they'd describe a DIFFERENT one.
+
+    The summary file and the rows can legitimately disagree. A run that refuses today (stale
+    universe) still writes a summary stamped with today's session and `scanned: null`, while
+    scan.db keeps last night's rows and happily serves them. Pinning today's counters onto last
+    night's numbers would be provenance for the wrong data — worse than no provenance, because it
+    reads as confirmation.
+
+    `scanned` / `fetch_failed` / `too_short` stay three separate facts: a name we could not fetch
+    and a name with too little history are different claims, and neither is "we scanned it".
+    """
+    s = _market_scan_summary() or {}
+    same = bool(night) and str(s.get("session") or "") == str(night)
+    built = s.get("universe_built_at") if same else None
+    stale: bool | None = None
+    if built:
+        try:
+            stale = universe.is_stale({"built_at": built})
+        except Exception:  # noqa: BLE001 — a corrupt built_at reaches is_stale as a string and
+            # raises there; "we cannot judge its freshness" is None, and is not the same as "fresh".
+            stale = None
+    return {
+        "generated_at": s.get("generated_at") if same else None,
+        "universe_size": s.get("universe_symbols") if same else None,
+        "scanned": s.get("scanned") if same else None,
+        "fetch_failed": s.get("fetch_failed") if same else None,
+        "too_short": s.get("too_short") if same else None,
+        "universe_built_at": built,
+        "universe_stale": stale,
+    }
+
+
+def _market_scan_note(shown: int, total: int | None, prov: dict) -> str:
+    """The one human sentence that says what slice this is, and of what."""
+    head = f"Top {shown} of {total:,} matching" if total is not None else f"Top {shown} matching"
+    scanned, size = prov.get("scanned"), prov.get("universe_size")
+    if scanned is not None and size is not None:
+        mid = f", from {scanned:,} scored of {size:,} in the universe."
+    elif scanned is not None:
+        mid = f", from {scanned:,} scored."
+    else:
+        # Rows without a matching run summary. Saying "of 3,113 scanned" here would be inventing the
+        # denominator; saying nothing at all would let the reader assume the whole market.
+        mid = ", from a scan whose run summary is unavailable."
+    return (head + mid + " Where these names sit relative to the market on this night — "
+            "CONTEXT, NOT A BUY SIGNAL.")
+
+
+def _market_scan_bool(name: str, raw: str) -> bool:
+    """A query-string boolean, refused rather than guessed at.
+
+    `above_sma200=maybe` silently read as False is a bearish filter the caller never asked for.
+    """
+    v = str(raw).strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    raise HTTPException(status_code=422, detail=f"filter {name!r} must be true or false, got {raw!r}")
+
+
+def _market_scan_filters(request: Request) -> dict:
+    """The query string's filter kwargs, validated against scan_store's own published vocabulary."""
+    out: dict = {}
+    for key, raw in request.query_params.multi_items():
+        if key in _MARKET_SCAN_RESERVED:
+            continue
+        if key not in scan_store.FILTER_NAMES:
+            raise HTTPException(status_code=422, detail=(
+                f"unknown filter {key!r} — filters are min_<metric> / max_<metric>, or a bare "
+                f"boolean metric ({', '.join(sorted(scan_store.BOOL_FILTERS))})"))
+        if key in scan_store.BOOL_FILTERS:
+            out[key] = _market_scan_bool(key, raw)
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422,
+                                detail=f"filter {key!r} must be a number, got {raw!r}") from None
+        # float("nan") parses. A NaN bound makes every comparison false, so the response would be a
+        # legitimately-shaped empty cross-section produced by a typo.
+        if not math.isfinite(val):
+            raise HTTPException(status_code=422, detail=f"filter {key!r} must be a finite number, got {raw!r}")
+        out[key] = val
+    return out
+
+
+def _invalidate_market_scan_cache() -> None:
+    """Drop every cached market-scan slice and breadth reading.
+
+    The cache keys on the scan's DATE, which is the right key for a job that runs once a night — but
+    `force=true` re-measures the SAME night, so the date alone would keep serving the pre-run answer
+    for up to 15 minutes with `cached: true` stamped on it.
+    """
+    for k in [k for k in _cache if isinstance(k, tuple) and k and str(k[0]).startswith("market_scan")]:
+        _cache.pop(k, None)
+
+
+@app.get("/market_scan")
+async def market_scan_endpoint(request: Request, limit: int = 50,
+                               sort: str = _MARKET_SCAN_DEFAULT_SORT,
+                               refresh: bool = False) -> dict:
+    """SWT-1 — a ranked SLICE of last night's market-wide cross-section. Free: NO LLM, no fetches.
+
+    CONTEXT, NOT A BUY SIGNAL. This ranks ~3,100 liquid names on one measurement and hands back the
+    head of that ranking. Being top of a momentum sort is a statement about the last three months of
+    price, not about what happens next — read it the way you read a leaderboard, not a shortlist.
+
+    `sort` is any metric column, descending, NULLs last; prefix it with "-" for ascending
+    ("-atr14_pct" for the calmest names rather than the wildest). Filters are `min_<metric>` /
+    `max_<metric>` query params plus bare booleans (`above_sma200=true`); an unknown one is a 422
+    rather than a filter that quietly does nothing. `limit` is capped at 200 — the whole night is a
+    bulk export, not a payload.
+
+    503 when no scan has ever run: an empty cross-section rendered as a market reading is the exact
+    defect this service keeps correcting.
+    """
+    if sort.lstrip("-") not in scan_store.SORT_COLUMNS:
+        raise HTTPException(status_code=422, detail=(
+            f"unknown sort {sort!r} — one of: {', '.join(sorted(scan_store.SORT_COLUMNS))} "
+            f"(prefix with '-' for ascending)"))
+    limit = max(1, min(_MARKET_SCAN_LIMIT_MAX, limit))
+    filters = _market_scan_filters(request)
+
+    night = await asyncio.to_thread(scan_store.latest_date)
+    if night is None:
+        raise HTTPException(status_code=503, detail="no market scan has run yet — POST /market_scan/run")
+
+    # The key carries EVERY input that changes the answer, including the scan's own date — the same
+    # rule /screener/value keys the universe's built_at on, and the one GET /regime's `count` misses.
+    # The date is what makes this self-invalidating: a new night is a new key, so a fresh scan can
+    # never be served from the previous night's entry.
+    key = ("market_scan", night, sort, limit, tuple(sorted(filters.items())))
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and not refresh and now - hit[0] < _MARKET_SCAN_TTL:
+        return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
+
+    rows = await asyncio.to_thread(scan_store.top, night, sort=sort, limit=limit, **filters)
+    # What the slice is a slice OF. len(rows) can only ever report `limit` back.
+    total = await asyncio.to_thread(scan_store.count, night, **filters)
+    prov = await asyncio.to_thread(_market_scan_provenance, night)
+
+    payload = {
+        "as_of": night,
+        **prov,
+        "sort": sort,
+        "limit": limit,
+        "total_matching": total,
+        "results": rows,
+        "note": _market_scan_note(len(rows), total, prov),
+        "cached": False,
+        # Present even when fresh, so a client decoding this never has to treat the key as optional.
+        "cached_age_seconds": 0,
+    }
+    _cache[key] = (now, payload)
+    return payload
+
+
+@app.get("/market_scan/breadth")
+async def market_scan_breadth_endpoint(refresh: bool = False) -> dict:
+    """SWT-1 — market participation for the last night scanned. Free: NO LLM, no fetches.
+
+    CONTEXT, NOT A BUY SIGNAL. Breadth describes how much of the market is participating; it is a
+    backdrop reading, and on its own it says nothing about any individual name.
+
+    READ `available` FIRST. When it is False every reading here is null and the caller must render
+    "no scan" — a dash, not a number. This route NEVER substitutes 0 for a missing scan:
+    `pct_above_sma50: 0.0` is not "we did not scan", it is "none of the market is above its 50-day
+    average", which is the single most bearish breadth print that exists. Unlike the other routes in
+    this section it therefore does not 503 on a missing scan either — SWT-2 depends on always
+    getting a decodable, honestly-null envelope back.
+    """
+    night = await asyncio.to_thread(scan_store.latest_date)
+    key = ("market_scan_breadth", night)
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and not refresh and now - hit[0] < _MARKET_SCAN_TTL:
+        return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
+
+    # scan_store.breadth() already returns the all-None shape on a missing night or an unreadable
+    # database, and it never raises. Passing `night` (rather than None) keeps the reading and the
+    # cache key describing the same night even if a scan lands between the two calls.
+    reading = await asyncio.to_thread(scan_store.breadth, night)
+    prov = await asyncio.to_thread(_market_scan_provenance, night)
+    payload = {**reading, **prov, "cached": False, "cached_age_seconds": 0}
+    _cache[key] = (now, payload)
+    return payload
+
+
+@app.get("/market_scan/{symbol}")
+async def market_scan_symbol_endpoint(symbol: str) -> dict:
+    """SWT-1 — one name's row from the market scan. Free: NO LLM, no fetches.
+
+    CONTEXT, NOT A BUY SIGNAL: these are measurements of this name's own price history plus where it
+    sits against the market, and nothing here is a view on it.
+
+    404 — "we looked and there is no data for this symbol" — when the name is in no night we hold.
+    The row returned is that symbol's MOST RECENT one, which is not necessarily the most recent
+    night overall: a name that was halted or failed to fetch last night still has an older
+    observation, and `as_of` / `is_latest_night` / `latest_scan_date` say plainly which night it is
+    rather than passing a three-day-old row off as tonight's.
+    """
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        raise HTTPException(status_code=422, detail="symbol is required")
+    row = await asyncio.to_thread(scan_store.symbol_row, sym)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"{sym} was not in the last market scan")
+
+    night = await asyncio.to_thread(scan_store.latest_date)
+    # Provenance for the night THIS ROW came from, not for the latest one — see
+    # _market_scan_provenance. An older row gets null counters, which is the truth about it.
+    prov = await asyncio.to_thread(_market_scan_provenance, row.get("d"))
+    return {
+        "symbol": sym,
+        "as_of": row.get("d"),
+        "latest_scan_date": night,
+        "is_latest_night": bool(night) and row.get("d") == night,
+        "row": row,
+        **prov,
+        "note": ("One name's measurements from the nightly market-wide scan — "
+                 "CONTEXT, NOT A BUY SIGNAL."),
+    }
+
+
+@app.post("/market_scan/run")
+async def market_scan_run_endpoint(force: bool = False, limit: int | None = None) -> dict:
+    """SWT-1 — run the market-wide scan now (also wired to a nightly systemd timer). No LLM.
+
+    EXPENSIVE, and therefore a POST that no read path can trigger: ~3,100 symbols of daily bars,
+    ~50s wall on this box. Awaited inline like POST /scan/run and POST /macro/run, so the response
+    IS the run summary rather than a promise that something started.
+
+    `force` re-measures a session already stored. `limit` takes the head of the cap-sorted universe
+    for a smoke test — a limited run is a SAMPLE, and the job deliberately skips retiring absent rows
+    on one so a partial run can never replace a night's cross-section with a fraction of itself.
+    """
+    if limit is not None and limit < 1:
+        raise HTTPException(status_code=422,
+                            detail="limit must be >= 1 — omit it to scan the whole universe")
+    out = await market_scan_job.run_market_scan(force=force, limit=limit)
+    # A forced re-run rewrites tonight's rows under tonight's cache key; without this the previous
+    # answer would keep being served for the rest of the TTL.
+    _invalidate_market_scan_cache()
+    return out
+
 
 
 # ======================================================================================

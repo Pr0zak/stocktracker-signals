@@ -1,0 +1,9 @@
+[Unit]
+Description=Fire the AI sandbox trader near the US close on weekdays (14:35 CT = 15:35 ET)
+
+[Timer]
+OnCalendar=Mon-Fri 14:35:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

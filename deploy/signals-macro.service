@@ -1,0 +1,10 @@
+[Unit]
+Description=StockTracker Signals - macro catalyst research pass
+After=network-online.target signals.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Via the running service, not python -m: the app process owns the data dir and this keeps the
+# single-writer property the rest of the service relies on.
+ExecStart=/usr/bin/curl -fsS -m 180 -X POST http://127.0.0.1:8000/macro/run

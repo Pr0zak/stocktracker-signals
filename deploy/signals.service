@@ -1,0 +1,14 @@
+[Unit]
+Description=StockTracker Signals (Tier-2 Claude analyst)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/signals
+EnvironmentFile=/opt/signals/.env
+ExecStart=/opt/signals/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

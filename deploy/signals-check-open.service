@@ -1,0 +1,7 @@
+[Unit]
+Description=StockTracker Signals — post-deploy check at the Monday open
+After=network-online.target signals.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/signals-monday-check.sh monday-market-open

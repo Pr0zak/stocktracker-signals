@@ -1,0 +1,10 @@
+[Unit]
+Description=StockTracker Signals — nightly watchlist scan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/signals
+EnvironmentFile=/opt/signals/.env
+ExecStart=/opt/signals/.venv/bin/python -m app.scan_job

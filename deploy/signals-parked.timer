@@ -1,0 +1,14 @@
+[Unit]
+Description=Re-check parked sandbox buys over the last 25 minutes of the US session
+
+[Timer]
+# The daily tick runs at 14:35 CT, so nothing can be parked before then; the market closes at 15:00
+# CT (16:00 ET). That 25-minute window is the entire opportunity, and parking turns ONE chance to
+# hit an entry zone into five rather than into an all-day limit order. Widening it without moving
+# the tick earlier would only add empty runs.
+OnCalendar=Mon-Fri 14:40/5:00
+OnCalendar=Mon-Fri 15:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

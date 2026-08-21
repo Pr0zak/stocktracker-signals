@@ -3,7 +3,8 @@
 The heat map was a FLAT treemap: 80 tiles in market-cap order with no structure, so JNJ sat between
 ASML and INTC and there was no way to read "tech is red, energy is green" at a glance. Sector blocks
 are the defining feature of the finviz-style map the user is comparing against, and the classification
-simply was not in the pipeline — universe rows carry symbol/name/is_etf/market_cap and nothing else.
+simply was not in the pipeline — universe rows carry symbol/name/is_etf/market_cap/
+dollar_volume and nothing else.
 
 Source is Yahoo `quoteSummary?modules=assetProfile`, which returns the same taxonomy finviz uses
 (Technology / Semiconductors, Energy / Oil & Gas Integrated, Healthcare / Drug Manufacturers). It

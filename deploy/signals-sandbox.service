@@ -1,0 +1,10 @@
+[Unit]
+Description=StockTracker AI sandbox — daily paper-trading tick
+After=network-online.target signals.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Fire one decision cycle. The endpoint gates on ET trading-day + session, so an off-by-DST minute is
+# harmless, and it is idempotent (once per ET day). 300s covers the weekly Opus review path.
+ExecStart=/usr/bin/curl -fsS -m 300 -X POST http://127.0.0.1:8000/sandbox/tick -H "Content-Type: application/json" -d "{}"

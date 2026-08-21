@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the post-deploy check just after the Monday US open
+
+[Timer]
+OnCalendar=2026-08-03 08:35:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,23 @@
+[Unit]
+# SWT-1 — the nightly LLM-free mechanical scan of the whole tradeable universe.
+#
+# This is deliberately a SEPARATE unit from signals-scan.service rather than another step inside it.
+# signals-scan is watchlist-scoped because every symbol it touches ends in a paid model call; this
+# job makes no model call at all and sweeps ~3,100 names. Keeping them apart means a reader can tell
+# from the unit which job costs money, and — more importantly — it separates the failure domains:
+# signals-scan produces the push-notification feed the phone polls, and a universe-wide fetch that
+# hangs or gets throttled must not be able to delay or fail that.
+#
+# Invoked with `python -m` rather than by curling the running service, which is the pattern
+# signals-macro.service uses. The rule is that the endpoint form exists to preserve the
+# single-writer property for files the app process also writes; data/scan.db has no other writer, so
+# the direct form is correct here and keeps the job independent of uvicorn being healthy.
+Description=StockTracker Signals — nightly full-market mechanical scan (SWT-1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/signals
+EnvironmentFile=/opt/signals/.env
+ExecStart=/opt/signals/.venv/bin/python -m app.market_scan_job

@@ -1,0 +1,20 @@
+[Unit]
+Description=Run the full-market mechanical scan nightly, before its consumers
+
+[Timer]
+# 05:45 America/Chicago, which is deliberately AHEAD of both consumers: signals-macro fires at 06:15
+# and signals-scan at 06:30, so each of them reads a cross-section minutes old rather than a day
+# old. The ordering matters for the regime gate in particular — market breadth is derived from this
+# scan, so a gate evaluated before the scan has run is evaluating yesterday's market.
+#
+# 45 minutes of headroom for a job measured at 50 seconds over 3,147 symbols (zero throttles, peak
+# RSS 53 MB). The margin is not for the normal case; it is for the case where Yahoo starts rate
+# limiting and the job's own backoff stretches the run.
+OnCalendar=*-*-* 05:45:00
+
+# A missed run — the CT was down, or migrated between nodes — fires on next boot rather than
+# silently skipping a night and leaving a hole in the retention window.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

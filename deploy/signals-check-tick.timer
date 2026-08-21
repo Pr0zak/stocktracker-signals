@@ -1,0 +1,9 @@
+[Unit]
+Description=Post-tick sandbox check, ten minutes after the daily decision
+
+[Timer]
+OnCalendar=Mon-Fri 14:45:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

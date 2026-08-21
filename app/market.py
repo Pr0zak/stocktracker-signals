@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -28,6 +28,12 @@ class Series:
     fifty_two_low: float | None
     currency: str
     source: str = "yahoo"  # "webull" when Yahoo had no data and the fallback supplied bars
+    # Per-bar high/low, index-aligned with `closes` and SCALED ONTO THE ADJUSTED BASIS (see the
+    # rescaling comment in fetch_series). None for a bar means the venue omitted it — never 0.0.
+    # These are defaulted and last on purpose: scan_job.py's memory backfill builds a truncated
+    # Series that predates them, so they must not become required positional fields.
+    highs: list[float | None] = field(default_factory=list)
+    lows: list[float | None] = field(default_factory=list)
 
 
 async def _fetch_chart(client: httpx.AsyncClient, symbol: str, rng: str = "1y", interval: str = "1d") -> dict:
@@ -79,20 +85,37 @@ async def _webull_series(client: httpx.AsyncClient, symbol: str) -> Series:
     closes = [b["c"] for b in bars]
     opens: list[float | None] = [b.get("o") for b in bars]
     vols: list[float | None] = [b.get("v") for b in bars]
+    # No adjusted-basis rescaling here, unlike the Yahoo path: Webull hands back one raw OHLC set,
+    # so `closes` are already raw too and high/low/close share a single basis. (The cost is that a
+    # split inside a Webull-only symbol's history distorts the closes themselves — that is a
+    # pre-existing property of this fallback, not something high/low make worse.)
+    highs: list[float | None] = [b.get("h") for b in bars]
+    lows: list[float | None] = [b.get("l") for b in bars]
     dates = [time.strftime("%Y%m%d", time.gmtime(b["t"] / 1000)) for b in bars]
     recent = closes[-252:]
     return Series(
         symbol=symbol.upper(), closes=closes, opens=opens, volumes=vols, dates=dates,
         fifty_two_high=max(recent), fifty_two_low=min(recent), currency="USD", source="webull",
+        highs=highs, lows=lows,
     )
 
 
-async def fetch_series(client: httpx.AsyncClient, symbol: str, rng: str = "1y") -> Series:
+async def fetch_series(client: httpx.AsyncClient, symbol: str, rng: str = "1y", *, fallback: bool = True) -> Series:
     """Daily bars for `symbol`. `rng` is a Yahoo range string ("1y", "2y", "5y") — the memory
-    backfill wants more history than a signal does, everything else takes the default."""
+    backfill wants more history than a signal does, everything else takes the default.
+
+    `fallback=False` makes a Yahoo failure raise instead of reaching for Webull. That switch exists
+    for the bulk swing scan: across 3,000+ symbols even a 2% Yahoo failure rate is ~60 names, and
+    each one would burn up to 30s of Yahoo timeouts (two hosts x 15s) and then ~27s more of Webull
+    search+chart against an unofficial, reverse-engineered endpoint — half an hour of wall clock and
+    a rate-limit magnet, to rescue a handful of warrants a swing scan does not want anyway. It
+    defaults True so every interactive caller keeps the rescue it has today.
+    """
     try:
         data = await _fetch_chart(client, symbol, rng=rng)
     except Exception:  # noqa: BLE001 — Yahoo has nothing; try the Webull fallback (warrants/OTC)
+        if not fallback:
+            raise
         return await _webull_series(client, symbol)
     result = data["chart"]["result"][0]
     meta = result.get("meta", {})
@@ -101,9 +124,14 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str, rng: str = "1y") 
     adj_closes = _adjusted_closes(result)
     raw_vols = quote.get("volume") or []
     raw_opens = quote.get("open") or []
+    raw_highs = quote.get("high") or []
+    raw_lows = quote.get("low") or []
+    raw_closes = quote.get("close") or []
     closes: list[float] = []
     opens: list[float | None] = []
     vols: list[float | None] = []
+    highs: list[float | None] = []
+    lows: list[float | None] = []
     dates: list[str] = []
     for i in range(len(ts)):
         c = adj_closes[i] if i < len(adj_closes) else None
@@ -111,9 +139,28 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str, rng: str = "1y") 
             continue
         closes.append(float(c))
         o = raw_opens[i] if i < len(raw_opens) else None
+        # `opens` is knowingly left RAW while highs/lows below are rescaled. gaps.py measures
+        # opens[-1] against the ADJUSTED closes[-2], so the split bar of a 10:1 reads as a ~90%
+        # overnight gap. That is a real latent bug, but correcting it changes the output of a
+        # shipped feature, so it gets its own commit rather than riding along with this one.
         opens.append(float(o) if o is not None else None)
         v = raw_vols[i] if i < len(raw_vols) else None
         vols.append(float(v) if v is not None else None)
+        # Yahoo's quote arrays (open/high/low/close) are RAW prices, but `closes` above are the
+        # split/dividend-ADJUSTED series from _adjusted_closes. Parking a raw high next to an
+        # adjusted close silently corrupts every range-derived metric across a split: after NVDA's
+        # 10:1 the pre-split bars would report (high-low)/close about 10x too wide, so ADR20 would
+        # flag a placid mega-cap as a volatile mover and CLV would read off a bar whose high sits
+        # 10x above its own close. Rescale each bar by its OWN adjusted/raw close ratio, which is
+        # exactly the cumulative split+dividend factor Yahoo already applied to that bar's close;
+        # the ratio is 1.0 for every bar after the last corporate action. Missing or zero raw close
+        # (Yahoo nulls a bar it has adjclose for) leaves the bar unscaled rather than dropping it.
+        rc = raw_closes[i] if i < len(raw_closes) else None
+        f = (float(c) / float(rc)) if rc else 1.0
+        h = raw_highs[i] if i < len(raw_highs) else None
+        highs.append(float(h) * f if h is not None else None)
+        lo = raw_lows[i] if i < len(raw_lows) else None
+        lows.append(float(lo) * f if lo is not None else None)
         dates.append(time.strftime("%Y%m%d", time.gmtime(ts[i])))
     return Series(
         symbol=symbol.upper(),
@@ -124,6 +171,8 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str, rng: str = "1y") 
         fifty_two_high=meta.get("fiftyTwoWeekHigh"),
         fifty_two_low=meta.get("fiftyTwoWeekLow"),
         currency=meta.get("currency", "USD"),
+        highs=highs,
+        lows=lows,
     )
 
 

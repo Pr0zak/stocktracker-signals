@@ -1,0 +1,7 @@
+[Unit]
+Description=StockTracker Signals — post-tick sandbox check (weekdays)
+After=network-online.target signals.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/signals-monday-check.sh post-tick

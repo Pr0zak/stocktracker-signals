@@ -1,8 +1,26 @@
-"""MB-19 — the curated universe.
+"""MB-19 / SWT-1 — the curated universe: what it parses, and what it is allowed to admit.
 
 Parsing is the part that decides what a screen can ever see, so it is tested against the real file's
 shape: pipe-delimited, a header row, a trailing footer, and columns whose meaning is positional.
+
+The second half pins the SWT-1 gate change. The build used to admit a name on MARKET CAP >= $2B,
+which deleted 13.3% of equities outright (Yahoo reports no marketCap for them) and excluded liquid
+sub-$5 names such as PLUG — $134M of stock a day at $2.27. The gate is now AVERAGE DOLLAR VOLUME and
+market cap survives as optional METADATA, which is what makes these tests necessary:
+
+  * an unreported cap must be stored as None, NEVER 0.0 — a $0 company is the "absent rendered as a
+    confident number" defect this codebase keeps having to fix;
+  * the sort must therefore survive None, and must stay CAP-DESCENDING, because /heatmap?mode=market
+    slices detail[:limit] under a caption that says "Sized by market cap";
+  * ETFs are excluded ON PURPOSE. They already were, accidentally — the old isinstance(cap) gate
+    deleted all but 9 of 5,620 — so dropping the cap gate without saying so would have silently
+    admitted 1,404 funds;
+  * anything the build could not measure (no price, no average volume) is COUNTED into a named
+    field, never dropped in silence;
+  * and publish() gates on symbols returned, not just on batches that answered, because Yahoo omits
+    unknown symbols from an otherwise-healthy 200 response.
 """
+import asyncio
 import time
 
 import pytest
@@ -48,6 +66,43 @@ def test_dual_class_shares_are_kept_AND_written_the_way_yahoo_needs(nasdaq, yaho
     cap filter dropped it again. Verified live against Yahoo before making this change.
     """
     assert [r["symbol"] for r in u.parse_directory(doc(row(nasdaq)))] == [yahoo]
+
+
+@pytest.mark.parametrize("name", [
+    "Churchill Capital Corp XIII - Units",
+    "Karman Line Acquisition Corp. - Units",
+    "Activate Energy Acquisition Corp. - Unit",
+    "Armada Acquisition Corp. III - Warrant",
+    "Abony Acquisition Corp. I - Warrants",
+    "Apogee Acquisition Corp - Rights",
+    "Apogee Acquisition Corp - Right",
+    "BrightSpring Health Services, Inc. - Tangible Equity Unit",
+])
+def test_units_and_warrants_are_dropped_even_when_the_symbol_looks_ordinary(name):
+    """The dotted-suffix rule only catches what the feed spells with a dot, and Nasdaq writes most
+    SPAC units as plain five-letter symbols (XIIIU, XTERU). The $2B cap floor had been excluding
+    them by accident; replacing it with a liquidity gate let seven into the universe. A unit is a
+    share bundled with a fraction of a warrant, so its price is part trust value and part option
+    premium — a moving average over that hybrid describes no company, and it pollutes every
+    cross-sectional percentile it lands in.
+    """
+    assert u.parse_directory(doc(row("XIIIU", name))) == []
+
+
+@pytest.mark.parametrize("name", [
+    "Alibaba Group Holding Limited American Depositary Shares each representing eight Ordinary",
+    "Sony Group Corporation American Depositary Shares",
+    "ASML Holding N.V. - New York Registry Shares",
+    "Taiwan Semiconductor Manufacturing Company Ltd.",
+    "Novo Nordisk A/S Common Stock",
+])
+def test_depositary_and_registry_shares_are_KEPT(name):
+    """The instrument-name rule is anchored to the end of the string for exactly this reason. An
+    unanchored match on "Shares" or "Depositary" deletes every ADR — TSM, BABA, ASML and SONY reach
+    this codebase through them, and TSM sits in the universe's top ten by market cap. Measured
+    against the live directory: 721 rows matched as units/warrants/rights, and none of these did.
+    """
+    assert [r["symbol"] for r in u.parse_directory(doc(row("ADRX", name)))] == ["ADRX"]
 
 
 def test_the_footer_line_does_not_become_a_symbol():
@@ -104,8 +159,6 @@ def test_the_scan_rebuilds_a_stale_universe_and_survives_a_failure(monkeypatch, 
     Equally, a failed rebuild must not take the nightly scan down — the scan's own job matters more
     than the refresh.
     """
-    import asyncio
-
     from app import scan_job
 
     monkeypatch.setattr(u, "_FILE", tmp_path / "universe.json")
@@ -144,8 +197,6 @@ def test_a_partial_fetch_is_marked_incomplete_rather_than_passing_as_a_universe(
     A rate limit midway silently shrank the universe, which was then SAVED and stamped fresh for a
     week — the value screen serving a subsample as if it were the whole market.
     """
-    import asyncio
-
     async def fake_directory(client):
         return [{"symbol": f"S{i}", "name": f"Co {i}", "is_etf": False} for i in range(200)]
 
@@ -155,7 +206,8 @@ def test_a_partial_fetch_is_marked_incomplete_rather_than_passing_as_a_universe(
         calls["n"] += 1
         if calls["n"] % 2 == 0:          # half the batches die
             return {}
-        return {s: {"cap": 5e9, "price": 50.0, "type": "EQUITY"} for s in syms}
+        return {s: {"cap": 5e9, "price": 50.0, "type": "EQUITY", "adv": 1_000_000}
+                for s in syms}
 
     monkeypatch.setattr(u, "fetch_directory", fake_directory)
     monkeypatch.setattr(u, "_profile_batch", flaky_batch)
@@ -166,18 +218,179 @@ def test_a_partial_fetch_is_marked_incomplete_rather_than_passing_as_a_universe(
 
 
 def test_a_clean_fetch_is_marked_complete(monkeypatch):
-    import asyncio
-
     async def fake_directory(client):
         return [{"symbol": f"S{i}", "name": f"Co {i}", "is_etf": False} for i in range(120)]
 
     async def ok_batch(client, syms):
-        return {s: {"cap": 5e9, "price": 50.0, "type": "EQUITY"} for s in syms}
+        return {s: {"cap": 5e9, "price": 50.0, "type": "EQUITY", "adv": 1_000_000}
+                for s in syms}
 
     monkeypatch.setattr(u, "fetch_directory", fake_directory)
     monkeypatch.setattr(u, "_profile_batch", ok_batch)
     blob = asyncio.run(u.build(None))
     assert blob["complete"] is True and blob["batch_coverage"] == 1.0
+
+
+# ---------------------------------------------------------------- the liquidity gate (SWT-1)
+
+def _q(price=50.0, adv=1_000_000, cap=5e9, quote_type="EQUITY") -> dict:
+    """One row of _profile_batch's output. Pass adv=None to model Yahoo OMITTING the field."""
+    row = {"cap": cap, "price": price, "type": quote_type}
+    if adv is not None:
+        row["adv"] = adv
+    return row
+
+
+def _build(monkeypatch, quotes: dict, **kw) -> dict:
+    """Drive build() against a stubbed directory + quote fetch, so no network is touched.
+
+    The directory's ETF flag is derived from the quote type so both signals agree, which is what the
+    real feeds do; the tests that care about a disagreement set it themselves.
+    """
+    directory = kw.pop("directory", None) or [
+        {"symbol": s, "name": f"{s} Inc", "is_etf": q.get("type") == "ETF"}
+        for s, q in quotes.items()]
+
+    async def fake_directory(client):
+        return directory
+
+    async def fake_batch(client, syms):
+        return {s: quotes[s] for s in syms if s in quotes}
+
+    monkeypatch.setattr(u, "fetch_directory", fake_directory)
+    monkeypatch.setattr(u, "_profile_batch", fake_batch)
+    return asyncio.run(u.build(None, **kw))
+
+
+def test_the_gate_is_dollar_volume_not_market_cap(monkeypatch):
+    """A $40B company that trades $200k a day cannot be scanned; a $400M one trading $80M a day can.
+
+    Market cap answered "how big is the issuer". The scanner's question is "can this be traded", and
+    the two disagree often enough that the old filter admitted the untradable and refused the liquid.
+    """
+    blob = _build(monkeypatch, {
+        "ILLIQ": _q(price=20.0, adv=10_000, cap=40e9),      # $200k/day
+        "LIQUID": _q(price=8.0, adv=10_000_000, cap=400e6),  # $80M/day
+    })
+    assert blob["symbols"] == ["LIQUID"]
+    assert blob["passed_filter"] == 1
+
+
+def test_a_liquid_sub_five_dollar_name_is_admitted(monkeypatch):
+    """PLUG: $2.27 a share, 59.4M shares a day — $134M of stock changing hands.
+
+    The old $5 price floor excluded it outright, which is the whole reason the floor moved to $1:
+    dollar volume is the tradability test, and price alone was a cruder version of the same test
+    that happened to be wrong here.
+    """
+    blob = _build(monkeypatch, {"PLUG": _q(price=2.27, adv=59_391_074, cap=2.6e9)})
+    assert blob["symbols"] == ["PLUG"]
+    assert blob["min_price"] == 1.0
+
+
+def test_a_sub_one_dollar_name_is_still_refused_however_liquid(monkeypatch):
+    # $1 is not a size opinion — it is where tick-size and delisting behaviour start breaking the
+    # weekly-trend maths downstream.
+    blob = _build(monkeypatch, {"PENNY": _q(price=0.40, adv=100_000_000, cap=1e9)})
+    assert blob["symbols"] == []
+
+
+def test_a_name_with_no_reported_market_cap_survives_and_is_stored_as_None(monkeypatch):
+    """Absent is not small, and it is certainly not zero.
+
+    873 of 6,555 equities (13.3%) report no marketCap. The old build deleted every one of them via
+    the isinstance(cap) gate. discover.py already treats a missing cap as "keep it" — pinned by
+    tests/test_min_market_cap.py — and the universe now agrees.
+    """
+    blob = _build(monkeypatch, {"NOCAP": _q(cap=None)})
+    assert blob["symbols"] == ["NOCAP"]
+    row = blob["detail"][0]
+    assert row["market_cap"] is None, "0.0 would render a real company as a $0 company"
+    assert "market_cap" in row, "the key must exist so a reader sees 'unknown', not 'not fetched'"
+
+
+def test_an_etf_is_excluded_from_the_stored_universe_and_counted(monkeypatch):
+    """EQUITIES ONLY, on purpose rather than by accident.
+
+    The live universe already held zero ETFs (0 of 600 — no VTI, no SPY, no FBTC), because only 9 of
+    5,620 ETFs report a marketCap and the cap gate deleted the rest. Removing that gate without an
+    explicit rule would have silently admitted 1,404 funds to a screen built around company trends.
+    """
+    blob = _build(monkeypatch, {"SPY": _q(price=600.0, adv=80_000_000, cap=None, quote_type="ETF"),
+                                "AAPL": _q(price=200.0, adv=50_000_000, cap=3e12)})
+    assert blob["symbols"] == ["AAPL"]
+    assert blob["etf_rows"] == 1
+    assert blob["equity_rows"] == 1
+
+
+def test_an_etf_yahoo_types_as_EQUITY_is_still_excluded_by_the_directory_flag(monkeypatch):
+    # The two feeds disagree occasionally. Either one saying "fund" is enough to keep it out.
+    quotes = {"FBTC": _q(price=90.0, adv=5_000_000, cap=20e9)}      # Yahoo says EQUITY
+    directory = [{"symbol": "FBTC", "name": "Fidelity Wise Origin Bitcoin Fund", "is_etf": True}]
+    blob = _build(monkeypatch, quotes, directory=directory)
+    assert blob["symbols"] == [] and blob["etf_rows"] == 1
+
+
+def test_a_row_with_no_average_volume_is_excluded_AND_counted(monkeypatch):
+    """averageDailyVolume3Month covers ~95% of the response, against marketCap's 79%.
+
+    A missing one is therefore a fetch anomaly rather than a property of the company. The gate cannot
+    run without it, so the name is excluded — but silence would make a fetch problem indistinguishable
+    from an illiquid stock, so it lands in a named field instead.
+    """
+    blob = _build(monkeypatch, {"NOADV": _q(adv=None), "FINE": _q()})
+    assert blob["symbols"] == ["FINE"]
+    assert blob["no_adv"] == 1
+
+
+def test_a_row_with_no_price_is_excluded_AND_counted(monkeypatch):
+    # No price means no scan — every computation downstream is price-based — but it is still a fact
+    # about the response, so it is counted rather than dropped.
+    blob = _build(monkeypatch, {"NOPX": _q(price=None), "FINE": _q()})
+    assert blob["symbols"] == ["FINE"]
+    assert blob["no_price"] == 1
+
+
+def test_the_sort_survives_unknown_caps_and_leaves_them_at_the_TAIL(monkeypatch):
+    """`rows.sort(key=lambda r: -r["market_cap"])` raises TypeError the instant a cap can be None.
+
+    Ordering is load-bearing beyond not crashing: /heatmap?mode=market slices detail[:limit] under a
+    caption that says "Sized by market cap". Keeping the sort cap-descending leaves the HEAD of the
+    list untouched, so the map's top-200 behaves exactly as before and the universe grows only at
+    the tail. Re-ranking by dollar volume would silently rewrite which companies appear on the map.
+    """
+    blob = _build(monkeypatch, {"MID": _q(cap=1e9), "NOCAP": _q(cap=None), "BIG": _q(cap=3e9)})
+    assert blob["symbols"] == ["BIG", "MID", "NOCAP"]
+    assert blob["detail"][-1]["market_cap"] is None
+
+
+def test_the_stored_universe_records_the_gate_it_ran(monkeypatch):
+    # A blob that does not say what filtered it cannot be audited later — and this one changed.
+    blob = _build(monkeypatch, {"FINE": _q()})
+    assert blob["min_dollar_volume"] == u.DEFAULT_MIN_DOLLAR_VOLUME == 5_000_000.0
+    assert blob["min_price"] == u.DEFAULT_MIN_PRICE == 1.0
+    assert blob["min_cap"] == u.DEFAULT_MIN_CAP == 0.0, "cap is metadata now, never a filter"
+    assert u.DEFAULT_LIMIT == 4000
+    for k in ("symbol_coverage", "batch_coverage", "no_adv", "no_price",
+              "etf_rows", "equity_rows", "passed_filter", "directory_rows", "complete"):
+        assert k in blob, k
+
+
+def test_symbol_coverage_counts_symbols_returned_not_batches_that_answered(monkeypatch):
+    """Yahoo silently OMITS unknown symbols from an otherwise-200 response.
+
+    batch_coverage counts BATCHES, so a batch that answered for half of what it was asked looks
+    perfectly healthy. At 253 batches, MIN_COVERAGE=0.90 alone tolerates ~1,250 missing symbols in a
+    build stamped `complete`.
+    """
+    # Every batch answers — it just answers for half the symbols it was handed, which is exactly
+    # what an omitted (unknown/delisted) symbol looks like from here.
+    quotes = {f"S{i}": _q() for i in range(0, 200, 2)}
+    directory = [{"symbol": f"S{i}", "name": f"Co {i}", "is_etf": False} for i in range(200)]
+    blob = _build(monkeypatch, quotes, directory=directory)
+    assert blob["batch_coverage"] == 1.0, "every batch answered..."
+    assert blob["symbol_coverage"] == 0.5, "...for half the symbols"
+    assert blob["complete"] is True, "batch coverage alone cannot see this; publish() is the gate"
 
 
 # ---------------------------------------------------------------- publish (shared by both callers)
@@ -219,3 +432,38 @@ def test_publish_always_gives_a_reason_so_every_caller_can_log_an_outcome():
                        ({"symbols": ["A"], "complete": False, "batch_coverage": 0.5}, None)):
         ok, why = u.publish(blob, previous=prev)
         assert isinstance(why, str) and why, (blob, prev)
+
+
+def test_publish_refuses_a_build_that_answered_for_too_few_symbols(monkeypatch):
+    """The symbol-coverage floor, and why it lives in publish() rather than in main.py.
+
+    publish() is the ONE place both callers go through — the attended POST /universe/build and the
+    unattended nightly hook. The batch-coverage guard originally lived in the endpoint only, which
+    left the path nobody watches unprotected; putting this one anywhere else would repeat that.
+    """
+    thin = {"symbols": ["A"], "complete": True, "batch_coverage": 1.0,
+            "symbol_coverage": 0.80, "passed_filter": 1}
+    ok, why = u.publish(thin, previous={"symbols": ["A", "B", "C"]})
+    assert ok is False
+    assert "symbol coverage" in why and "keeping the previous" in why
+
+
+def test_a_thin_build_is_accepted_when_there_is_nothing_to_fall_back_on_but_says_so():
+    thin = {"symbols": ["A"], "complete": True, "batch_coverage": 1.0, "symbol_coverage": 0.80}
+    ok, why = u.publish(thin, previous=None)
+    assert ok is True and "PARTIAL" in why and "symbol coverage" in why
+
+
+def test_symbol_coverage_at_or_above_the_floor_publishes_normally():
+    ok, why = u.publish({"symbols": ["A"], "complete": True, "batch_coverage": 1.0,
+                         "symbol_coverage": u.MIN_SYMBOL_COVERAGE, "passed_filter": 1},
+                        previous={"symbols": ["A", "B"]})
+    assert ok is True and "rebuilt:" in why
+
+
+def test_an_ABSENT_symbol_coverage_is_not_a_failing_one():
+    # A blob built before the field existed cannot be judged on it. Refusing on a number that was
+    # never measured is inventing evidence — the same mistake as reading a missing cap as $0.
+    ok, why = u.publish({"symbols": ["A"], "complete": True, "passed_filter": 1},
+                        previous={"symbols": ["A", "B"]})
+    assert ok is True and "rebuilt:" in why

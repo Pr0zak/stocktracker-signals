@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh the macro / geopolitical catalyst read
+
+[Timer]
+# Deliberately ahead of the two consumers: the nightly scan fires at 06:30 and the sandbox tick at
+# 14:35, so each reads a macro blob minutes old rather than a day old. The midday run catches
+# anything that breaks during the session.
+OnCalendar=*-*-* 06:15:00
+OnCalendar=*-*-* 10:00:00
+OnCalendar=*-*-* 14:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
