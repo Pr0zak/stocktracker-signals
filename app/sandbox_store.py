@@ -64,13 +64,14 @@ def validate_arm(arm: str) -> str:
     return arm
 
 
-def _paths(arm: str) -> tuple[Path, Path, Path, Path, Path]:
-    """(ledger, ledger.bak, trades, nav, changes) for an arm. `main` keeps the original flat layout."""
+def _paths(arm: str) -> tuple[Path, Path, Path, Path, Path, Path]:
+    """(ledger, ledger.bak, trades, nav, changes, inputs) for an arm. `main` keeps the flat layout."""
     arm = validate_arm(arm)
     d = _DATA_DIR if arm == MAIN_ARM else _DATA_DIR / "arms" / arm
     return (d / "sandbox.json", d / "sandbox.json.bak",
             d / "sandbox_trades.jsonl", d / "sandbox_nav.jsonl",
-            d / "sandbox_changes.jsonl")
+            d / "sandbox_changes.jsonl",
+            d / "sandbox_inputs.jsonl")
 
 
 def list_arms() -> list[str]:
@@ -321,6 +322,23 @@ def append_change(row: dict, arm: str = MAIN_ARM) -> None:
 def read_changes(limit: int = 100, arm: str = MAIN_ARM) -> list[dict]:
     """Most recent settings changes first."""
     rows = _read_jsonl(_paths(arm)[4])
+    return list(reversed(rows))[: max(1, limit)]
+
+
+def append_inputs(row: dict, arm: str = MAIN_ARM) -> None:
+    """Record what the model was SHOWN this tick. Append-only, like the trade and NAV logs.
+
+    The companion to the trade log: that says what was decided, this says what it was decided from.
+    Without it a stated reason quoting a number could not be checked against anything -- and on
+    2026-08-21 both the analyst and its reviewer made claims about the input data that turned out to
+    be wrong, with nothing on disk able to settle either.
+    """
+    _append_jsonl(_paths(arm)[5], row)
+
+
+def read_inputs(limit: int = 10, arm: str = MAIN_ARM) -> list[dict]:
+    """Most recent input snapshots first. Small `limit` by default -- each row holds every candidate."""
+    rows = _read_jsonl(_paths(arm)[5])
     return list(reversed(rows))[: max(1, limit)]
 
 

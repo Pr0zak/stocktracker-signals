@@ -1309,6 +1309,49 @@ def validate_and_fill(
     return b, filled, skipped
 
 
+# The numeric fields a decision reason actually quotes, flattened to one row per candidate.
+#
+# Not the whole payload. A full candidate row is ~230 tokens and 89 of them is ~80KB a tick; this is
+# the subset that has appeared inside a stated reason, which is the only part a claim can be checked
+# against.
+_FINGERPRINT_FIELDS = (
+    ("technicals", "rsi14"), ("technicals", "pct_vs_sma50"), ("technicals", "pct_off_52w_high"),
+    ("technicals", "stochastic_k"), ("technicals", "rel_strength_3mo_vs_benchmark"),
+    ("long_term", "rsi_14w"), ("long_term", "mayer_multiple"), ("long_term", "zone"),
+    ("long_term", "price_vs_200w_sma_pct"), ("long_term", "cagr_3y_pct"),
+)
+
+
+def candidate_fingerprint(candidates: list[dict]) -> list[dict]:
+    """One compact row per candidate: what the model was actually shown, for later checking.
+
+    Every record this account keeps describes what was DECIDED -- the trade log, the posture, the
+    review verdict, the settings changelog. Nothing recorded what was SEEN, so a claim about the
+    input could not be settled at all.
+
+    Measured 2026-08-21: an order cited "rsi14w 65" for GLD and the review model rejected the
+    surrounding logic partly on the grounds that GLD "appears nowhere in the candidate data".
+    Rebuilding that day's pool by hand showed GLD present with an rsi_14w of 58.6 -- so the analyst's
+    number was wrong AND the reviewer's reason was wrong, and neither could be established from disk.
+    A critic whose claims cannot be checked is another unverified source, not an audit.
+
+    Deliberately a SUBSET. A full candidate row runs ~230 tokens and 89 of them is ~80KB per tick;
+    these are the fields that have actually turned up inside a stated reason, which is the only part
+    a claim can be checked against. `zone` is a string and kept anyway, because "long_term zone
+    above" was itself one of the quoted claims.
+    """
+    out = []
+    for c in candidates or []:
+        row = {"symbol": str(c.get("symbol", "")).upper(),
+               "source": c.get("source"), "price": c.get("price")}
+        for block, key in _FINGERPRINT_FIELDS:
+            v = (c.get(block) or {}).get(key)
+            if v is not None:
+                row[key] = v
+        out.append(row)
+    return out
+
+
 def target_gaps(
     positions: list[dict], *, equity: float, plan: dict | None,
     group_of: Callable[[str], str], price_of: Callable[[str], float | None],

@@ -2665,6 +2665,11 @@ async def _run_extra_arm(
     sandbox_store.save(new_blob, arm)
     for r in filled + skipped + _review_skips:
         sandbox_store.append_trade(r, arm)
+    if candidates:
+        sandbox_store.append_inputs({
+            "ts": time.time(), "date": sandbox_job.today_et_str(now), "arm": arm,
+            "candidates": sandbox_job.candidate_fingerprint(candidates),
+        }, arm)
     sandbox_store.append_nav(nav, arm)
     return {"arm": arm, "label": label, "engine": engine, "status": "ok", "posture": posture,
             "orders_filled": filled, "orders_skipped": skipped, "nav": nav, "warnings": warnings}
@@ -3021,6 +3026,14 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         # without re-running it. Saved with last_tick_date in the same write, so the two cannot drift.
         new_blob["last_posture"] = posture or ""
         sandbox_store.save(new_blob)
+        # What the model was SHOWN, recorded next to what it decided. Written only when a decision
+        # actually happened -- a weekly-cadence hold or an exit-date flatten consults no candidates,
+        # and a row of zero candidates would read as "it saw nothing" rather than "it was not asked".
+        if candidates:
+            sandbox_store.append_inputs({
+                "ts": time.time(), "date": sandbox_job.today_et_str(now), "arm": "main",
+                "candidates": sandbox_job.candidate_fingerprint(candidates),
+            })
 
         for r in filled + skipped:
             sandbox_store.append_trade(r)
@@ -3443,6 +3456,20 @@ async def sandbox_fill_parked_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dic
         return {"arm": arm, "status": "ok", "filled": filled, "skipped": skipped,
                 "still_parked": len(new_blob.get("parked_orders") or []),
                 "dropped_stale": stale, "positions_value": round(pv, 2)}
+
+
+@app.get("/sandbox/inputs")
+async def sandbox_inputs_endpoint(limit: int = 3, arm: str = sandbox_store.MAIN_ARM) -> dict:
+    """What the model was shown on recent ticks, newest first. Free — NO LLM.
+
+    The companion to /sandbox/trades: that answers what the account did, this answers what it was
+    looking at when it decided. A reason quoting a number can be checked against this; before it
+    existed, such a claim could not be settled against anything on disk.
+
+    Small default limit: each row carries every candidate from one tick.
+    """
+    arm = _arm_or_400(arm)
+    return {"arm": arm, "inputs": sandbox_store.read_inputs(limit=limit, arm=arm)}
 
 
 @app.get("/sandbox/changes")
