@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import chase, congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import dashboard, gaps, gate, market_calendar, market_scan_job, memory, percentiles, rebalance_check, heatmap, sandbox_job, sandbox_store, scan_store, screener, smartmoney, universe, valuetrap
+from . import dashboard, gaps, gate, market_calendar, market_scan_job, memory, percentiles, plan_replay, rebalance_check, heatmap, sandbox_job, sandbox_store, scan_store, screener, smartmoney, universe, valuetrap
 from .analyst import (
     analyze,
     daily_brief,
@@ -4280,3 +4280,124 @@ async def sandbox_reset_endpoint(req: SandboxResetRequest) -> dict:
     async with _sandbox_lock:
         fresh = sandbox_store.reset()
         return {"status": "reset", "cash": fresh["cash"], "funded_total": fresh["funded_total"]}
+
+
+# ======================================================================================
+# SWT-8 — the JOURNAL's mechanical half: what a recorded plan would have done next.
+#
+# memory.py scores the ANALYST (a fixed 20-day forward return, no stop, no target), the sandbox
+# scores the PAPER TRADER in its own ledger, and the options tracker scores real option positions.
+# Nothing scored what the USER did with a verdict on a stock. This route computes the plan-as-written
+# leg of that comparison; app/plan_replay.py holds the logic and every judgement call behind it.
+# ======================================================================================
+
+class PlanReplayRequest(BaseModel):
+    symbol: str
+    date: str                                # the session the plan was RECORDED (YYYYMMDD or ISO)
+    entry_low: float | None = None
+    entry_high: float | None = None
+    stop: float | None = None
+    target: float | None = None
+    horizon_days: int = plan_replay.DEFAULT_HORIZON_DAYS
+    fill_window_days: int = plan_replay.DEFAULT_FILL_WINDOW_DAYS
+
+
+# Yahoo range strings, smallest first — a replay only ever needs history back to the plan date, and
+# asking for "5y" to answer a three-week-old plan costs ~1,250 bars of parsing per call for nothing.
+_REPLAY_RANGES: tuple[tuple[int, str], ...] = ((300, "1y"), (650, "2y"), (1700, "5y"), (3500, "10y"))
+
+
+def _replay_range(plan_date: str, today: str) -> str:
+    """The shortest Yahoo range that certainly reaches back to `plan_date` (both YYYYMMDD).
+
+    The thresholds sit well under each nominal window (300 days for "1y") on purpose: a range that
+    lands one session short of the plan date comes back as an EMPTY bar list, which this route would
+    then report as "nothing has traded since" — a confident, wrong answer where the real fault was
+    not asking for enough history. Erring long costs some parsing; erring short costs the truth.
+    """
+    from datetime import date
+    try:
+        a = date(int(plan_date[:4]), int(plan_date[4:6]), int(plan_date[6:8]))
+        b = date(int(today[:4]), int(today[4:6]), int(today[6:8]))
+        days_back = max(0, (b - a).days)
+    except ValueError:  # a syntactically valid YYYYMMDD that is not a real day (e.g. 20260231)
+        return "max"
+    for limit, rng in _REPLAY_RANGES:
+        if days_back <= limit:
+            return rng
+    return "max"
+
+
+@app.post("/journal/replay")
+async def journal_replay_endpoint(req: PlanReplayRequest) -> dict:
+    """SWT-8 — replay one recorded plan against the daily bars that actually followed it. No LLM.
+
+    Give it the plan as it stood (`entry_low`/`entry_high`, `stop`, `target`) and the date it was
+    recorded, and it walks the sessions AFTER that date to say whether the plan hit its target,
+    stopped out, ran out of clock, never filled, or is still running — with the outcome expressed in
+    R, the units of the risk the plan itself defined.
+
+    THREE THINGS TO READ BEFORE THE NUMBER:
+      * `ambiguous: true` means a single daily bar touched BOTH the stop and the target and the bars
+        cannot say which came first. This replay assumes the STOP — the pessimistic reading — so an
+        ambiguous row is a result that rests on that assumption rather than on the tape.
+      * `r: null` is not 0R. It means the plan named no usable stop (so there is no risk to divide
+        by), or the trade has not exited. 0R would claim the trade made exactly what it risked.
+      * `outcome: "never_filled"` means price never came into the entry zone inside the fill window,
+        or gapped through the stop before the entry could fill. The plan was never tradeable — this
+        is SWT-3's chase warning, seen after the fact, and it is not a losing trade.
+
+    `outcome: null` with `refused: false` means the plan is fine but nothing has traded since the
+    date given — a plan recorded today has no replay yet, which is not an error.
+
+    422 for a plan that cannot be replayed (a date that is not a date, a date in the future, an
+    inverted zone, a stop that is not below the entry, a target that is not above it). 404 when the
+    symbol has no price history at all. 502 when the price fetch fails.
+    """
+    assert _http is not None
+    if not (req.symbol or "").strip():
+        raise HTTPException(status_code=422, detail="a plan needs a symbol")
+    try:
+        d0 = plan_replay.norm_date(req.date)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    today = sandbox_job.today_et_str().replace("-", "")
+    if d0 > today:
+        # A future plan date is not an empty result — every bar "after" it is one that has not
+        # happened. Refusing is the only answer that cannot be mistaken for "the plan did nothing".
+        raise HTTPException(status_code=422, detail=f"plan date {d0} is in the future — nothing to replay")
+
+    try:
+        series = await fetch_series(_http, req.symbol, rng=_replay_range(d0, today))
+    except Exception:  # noqa: BLE001 — the upstream error text carries the Yahoo URL; log it, never ship it
+        _log.warning("journal replay: price fetch failed for %s", req.symbol, exc_info=True)
+        raise HTTPException(status_code=502, detail="price history fetch failed")
+    if not series.closes:
+        raise HTTPException(status_code=404, detail="no price history for this symbol")
+
+    bars = plan_replay.bars_from_series(series, d0)
+    out = plan_replay.replay(
+        bars,
+        entry=(req.entry_low, req.entry_high),
+        stop=req.stop,
+        target=req.target,
+        horizon_days=req.horizon_days,
+        fill_window_days=req.fill_window_days,
+    )
+    if out.get("refused"):
+        raise HTTPException(status_code=422, detail=out.get("reason") or "the plan cannot be replayed")
+    if not bars:
+        # The symbol HAS history — none of it is after the plan date. That is a 200 saying "not
+        # yet", not a 404: we looked, and what we found was that no session has traded since.
+        out = {**out, "reason": f"no session has traded since {d0} — nothing to replay yet"}
+    return {
+        "symbol": series.symbol,
+        "as_of": d0,
+        "source": series.source,
+        # The window actually walked, so a caller can see the replay was fed what it thinks it was.
+        "bars_from": bars[0]["date"] if bars else None,
+        "bars_to": bars[-1]["date"] if bars else None,
+        **out,
+        "note": ("What the plan as written would have done — the MECHANICAL leg. It is not what you "
+                 "did, and an ambiguous bar resolves against the trade."),
+    }
