@@ -1,0 +1,11 @@
+[Unit]
+# Post-wave verification for SWT-1..10. Reads the local API and the job's own summary, appends a
+# report to /var/log/signals-swt.log. Read-only: it never writes to the ledger, the scan store or
+# the settings, so a failure here can only cost a log line.
+Description=StockTracker Signals — SWT wave verification
+After=network-online.target signals.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/signals-swt-check.sh scheduled

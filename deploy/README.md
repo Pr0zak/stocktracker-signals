@@ -31,8 +31,9 @@ ssh "root@$NODE" "pct exec $CT -- systemctl enable --now signals-market-scan.tim
 ssh "root@$NODE" "pct exec $CT -- systemctl list-timers 'signals-*' --no-pager"
 ```
 
-`signals-monday-check.sh` is the one file here that does **not** live in `/etc/systemd/system`; it
-installs to `/usr/local/bin/` and is what `signals-check-open` and `signals-check-tick` invoke.
+Two files here do **not** live in `/etc/systemd/system` — `signals-monday-check.sh` (invoked by
+`signals-check-open` / `signals-check-tick`) and `signals-swt-check.sh` (invoked by
+`signals-swt-check`). Both install to `/usr/local/bin/` and must be copied there separately.
 
 The container runs on `America/Chicago`, so every `OnCalendar` below is Central wall-clock time.
 
@@ -46,6 +47,7 @@ The container runs on `America/Chicago`, so every `OnCalendar` below is Central 
 | 10:00, 14:20 | `signals-macro` | intraday refreshes |
 | 14:35 | `signals-sandbox` | paper-trading tick |
 | 14:40 | `signals-parked` | sweep parked orders |
+| Mon+Tue 06:05 | `signals-swt-check` | post-wave verification → `/var/log/signals-swt.log` |
 
 The ordering is load-bearing at the top. Market breadth is derived from the market scan, so anything
 that reads a regime gate before 05:45 is reading yesterday's market. Macro and the watchlist scan

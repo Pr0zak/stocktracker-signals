@@ -1,0 +1,21 @@
+[Unit]
+Description=Verify the SWT wave on the first trading days after it shipped
+
+[Timer]
+# 06:05 America/Chicago — twenty minutes after signals-market-scan, so the scan has finished (it
+# takes ~48s) and its summary is on disk to be read.
+#
+# MONDAY AND TUESDAY, and the pair is deliberate. The scan measures the most recent session whose
+# bars are FINAL, and 05:45 CT is before the opening bell, so Monday morning resolves to FRIDAY —
+# which Saturday morning already stored — and correctly skips. Tuesday is the first morning that
+# resolves to a session nothing has captured yet. Checking only Monday would find a skip every week
+# and prove nothing about the pipeline; checking only Tuesday would miss the market reopening, which
+# is when the gate re-reads live index prices and the arms tick for the first time in three days.
+OnCalendar=Mon *-*-* 06:05:00
+OnCalendar=Tue *-*-* 06:05:00
+
+# A missed run fires on next boot rather than silently skipping the week this was set up to watch.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
