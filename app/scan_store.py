@@ -45,6 +45,33 @@ runs in the API process — that invariant is gone, and `timeout=5.0` becomes th
 between you and an intermittent "database is locked" in a request handler. Either keep the write in
 the nightly job, or change this docstring and think about it properly first.
 
+THE SECOND WRITER (record_gate) — added deliberately, and here is the reasoning
+------------------------------------------------------------------------------
+`record_gate()` breaks the invariant above: `app/gate.py` evaluates in the API process, off a
+request or a sandbox tick, and files one row per day. So scan.db now has TWO writing processes.
+
+What that actually costs. SQLite locks the FILE, not the table — `gate` and `scan` living in
+separate tables buys exactly nothing here, and anyone reasoning "different tables, no contention"
+is wrong. In WAL mode readers never block, but the two writers serialise on the single write lock,
+and the only thing between them is `timeout=5.0` (SQLite's busy handler, which retries for five
+seconds before raising "database is locked").
+
+Why it is acceptable anyway, in the order the numbers matter:
+  1. The shapes are wildly asymmetric. The gate write is ONE upserted row of ~400 bytes, sub-
+     millisecond. The nightly job's write holds the lock for the ~100ms of a 3,200-row commit. A
+     100ms hold against a 5,000ms budget is a 50x margin, and the gate write is not retried into a
+     queue — it either lands immediately or waits out a commit that is already ending.
+  2. The windows barely overlap. The scan is a systemd oneshot at a fixed nightly hour; the gate is
+     consulted during the session and by the sandbox tick. Collisions are possible, not routine.
+  3. The failure is contained and honest. `record_gate` swallows into a logged False, so a lock
+     timeout costs one row of gate HISTORY — never the evaluation itself, which has already been
+     returned to the caller, and never a scan row, since the nightly writer is the one holding the
+     lock it would be waiting on.
+What is NOT acceptable, and must not be added on the back of this precedent: a bulk write from the
+API process. A percentile pass or a backfill endpoint writing thousands of rows would hold the lock
+for exactly as long as the nightly job does, in the middle of the trading day, and the argument
+above would no longer hold — it rests entirely on this writer being one small row.
+
 Threading model
 ---------------
 Every public function here is SYNCHRONOUS and blocking. Callers in async code wrap them:
@@ -241,6 +268,26 @@ CREATE TABLE IF NOT EXISTS scan (
 -- "how has THIS name's cross-sectional standing moved" — symbol_history()'s only query, and the
 -- one access pattern the (d, symbol) clustering is wrong for.
 CREATE INDEX IF NOT EXISTS ix_scan_symbol ON scan(symbol, d);
+
+-- One row per day: what app/gate.py said about the market that day. It lives HERE, next to the
+-- cross-section, because one of the gate's five legs IS the cross-section (breadth) — a gate row and
+-- the night it was computed against belong to the same retention story and the same file.
+--
+-- `passed` is deliberately NULLABLE and three-valued. NULL is not "unknown row", it is a RECORDED
+-- STATE: the gate ran, and at least one leg could not be measured, so it refused to claim the market
+-- was clear either way. Storing that as 0 would rewrite "we could not tell" into "the market failed
+-- the gate" the moment it hit disk, which is precisely the distinction gate.py exists to preserve.
+CREATE TABLE IF NOT EXISTS gate (
+    d            TEXT NOT NULL,     -- YYYYMMDD the gate describes
+    ts           REAL NOT NULL,     -- epoch seconds of the evaluation
+    passed       INTEGER,           -- 1 / 0 / NULL, where NULL means "not decidable", never False
+    market_score REAL,              -- 0-100, NULL when any leg was unmeasurable
+    failing      TEXT,              -- JSON array of leg names that were explicitly False
+    unmeasured   TEXT,              -- JSON array of leg names whose ok was NULL
+    legs         TEXT,              -- JSON blob of the full five-leg list, as evaluated
+
+    PRIMARY KEY (d)
+) WITHOUT ROWID;
 """
 
 
@@ -301,6 +348,14 @@ def _migrate(db: sqlite3.Connection) -> None:
     for col, decl in ():           # ("new_col", "REAL"), ... — also add it to _SCHEMA above
         if col not in have:
             db.execute(f"ALTER TABLE scan ADD COLUMN {col} {decl}")
+
+    # Same treatment for the gate table, which arrived after scan did: a database created before it
+    # existed gets the table from CREATE TABLE IF NOT EXISTS above, but a COLUMN added to it later
+    # needs its own ALTER here or the two definitions diverge by machine age.
+    have_gate = {r["name"] for r in db.execute("PRAGMA table_info(gate)")}
+    for col, decl in ():           # ("new_col", "REAL"), ... — also add it to _SCHEMA above
+        if col not in have_gate:
+            db.execute(f"ALTER TABLE gate ADD COLUMN {col} {decl}")
 
     ver = int(db.execute("PRAGMA user_version").fetchone()[0] or 0)
     if ver < _USER_VERSION:
@@ -415,6 +470,149 @@ def retire_absent(d: str, symbols: Iterable[str]) -> int:
         # carrying a few stale rows is recoverable, a job that dies before writing its summary is not.
         log.warning("scan_store: retire_absent failed for %s", d, exc_info=True)
         return 0
+
+
+# ---------------------------------------------------------------------------- gate history (rw)
+
+# Kept together rather than split across the writes/reads sections above: all three share the
+# second-writer caveat in the module docstring, and the round-trip of `passed` — 1/0/NULL out and
+# True/False/None back — is only checkable if the two halves sit next to each other.
+
+def record_gate(row: dict, *, d: str) -> bool:
+    """File one day's gate evaluation. Returns whether it landed. Never raises.
+
+    `row` is `gate.evaluate()`'s dict, taken whole, so the recorded row cannot drift from the shape
+    the consumer was handed. `d` comes from the caller for the same reason `insert_night` takes it:
+    the day a reading is filed under is the caller's claim, not something a payload gets to restate.
+
+    `passed` round-trips through THREE states. None is stored as SQL NULL and read back as None, and
+    the coercion below is written out longhand precisely because `int(bool(None))` and
+    `1 if x else 0` both quietly turn "we could not tell" into "the gate failed" — a bearish claim
+    about a day on which the gate specifically declined to make one.
+
+    Upsert, not REPLACE, and last-write-wins within a day: the row is what the gate most recently
+    reported. `evaluate()` refuses to call this when it measured nothing at all, so a transient
+    outage cannot overwrite a real morning reading with five nulls.
+    """
+    try:
+        night = _norm_d(d)
+        passed = row.get("passed")
+        # Explicit three-way. Anything that is not exactly True or False is stored as NULL rather
+        # than coerced — a truthy string or a 1 arriving here is a caller bug, and NULL ("we do not
+        # know") is the only safe way to record a bug in a field that means "is the market clear".
+        stored = 1 if passed is True else (0 if passed is False else None)
+        vals = (
+            night,
+            _num(row.get("evaluated_at")) or time.time(),
+            stored,
+            _num(row.get("market_score")),
+            _dump_names(row.get("failing")),
+            _dump_names(row.get("unmeasured")),
+            json.dumps(row.get("legs") or [], default=str),
+        )
+        with _lock:
+            db = _db()
+            db.execute(
+                "INSERT INTO gate (d, ts, passed, market_score, failing, unmeasured, legs)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(d) DO UPDATE SET ts=excluded.ts, passed=excluded.passed,"
+                "   market_score=excluded.market_score, failing=excluded.failing,"
+                "   unmeasured=excluded.unmeasured, legs=excluded.legs",
+                vals,
+            )
+            db.commit()
+        return True
+    except Exception:  # noqa: BLE001 — history is a record of a decision that has ALREADY been
+        # returned to the caller. A locked database (see the second-writer note in the module
+        # docstring) or an unserialisable leg must cost one history row, never the evaluation.
+        log.warning("scan_store: record_gate failed for %s", d, exc_info=True)
+        return False
+
+
+def gate_history(limit: int = 30) -> list[dict]:
+    """The recent gate rows, NEWEST FIRST. [] on any failure.
+
+    Newest first for the same reason symbol_history() is: `limit` has to mean "the most recent N",
+    and an ascending order would silently hand back the oldest N instead.
+
+    Note these rows are NOT pruned with the cross-section. `prune()` cuts `scan` on a 90-day window
+    because a night is bulk and fully reproducible; a gate row is neither. It is a record of what we
+    decided and why, ~400 bytes a day, and its entire value is being readable long after the night
+    it was computed against is gone — the same argument that keeps verdicts for two years.
+    """
+    try:
+        with _lock:
+            rows = _db().execute(
+                "SELECT * FROM gate ORDER BY d DESC LIMIT ?", (max(1, min(int(limit), 1000)),)
+            ).fetchall()
+        return [_gate_rowdict(r) for r in rows]
+    except Exception:  # noqa: BLE001 — a history panel that cannot load renders as "no history";
+        # raising would take the gate card it sits on down with it.
+        log.warning("scan_store: gate_history failed", exc_info=True)
+        return []
+
+
+def gate_for(d: str) -> dict | None:
+    """One day's gate row, or None if the gate was never recorded for that day.
+
+    None means "no row", which is a different statement from a row whose `passed` is None ("the gate
+    ran and could not decide"). A caller must be able to tell those apart, so this never manufactures
+    an empty row to return.
+    """
+    try:
+        with _lock:
+            row = _db().execute("SELECT * FROM gate WHERE d = ?", (_norm_d(d),)).fetchone()
+        return _gate_rowdict(row) if row is not None else None
+    except Exception:  # noqa: BLE001 — an unreadable row is indistinguishable from an absent one to
+        # every caller of this, and None is what both of them already handle.
+        log.warning("scan_store: gate_for failed for %s", d, exc_info=True)
+        return None
+
+
+def _gate_rowdict(r: sqlite3.Row) -> dict:
+    """A gate row as callers expect it: `passed` back to True/False/None, JSON columns parsed.
+
+    `passed` is the whole reason this is not `_rowdict`: `bool(0)` and `bool(None)` are both False in
+    Python, so restoring this column with the generic helper would collapse the third state on the
+    way OUT after the write took such care to keep it on the way in.
+    """
+    passed = r["passed"]
+    return {
+        "d": r["d"],
+        "ts": r["ts"],
+        "passed": None if passed is None else bool(passed),
+        "market_score": r["market_score"],
+        # [] and None are different here too, exactly as in _load_unmeasured: [] means the gate
+        # checked and nothing was failing, None means no writer ever said.
+        "failing": _load_unmeasured(r["failing"]),
+        "unmeasured": _load_unmeasured(r["unmeasured"]),
+        "legs": _load_legs(r["legs"]),
+    }
+
+
+def _dump_names(v: Any) -> str | None:
+    """A list of leg names as JSON, IN THE ORDER GIVEN. None stays None.
+
+    Deliberately not `_dump_unmeasured`, which sorts: these lists are ordered by the gate's leg
+    order, and a `failing` list that comes back alphabetised no longer matches the leg list stored
+    beside it in the same row.
+    """
+    if v is None:
+        return None
+    if not isinstance(v, (list, tuple)):
+        return None
+    return json.dumps([str(x) for x in v])
+
+
+def _load_legs(v: Any) -> list[dict] | None:
+    """The stored leg blob back as a list of dicts, or None if it is missing or unparseable."""
+    if v is None:
+        return None
+    try:
+        out = json.loads(v)
+    except (TypeError, ValueError):
+        return None
+    return [x for x in out if isinstance(x, dict)] if isinstance(out, list) else None
 
 
 # ----------------------------------------------------------------------------------------- reads

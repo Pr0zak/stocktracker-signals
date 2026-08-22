@@ -134,6 +134,21 @@ DEFAULT_SETTINGS = {
     "review_enabled": False,
     # For an engine="rejects" arm: whose rejected orders to take. Ignored by every other engine.
     "rejects_from": "",
+    # Regime gate: when the market's own trend/breadth check does not pass, open no NEW risk this
+    # tick (buys blocked, sells always allowed — see sandbox_job.gate_block_reason).
+    #
+    # OFF EVERYWHERE, deliberately, because the gate is an UNPROVEN HYPOTHESIS. The published
+    # numbers it comes from do not establish it: Swing Terminal's breakout plan backtests at 50.0%
+    # win / 1.53 profit factor over 514 trades but shows 73.9% / 5.17 over just 23 closed forward
+    # trades -- and their own methodology page says samples under 20-30 are noise. A 23-trade
+    # forward record diverging that far from a 514-trade backtest is the shape of noise, not of an
+    # edge, so shipping the gate ON would bet five live ledgers on it.
+    #
+    # Switchable per arm instead, which is exactly what the arms are for: one arm turns it on, every
+    # other arm runs the identical tick without it, and the difference between the curves is the
+    # gate rather than the weather. Until an arm has measured it, nothing here changes how any
+    # existing arm trades.
+    "gate_enabled": False,
     # Honour the analyst's per-buy entry zone: skip (and retry a later day) when the market is above
     # the zone's top, instead of chasing an extended price. Sells always execute at the market.
     "respect_entry_zones": True,

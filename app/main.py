@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import dashboard, gaps, market_calendar, market_scan_job, memory, rebalance_check, heatmap, sandbox_job, sandbox_store, scan_store, screener, smartmoney, universe, valuetrap
+from . import dashboard, gaps, gate, market_calendar, market_scan_job, memory, rebalance_check, heatmap, sandbox_job, sandbox_store, scan_store, screener, smartmoney, universe, valuetrap
 from .analyst import (
     analyze,
     daily_brief,
@@ -2278,13 +2278,19 @@ def _market_scan_filters(request: Request) -> dict:
 
 
 def _invalidate_market_scan_cache() -> None:
-    """Drop every cached market-scan slice and breadth reading.
+    """Drop every cached market-scan slice and breadth reading — and the gate, which reads breadth.
 
     The cache keys on the scan's DATE, which is the right key for a job that runs once a night — but
     `force=true` re-measures the SAME night, so the date alone would keep serving the pre-run answer
     for up to 15 minutes with `cached: true` stamped on it.
+
+    The gate is included because its breadth leg comes out of these same rows: a forced re-measure of
+    tonight changes the gate's answer without changing its cache key either. Its TTL is only 60s, so
+    this buys a minute — but a re-run exists precisely because someone did not trust the stored
+    numbers, and serving them back for another minute is the wrong answer to that.
     """
-    for k in [k for k in _cache if isinstance(k, tuple) and k and str(k[0]).startswith("market_scan")]:
+    for k in [k for k in _cache
+              if isinstance(k, tuple) and k and str(k[0]).startswith(("market_scan", "gate"))]:
         _cache.pop(k, None)
 
 
@@ -2437,6 +2443,131 @@ async def market_scan_run_endpoint(force: bool = False, limit: int | None = None
     _invalidate_market_scan_cache()
     return out
 
+
+
+# ======================================================================================
+# SWT-2 — the market GATE: the checkable half of the market read. Five mechanical legs (SPY and QQQ
+# over their 50-day EMAs, breadth over 55%, VIX under 20, SPY's 20-day return positive) evaluated
+# together, so a buy-side consumer can stand aside for a reason it can NAME and a reader can check
+# the claim against any chart package.
+#
+# GET /regime stays, and is the other half. It is an analyst narrative: what kind of market this is,
+# in sentences, for a human. This is arithmetic: whether five stated conditions hold right now, with
+# every number and threshold published beside the verdict. Neither replaces the other, and when they
+# disagree that disagreement is information — a bullish narrative over a closed gate is exactly the
+# moment to look at which leg failed.
+#
+# THE INVARIANT THESE ROUTES CARRY (see app/gate.py): a leg that could not be measured is NEVER a
+# silent pass and NEVER a silent fail. Its `ok` is null and its name is in `unmeasured`; `passed` is
+# true only when all five are explicitly true, and null — not false — when a leg is unknown and none
+# of the measurable ones failed. These routes must not flatten that on the way out: `passed: false`
+# manufactured out of a missing nightly scan is indistinguishable from a bearish market, and every
+# consumer that sees it once learns to ignore a real closure.
+# ======================================================================================
+
+_GATE_TTL = 60          # The price legs come off the live tape and the app refreshes its own quotes
+                        # every 60s; a gate lagging the prices printed next to it on screen would
+                        # contradict them. This only coalesces a burst of taps, it is not a stale
+                        # window anyone should be reading through.
+_GATE_FAIL_TTL = 10     # An evaluation that measured NOTHING is cached far more briefly than a real
+                        # one: it is a statement about our upstreams, not about the market, and
+                        # freezing it for a full minute turns a three-second blip into a minute of
+                        # "unknown". Long enough to absorb a retry storm, short enough that a
+                        # recovered feed shows up on the very next poll.
+_GATE_HISTORY_MAX = 365  # ~a year of rows at ~400 bytes each. Gate rows are deliberately not pruned
+                         # with the cross-section, so without a cap this grows into a bulk export.
+
+
+@app.get("/gate")
+async def gate_endpoint(refresh: bool = False) -> dict:
+    """SWT-2 — the five-leg market gate, evaluated now. FREE: no LLM, no analyst, no tokens.
+
+    Cost is three quote fetches (SPY, QQQ, ^VIX) plus one local SQLite read for breadth. This is a
+    MECHANICAL, CHECKABLE gate — every leg publishes its `value`, its `threshold` and a sentence, so
+    "breadth 54.1%, gate closed" can be verified against any chart package. It is deliberately
+    distinct from GET /regime, which pays an analyst to narrate the structural backdrop in prose;
+    that route answers "what kind of market is this", this one answers "do five stated conditions
+    hold right now".
+
+    READ `available` FIRST, THEN `passed`, WHICH IS THREE-VALUED.
+      * `available: false` — nothing could be measured. There is no verdict here; render "unknown".
+      * `passed: true`  — all five legs explicitly passed.
+      * `passed: false` — at least one leg explicitly failed; `failing` names them.
+      * `passed: null`  — a leg could not be measured (`unmeasured` names it) and nothing failed.
+
+    Null is not false. A gate that could not read last night's scan has not observed a bearish
+    market, and this route never fabricates one: it returns `available: false` with all five legs
+    null rather than 503ing or inventing a verdict, because a consumer standing aside needs a
+    decodable envelope more than it needs an error code. `market_score` (0-100) is a plotting aid
+    over the same legs and is null whenever any leg is — it is NOT a probability, a forecast, or a
+    position size.
+
+    Cached ~60s (~10s when unavailable); `refresh=true` forces a re-evaluation. The cache key carries
+    the nightly scan's date, so a scan landing between two calls re-evaluates instead of serving a
+    gate that was computed without it.
+    """
+    assert _http is not None
+    # The scan's date is the one input to the gate that changes discretely — the price legs change
+    # continuously and are covered by the 60s TTL instead. Keying on it means the first request after
+    # a scan lands re-evaluates rather than serving an evaluation whose breadth leg was null.
+    night = await asyncio.to_thread(scan_store.latest_date)
+    key = ("gate", night)
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and not refresh:
+        # An unavailable evaluation gets its own, much shorter window — see _GATE_FAIL_TTL. The TTL
+        # is read off the CACHED payload, not the live one, because it is that payload's honesty
+        # about itself that decides how long it may be served.
+        ttl = _GATE_TTL if hit[1].get("available") else _GATE_FAIL_TTL
+        if now - hit[0] < ttl:
+            return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
+
+    # gate.evaluate() never raises and never fabricates: a dead upstream nulls the leg it feeds and
+    # nothing else, and a totally failed evaluation comes back as the unavailable shape with all five
+    # legs present and null. So there is no try/except here to write — adding one would only be able
+    # to turn a precise "we could not measure X" into a vaguer 502.
+    #
+    # `d` is deliberately not passed and not exposed as a query param: the price legs are always
+    # live, so a historical `d` would file today's tape under a past date. Backfilling real gate
+    # history needs stored index bars, which this service does not keep.
+    out = await gate.evaluate(_http)
+    payload = {**out, "cached": False, "cached_age_seconds": 0}
+    _cache[key] = (now, payload)
+    return payload
+
+
+@app.get("/gate/history")
+async def gate_history_endpoint(limit: int = 30) -> dict:
+    """SWT-2 — what the gate reported, day by day. FREE: no LLM, no fetches, one SQLite read.
+
+    One row per day, NEWEST FIRST, as filed by GET /gate (`evaluate()` records every evaluation that
+    measured at least one leg; one that measured nothing is never filed, so an outage cannot
+    overwrite a real morning reading with five nulls). Within a day the row is last-write-wins — it
+    is what the gate most recently reported, not what it first reported.
+
+    `passed` STAYS THREE-VALUED THROUGH THE DATABASE. SQLite has no boolean and `bool(0)` and
+    `bool(None)` are both False in Python, so a generic restore would collapse "the gate declined to
+    decide" into "the gate failed" — a bearish claim about a day on which no such claim was made.
+    A null here means the gate ran and could not decide; a day that is simply MISSING from this list
+    means no evaluation was ever filed for it. Those are different facts and neither is a false.
+
+    An empty list means no gate evaluation has ever been recorded — call GET /gate to file one. It is
+    not a run of failing days.
+    """
+    if limit < 1:
+        raise HTTPException(status_code=422, detail="limit must be >= 1 — it is a row count")
+    limit = min(_GATE_HISTORY_MAX, limit)
+    rows = await asyncio.to_thread(scan_store.gate_history, limit)
+    return {
+        "limit": limit,
+        # Rows RETURNED, which is bounded by `limit` and is not a count of days on record. There is
+        # no cheap total to report here and inventing one out of len(rows) would be that same
+        # len()-as-a-total mistake /market_scan's `total_matching` exists to avoid.
+        "count": len(rows),
+        "history": rows,
+        "note": ("One row per day, newest first. `passed` is three-valued: true, false, or null — "
+                 "null means the gate ran and could not measure every leg, never that it failed."),
+    }
 
 
 # ======================================================================================
@@ -2798,6 +2929,7 @@ async def _run_extra_arm(
     arm: str, *, now, price_of, spy_price: float | None, shared_plan: dict | None,
     candidates: list[dict], macro_block, force: bool,
     rejected: dict[str, list[dict]] | None = None,
+    gate: dict | None = None,
 ) -> dict:
     """One decision cycle for a NON-main arm, against the market snapshot main already fetched.
 
@@ -2939,6 +3071,10 @@ async def _run_extra_arm(
         new_blob, filled, skipped = sandbox_job.validate_and_fill(
             blob, orders, price_of, group_of=_exposure_group, source=source, exclude=exclude,
             liquidation=(source == "exit_date"),
+            # Every arm on the tick sees the SAME verdict, for the same reason they all see the same
+            # quotes: an arm that gated on its own evaluation seconds later would differ from its
+            # control by the feed as well as by the setting.
+            gate=gate,
             extension_of=_extension_lookup(locals().get("book")))
     except AssertionError as e:
         # Main is mid-tick and already persisted. Aborting the whole request over a side arm would
@@ -2990,6 +3126,31 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         proceed, status = sandbox_job.tick_gate(blob, now=now, force=force)
         if not proceed:
             return {"status": status, "date": sandbox_job.today_et_str(now)}
+
+        # SWT-2's market regime gate, evaluated ONCE for the whole tick and handed to every arm.
+        #
+        # Evaluated only when some arm actually wants it. `gate_block_reason` returns None the moment
+        # it sees `gate_enabled` falsy, so with the setting off everywhere — which is the shipped
+        # default on all five live arms — this verdict would be read by nobody, and three HTTP
+        # fetches a tick to compute an answer no arm consults is a cost with no reader.
+        #
+        # It is evaluated ONCE rather than per arm for the same reason `price_of` is fetched once:
+        # arms are only comparable if the tick is identical across them. An arm that ran its own
+        # evaluation a few seconds later could stand aside while its control bought, and the
+        # difference between their curves would be the feed rather than the setting under test.
+        #
+        # A failure here leaves the verdict None, which a gated arm reads as "could not be measured"
+        # and blocks on — deliberately, and distinguishably from "the market failed". It must never
+        # raise: the gate is off everywhere by default, and an unproven experiment has no business
+        # being able to take down the real account's tick.
+        gate_verdict: dict | None = None
+        if sandbox_job.any_arm_wants_gate(
+                sandbox_store.get(a).get("settings", {}) for a in sandbox_store.list_arms()):
+            try:
+                gate_verdict = await gate.evaluate(_http)
+            except Exception:  # noqa: BLE001 — a gated arm blocks on the resulting None and says
+                # "could not be measured", which is the honest reading of a failed evaluation.
+                _log.warning("sandbox tick: regime gate evaluation failed", exc_info=True)
 
         settings = blob["settings"]
         cfg = settings_store.get()
@@ -3282,6 +3443,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         try:
             new_blob, filled, skipped = sandbox_job.validate_and_fill(
                 blob, orders, price_of, group_of=_exposure_group, source=source, exclude=exclude,
+                gate=gate_verdict,
                 extension_of=_extension_lookup(locals().get("book")),
                 # An exit-date flatten is the user's scheduled instruction, not churn, so the
                 # anti-churn caps must not silently leave the account still invested on that date.
@@ -3386,7 +3548,8 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 arms.append(await _run_extra_arm(
                     _arm, now=now, price_of=price_of, spy_price=spy_price,
                     shared_plan=new_blob.get("last_strategy_note"), candidates=candidates,
-                    macro_block=macro_block, force=force, rejected=rejected_by_arm))
+                    macro_block=macro_block, force=force, rejected=rejected_by_arm,
+                    gate=gate_verdict))
             except Exception as e:  # noqa: BLE001 — a side arm must never break the real account
                 _log.exception("sandbox arm %s failed", _arm)
                 arms.append({"arm": _arm, "status": "error", "warnings": [str(e)]})
@@ -3441,6 +3604,12 @@ class SandboxSettingsPatch(BaseModel):
     max_new_positions_per_tick: int | None = None
     min_conviction_to_trade: int | None = None
     review_enabled: bool | None = None
+    # Per-arm regime gate. Off everywhere by default and settable only per arm, because the gate is
+    # an unproven hypothesis (see sandbox_store.DEFAULT_SETTINGS) — it is here so ONE arm can turn
+    # it on and be compared against the arms that did not. While no verdict is supplied to
+    # validate_and_fill, a gated arm blocks buys as "could not be measured", which is the intended
+    # reading: the gate is on and nothing has measured the regime.
+    gate_enabled: bool | None = None
     rejects_from: str | None = None
     respect_entry_zones: bool | None = None
     slippage_bps: int | None = None
@@ -3796,7 +3965,7 @@ async def sandbox_set_settings_endpoint(
         if d.get("risk_tolerance") in ("conservative", "balanced", "aggressive"):
             s["risk_tolerance"] = d["risk_tolerance"]
         for k in ("master_enabled", "allow_crypto", "allow_crypto_etf", "allow_etf", "allow_after_hours",
-                  "respect_entry_zones", "avoid_wash_sales", "review_enabled"):
+                  "respect_entry_zones", "avoid_wash_sales", "review_enabled", "gate_enabled"):
             if k in d:
                 s[k] = bool(d[k])
         for k in ("retirement_date", "exit_date", "goal_date"):

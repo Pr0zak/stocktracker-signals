@@ -878,6 +878,92 @@ def rules_decision(
             "orders": orders}
 
 
+# ------------------------------------------------------------- regime gate (opt-in, per arm)
+#
+# The two ways a gated arm refuses a buy, as they appear in the trade log and in
+# memory.blocked_summary(). Fixed strings carrying no per-event numbers, for the same reason the
+# cash-floor and turnover reasons carry none: blocked_summary GROUPs BY skip_reason, so an
+# interpolated figure splits one recurring cause into a column of counts of 1.
+#
+# Two strings rather than one because "the regime failed" and "the regime could not be measured"
+# are different facts about the world. Logged identically, the gate's own failure rate becomes
+# unmeasurable — a month of broken feeds would read back as a month of bad tape, and the experiment
+# this setting exists to run would be scored against the wrong cause.
+GATE_SKIP_FAILED = "regime gate did not pass — standing aside from new risk (sells unaffected)"
+GATE_SKIP_UNKNOWN = ("regime gate could not be measured — standing aside from new risk "
+                     "(sells unaffected)")
+
+
+def any_arm_wants_gate(settings_by_arm: Iterable[dict]) -> bool:
+    """Whether ANY arm has the regime gate switched on, and therefore whether a tick should pay to
+    evaluate one.
+
+    Extracted from the tick rather than inlined there because its failure mode is silent and
+    expensive. `gate_block_reason` blocks on a None verdict by design, so if this answered False
+    while an arm actually had `gate_enabled` on, that arm would never receive a verdict, would block
+    every buy it ever proposed as "could not be measured", and would look from its equity curve like
+    a strategy that simply stopped trading. Nothing would raise, and the blocked log would give the
+    same reason a genuine feed outage does.
+
+    Takes the settings dicts rather than arm ids so it stays pure and testable offline, in keeping
+    with the rest of this module.
+    """
+    return any(bool((s or {}).get("gate_enabled")) for s in settings_by_arm)
+
+
+def gate_block_reason(settings: dict, gate: dict | None) -> str | None:
+    """Whether the regime gate refuses this tick's BUYS. Returns the skip reason, or None to proceed.
+
+    BUYS ONLY. A failing gate never blocks a sell: you can always exit, and standing aside is about
+    not opening new risk rather than about being trapped in what is already open. A gate that could
+    stop an exit would be a risk control that manufactures risk.
+
+    THE VERDICT IS AN INPUT, not something computed here. Whatever measures the regime reads the
+    tape over the network, and this module is deliberately pure — every function in it takes
+    already-fetched data so the whole trade path stays unit-testable offline. Wiring a fetch in here
+    would put a network call on the tick path for the five arms that have the gate switched OFF and
+    do not want it evaluated at all.
+
+    `gate` is the verdict dict as `app.gate.evaluate()` returns it (`{"passed": True|False|None,
+    "failing": [...], "unmeasured": [...], ...}`), or None when nothing evaluated one. `passed` is
+    THREE-VALUED and the third value is the interesting one: None means a leg could not be measured,
+    which is not the same claim as "the regime is bad".
+
+    ON None WE BLOCK — "stand aside when we cannot confirm" — and say so with a different reason
+    than a hard failure. Two arguments decide it against the "innocent until proven guilty" reading:
+
+      • An arm that quietly buys through an unmeasurable gate is not running the experiment it was
+        switched on to run. It is running a blend of gate-on and gate-off ticks, weighted by feed
+        reliability, and the resulting curve cannot be attributed to the gate at all. The point of
+        the setting is a clean comparison against arms that have it off; falling through on missing
+        data silently turns the gate off some of the time and never says which times.
+      • Blocking makes the unmeasurable case COUNTABLE. It lands in the blocked log under its own
+        reason, so "the gate could not be measured on 40% of ticks" is a query. Allowing on None
+        leaves no trace whatsoever, and an experiment degrading invisibly is the failure mode this
+        codebase keeps re-learning (absent is never zero).
+
+    This deliberately differs from the take-profit/extension guard above, which falls THROUGH on an
+    unmeasured mayer multiple. That guard is on for everyone and was never asked for, so falling
+    through preserves the behaviour the account already had. The gate is opt-in and its entire
+    purpose is to stand aside, so falling through would be the surprising direction — it would
+    disable, on exactly the days data is broken, the thing an arm explicitly turned on.
+
+    An ABSENT verdict is treated as an unmeasured one, not as a pass. A gated arm whose caller never
+    supplied a verdict knows nothing about the regime, which is the same state of knowledge as a
+    verdict whose legs failed to compute, and it should read as such in the log rather than trading
+    as though the gate had approved.
+    """
+    if not settings.get("gate_enabled"):
+        # The switch is off, which is the default everywhere. Nothing below this line can run, so a
+        # non-gated arm's behaviour is bit-for-bit what it was before the gate existed.
+        return None
+    passed = gate.get("passed") if isinstance(gate, dict) else None
+    if passed is True:
+        return None
+    # Explicit `is False`, never falsiness: 0, "" or None must not be able to impersonate a verdict.
+    return GATE_SKIP_FAILED if passed is False else GATE_SKIP_UNKNOWN
+
+
 def validate_and_fill(
     blob: dict,
     orders: list[dict],
@@ -889,6 +975,7 @@ def validate_and_fill(
     exclude: set[str] | None = None,
     liquidation: bool = False,
     extension_of: Callable[[str], float | None] | None = None,
+    gate: dict | None = None,
 ) -> tuple[dict, list[dict], list[dict]]:
     """Apply an analyst order list to the ledger under hard risk limits. Returns (new_blob, filled_rows,
     skipped_rows). Sells run before buys (free cash / cut exposure first). The blob is copied, not mutated
@@ -898,7 +985,11 @@ def validate_and_fill(
     exit-date flatten. Those caps exist to stop the strategy trading itself into the ground; a
     liquidation the user scheduled is not churn, and throttling it left the account still holding most
     of the book on the very date they asked to be out — while the response said "flattening to cash".
-    Every risk limit that protects the ACCOUNT (cash conservation, shares actually held) still applies."""
+    Every risk limit that protects the ACCOUNT (cash conservation, shares actually held) still applies.
+
+    `gate` is this tick's regime verdict, supplied by the caller (see gate_block_reason). It is
+    consulted ONLY when this arm's settings have `gate_enabled` on, which no arm does by default —
+    handing a verdict to an ungated arm changes nothing about what it trades."""
     now_ts = now_ts or time.time()
     b = {**blob, "positions": [dict(p) for p in blob.get("positions", [])]}
     s = {**b.get("settings", {})}
@@ -926,6 +1017,9 @@ def validate_and_fill(
     # sees a ticker string and has no way to tell an ETF from a stock, so the check it used to hold
     # was a local variable that nothing read: the setting looked enforced and was not.
     respect_zones = bool(s.get("respect_entry_zones", True))
+    # None unless this arm opted into the regime gate AND the gate did not pass. Resolved once, up
+    # here, so the buy loop cannot ask the question differently on different orders.
+    gate_reason = gate_block_reason(s, gate)
     # Brokerage realism. CASH accounts settle T+1 (US moved from T+2 on 2024-05-28), so proceeds from
     # today's sales cannot fund today's buys — reusing them is a good-faith violation that a real broker
     # would block. MARGIN accounts may reuse proceeds immediately but are subject to FINRA's pattern-day
@@ -1116,6 +1210,13 @@ def validate_and_fill(
             group_value[g] = group_value.get(g, 0.0) + p["shares"] * px
 
     for o in sorted(buys, key=lambda x: -int(x.get("conviction") or 0)):
+        # The regime gate goes FIRST, ahead of every per-order limit. It is not a limit on this
+        # order's size or price — it is a decision not to open new risk at all this tick — so it is
+        # the honest headline reason even where a cap would also have bound, and naming it first
+        # keeps every gated refusal under one countable string instead of scattering them across
+        # whichever cap happened to be tested next. Sells have already run above, untouched.
+        if gate_reason:
+            _skip(o, gate_reason); continue
         if len(filled) >= max_trades:
             _skip(o, "max_trades_per_tick reached"); continue
         sym = o["symbol"].upper()
