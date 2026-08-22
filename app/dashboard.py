@@ -151,6 +151,22 @@ PAGE = """<!doctype html>
   .logrow .st { width: 2.4rem; text-align: right; }
   .logrow .ms { width: 4rem; text-align: right; color: var(--muted); }
 
+  /* A run/verdict banner. Loud on purpose: the whole point of the market-scan and gate cards is
+     that a job which stopped running, or a gate that could not decide, must be visible at a glance
+     rather than inferred from a grid of dashes. `.unknown` is its own colour precisely because
+     "we could not measure" must not look like "closed". */
+  .banner { font-size: .85rem; font-weight: 600; border-radius: .5rem; padding: .45rem .7rem;
+            margin: .1rem 0 .8rem; }
+  .banner .sub2 { display: block; font-weight: 400; font-size: .78rem; opacity: .85; margin-top: .1rem; }
+  .banner.ok { background: rgba(22,163,74,.14); color: var(--ok); }
+  .banner.warn { background: rgba(217,119,6,.16); color: var(--warn); }
+  .banner.err { background: rgba(220,38,38,.16); color: var(--err); }
+  .banner.unknown { background: #8883; color: var(--muted); }
+  .stat.absent .v { color: var(--muted); font-weight: 500; }
+  .leg-ok { color: var(--ok); font-weight: 600; }
+  .leg-fail { color: var(--err); font-weight: 600; }
+  .leg-unk { color: var(--muted); font-weight: 600; }
+
   /* arms */
   .arm-edit { border-top: 1px solid var(--line); margin-top: .8rem; padding-top: .8rem; }
   .arm-edit[hidden] { display: none; }
@@ -183,6 +199,12 @@ PAGE = """<!doctype html>
           <div class="d" id="scan-detail"></div></div>
         <div class="stat"><div class="k">Next scan</div><div class="v countdown" id="next-scan">…</div>
           <div class="d">06:30 America/Chicago</div></div>
+        <!-- The nightly MARKET scan (the whole-universe cross-section), not the watchlist scan on
+             the left. It is here on Overview only as a freshness headline — a job that stopped
+             running has to be wrong on the first screen, not three tabs away. The counters live on
+             the Scan tab. -->
+        <div class="stat"><div class="k">Market scan</div><div class="v" id="mscan-when">…</div>
+          <div class="d" id="mscan-when-detail"></div></div>
         <div class="stat"><div class="k">Disk</div><div class="v" id="disk-v">…</div>
           <div class="meter" id="disk-meter"><span></span></div></div>
       </div>
@@ -341,6 +363,33 @@ PAGE = """<!doctype html>
 <!-- =============================== SCAN ================================= -->
 <section class="panel" id="p-scan" hidden>
   <div class="grid">
+    <div class="card">
+      <h2>Market scan <span class="hint" id="mscan-age"></span></h2>
+      <p class="hint" style="margin:.1rem 0 .7rem">The nightly, LLM-free cross-section of the whole
+      liquid universe — a different job and a different artifact from the watchlist scan below.
+      Every counter is reported separately: a symbol that never answered and one with too little
+      history are different facts about the market, and a blank is "not measured", never zero.</p>
+      <div class="banner unknown" id="mscan-state">loading…</div>
+      <div class="stat-grid" id="mscan-counters"></div>
+      <div class="hint" id="mscan-reason" style="margin-top:.7rem"></div>
+      <div class="hint" id="mscan-extra" style="margin-top:.35rem"></div>
+    </div>
+
+    <div class="card">
+      <h2>Market gate <span class="hint" id="gate-age"></span></h2>
+      <p class="hint" style="margin:.1rem 0 .7rem">Five mechanical legs, no model. Read the banner
+      before the legs: <b>undecided</b> is not <b>closed</b> — a leg nobody could measure is not a
+      bearish market, and the two are listed separately below for that reason.</p>
+      <div class="banner unknown" id="gate-state">loading…</div>
+      <div class="scroll"><table class="tbl" id="gate-tbl">
+        <thead><tr><th>Leg</th><th></th><th class="num">Value</th><th class="num">Threshold</th></tr></thead>
+        <tbody id="gate-body"><tr><td colspan="4" class="loading">loading…</td></tr></tbody>
+      </table></div>
+      <div class="hint" id="gate-failing" style="margin-top:.6rem"></div>
+      <div class="hint" id="gate-unmeasured" style="margin-top:.25rem"></div>
+      <div class="hint" id="gate-note" style="margin-top:.5rem"></div>
+    </div>
+
     <div class="card span2">
       <h2>Latest scan <span class="hint" id="scan-count"></span></h2>
       <div class="scroll"><table class="tbl" id="scan-tbl">
@@ -609,8 +658,76 @@ PAGE = """<!doctype html>
       " shorts files · " + (ca.iv_history_days_total || 0) + " IV-history rows";
     renderIvProgress(s.iv_progress || {});
   }
+
+  // The market scan's own run summary.
+  //
+  // `present:false` and a status of "skipped" are DIFFERENT facts and must not render alike: the
+  // first is a job that has never completed, the second is a job that ran and correctly declined
+  // (Monday resolves to Friday's already-stored session, so it skips by design). A dashboard that
+  // showed both as blank is exactly what let this job fail invisibly before the card existed.
+  function renderMarketScan(m) {
+    m = m || {};
+    const banner = $("mscan-state"), age = $("mscan-age");
+    const when = $("mscan-when"), whenD = $("mscan-when-detail");
+    // null is UNKNOWN and renders as a dash. Coercing to 0 would turn "we did not measure" into
+    // "we measured nothing", which is a claim about the market.
+    const n = (v) => (v == null ? "&mdash;" : esc(v));
+
+    if (!m.present) {
+      banner.className = "banner err";
+      banner.textContent = "No run recorded — the job has never written a summary";
+      $("mscan-counters").innerHTML = "";
+      $("mscan-reason").textContent = "";
+      $("mscan-extra").textContent = "Runs nightly at 05:45 America/Chicago.";
+      age.textContent = "";
+      if (when) { when.textContent = "never"; when.className = "v err"; }
+      if (whenD) whenD.textContent = "no summary on disk";
+      return;
+    }
+
+    const st = (m.status || "unknown").toLowerCase();
+    // `stale` is three-valued upstream: null means we could not tell how old the run is, which is
+    // not the same claim as fresh, so it gets its own wording instead of folding into either.
+    const staleTxt = m.stale === true ? " · STALE" : m.stale == null ? " · age unknown" : "";
+    banner.className = "banner " + (st === "ok" ? "ok" : st === "skipped" ? "unknown" : "err");
+    banner.textContent =
+      (st === "ok" ? "Scan advanced" : st === "skipped" ? "Skipped — that session was already stored"
+                                                        : "Run " + st)
+      + " · session " + (m.session || "—") + staleTxt;
+
+    const ageTxt = m.age_hours != null ? m.age_hours.toFixed(1) + "h ago" : "age unknown";
+    age.textContent = "· " + ageTxt;
+    if (when) {
+      when.textContent = ageTxt;
+      when.className = "v" + (m.stale === true ? " err" : "");
+    }
+    if (whenD) whenD.textContent = (m.session ? "session " + m.session : "") + (st ? " · " + st : "");
+
+    const tile = (k, v, d) =>
+      '<div class="stat"><div class="k">' + k + '</div><div class="v">' + v + "</div>" +
+      (d ? '<div class="d">' + d + "</div>" : "") + "</div>";
+    $("mscan-counters").innerHTML =
+      tile("Scanned", n(m.scanned), m.universe_symbols != null ? "of " + esc(m.universe_symbols) : "") +
+      tile("Fetch failed", n(m.fetch_failed), "never answered") +
+      tile("Too short", n(m.too_short), "not enough history") +
+      tile("Suspect", n(m.suspect_series), "mixed split basis") +
+      tile("Stored", n(m.rows_written), m.retired != null ? esc(m.retired) + " retired" : "") +
+      tile("Duration", m.duration_s != null ? esc(m.duration_s) + "s" : "&mdash;",
+           m.pruned != null ? esc(m.pruned) + " pruned" : "");
+
+    $("mscan-reason").textContent = m.reason ? "Reason: " + m.reason : "";
+    const ranked = (m.percentiles && m.percentiles.ranked) ? m.percentiles.ranked.length : null;
+    $("mscan-extra").textContent = ranked != null
+      ? ranked + " metric(s) ranked across the night's cross-section."
+      : "Percentile pass has not reported for this run.";
+  }
+
   async function loadStatus() {
-    try { renderStatus(await (await fetch("/api/status")).json()); }
+    try {
+      const s = await (await fetch("/api/status")).json();
+      renderStatus(s);
+      renderMarketScan(s.market_scan);
+    }
     catch (e) { $("uptime").textContent = "· status unavailable"; }
   }
 

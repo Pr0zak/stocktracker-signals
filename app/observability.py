@@ -14,6 +14,7 @@ from __future__ import annotations
 import collections
 import datetime as dt
 import json
+import math
 import re
 import os
 import time
@@ -31,10 +32,21 @@ USAGE_FILE = _DATA_DIR / "usage.jsonl"
 IV_HISTORY = _DATA_DIR / "iv_history.jsonl"
 SHORTS_DIR = _DATA_DIR / "shorts"
 SCAN_LATEST = Path(__file__).resolve().parent.parent / "data" / "scan_latest.json"
+# The NIGHTLY MARKET SCAN's run summary — a different job over a different artifact than
+# scan_latest.json above. Mirrors market_scan_job.LATEST rather than importing it: that module pulls
+# in universe/scan_store/percentiles/swing and an httpx client, which is a lot of import weight for
+# one Path. test_observability pins the two constants together so the mirror cannot drift.
+MARKET_SCAN_LATEST = _DATA_DIR / "market_scan_latest.json"
 
 # Nightly scan fires at this local time in this zone (see the systemd timer / scan_job).
 SCAN_HOUR, SCAN_MINUTE = 6, 30
 SCAN_TZ_NAME = "America/Chicago"
+
+# A market-scan run older than this has MISSED A NIGHT. The job fires every morning at 06:30 CT and
+# rewrites its summary on every exit path — including the "already scanned tonight" skip and every
+# refusal — so a stamp this old means the job did not run at all, not that the market was shut. 26h
+# rather than 24h so a timer drifting an hour is not reported as a failure.
+MARKET_SCAN_STALE_HOURS = 26.0
 
 # Files under data/shorts/ that the prune button may delete (whole-market day/period caches).
 # NEVER settings.json / scan_latest.json / usage.jsonl / iv_history.jsonl — none live here anyway.
@@ -220,6 +232,90 @@ def _scan_summary() -> dict:
     }
 
 
+# The market-scan summary fields the ops page reads, in the order the card lays them out. Each is
+# passed through verbatim except for the numeric coercions below — this reader reports what the job
+# published, it does not recompute it.
+_MARKET_SCAN_COUNTERS = ("attempted", "scanned", "fetch_failed", "too_short", "suspect_series",
+                         "rows_written", "retired", "pruned", "errors_total", "universe_symbols")
+
+
+def _int_or_none(v) -> int | None:
+    """An int, or None. A counter that is absent, null, or type-malformed stays UNKNOWN — coercing
+    it to 0 would turn 'we did not measure' into 'we measured nothing', which is a claim."""
+    if isinstance(v, bool):     # a JSON true would otherwise become 1 and read as a count
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(v) -> float | None:
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _blank_market_scan() -> dict:
+    """The neutral shape: nothing measured, nothing claimed. `present: False` is the load-bearing
+    field — every counter is None, never 0."""
+    out = {"present": False, "path": str(MARKET_SCAN_LATEST), "status": None, "reason": None,
+           "generated_at": None, "as_of": None, "session": None, "session_is_holiday": None,
+           "duration_s": None, "percentiles": None, "unmeasured_top": None,
+           "age_hours": None, "stale": None}
+    out.update({k: None for k in _MARKET_SCAN_COUNTERS})
+    return out
+
+
+def _market_scan_summary(now: float | None = None) -> dict:
+    """The nightly market scan's run summary, tolerantly. Never raises.
+
+    A reader of its own rather than a branch of `_scan_summary()`, because it is a different job over
+    a different artifact: that one is the ~20-name watchlist scan the analyst is paid to score, this
+    one is the LLM-free cross-section of the whole liquid universe. The ops page only ever knew about
+    the first, so the second could refuse every night from behind a page that looked perfectly
+    healthy — the exact failure the page exists to prevent.
+
+    Absent, unreadable, corrupt, or valid-JSON-but-not-an-object all return the SAME neutral shape
+    with `present: False`. A run that has never happened and a run that stored nothing are different
+    facts, and neither of them is "0 rows scanned".
+
+    `stale` is three-valued on purpose: True/False when the run's age is known, None when it is not
+    (no artifact, or one with no usable timestamp). "We cannot tell how old this is" is not "it is
+    fresh".
+    """
+    out = _blank_market_scan()
+    data = _read_json(MARKET_SCAN_LATEST)
+    if not isinstance(data, dict):
+        return out
+    out["present"] = True
+    out["status"] = str(data["status"]) if data.get("status") is not None else None
+    out["reason"] = str(data["reason"]) if data.get("reason") is not None else None
+    out["session"] = str(data["session"]) if data.get("session") is not None else None
+    out["as_of"] = str(data["as_of"]) if data.get("as_of") is not None else None
+    hol = data.get("session_is_holiday")
+    out["session_is_holiday"] = hol if isinstance(hol, bool) else None
+    for k in _MARKET_SCAN_COUNTERS:
+        out[k] = _int_or_none(data.get(k))
+    out["duration_s"] = _float_or_none(data.get("duration_s"))
+    out["generated_at"] = _float_or_none(data.get("generated_at"))
+    # Passed through only when they are the shapes the card renders; a corrupt artifact must not
+    # hand the page something it will try to iterate.
+    pct = data.get("percentiles")
+    out["percentiles"] = pct if isinstance(pct, dict) else None
+    unm = data.get("unmeasured_top")
+    out["unmeasured_top"] = unm if isinstance(unm, dict) else None
+    if out["generated_at"] is not None:
+        age = (time.time() if now is None else now) - out["generated_at"]
+        out["age_hours"] = round(age / 3600.0, 2)
+        out["stale"] = age > MARKET_SCAN_STALE_HOURS * 3600.0
+    return out
+
+
 def _cache_footprint() -> dict:
     shorts_bytes = 0
     shorts_files = 0
@@ -258,6 +354,9 @@ def status_snapshot() -> dict:
         "uptime_s": round(uptime_seconds(), 1),
         "disk": _disk(),
         "scan": _scan_summary(),
+        # The nightly cross-section, beside the watchlist scan and never merged into it. See
+        # _market_scan_summary: absent is `present: False`, never a row of zeros.
+        "market_scan": _market_scan_summary(now),
         "next_scan_at": next_scan_at(now),
         "cache": _cache_footprint(),
         "iv_progress": iv_rank_progress(),
