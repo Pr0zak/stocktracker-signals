@@ -72,6 +72,22 @@ API process. A percentile pass or a backfill endpoint writing thousands of rows 
 for exactly as long as the nightly job does, in the middle of the trading day, and the argument
 above would no longer hold — it rests entirely on this writer being one small row.
 
+THE THIRD WRITER (write_percentiles) — the paragraph above named it, so here is the answer
+-------------------------------------------------------------------------------------------
+SWT-4's percentile pass (app/percentiles.py) runs in TWO places, and only one of them is new.
+
+  * At the tail of the nightly job, in the SAME process that just wrote the night. That is not a
+    second writer at all — it is the sole writer doing one more thing before it exits, and it is
+    where the pass belongs.
+  * From POST /market_scan/percentiles, to rank a night that is already stored. THIS is the bulk
+    write from the API process the paragraph above forbids, and it is admitted under one condition:
+    `write_percentiles` commits in `_PCT_CHUNK`-row transactions rather than one. The objection was
+    never "thousands of rows", it was "one lock held for the length of thousands of rows"; a chunked
+    writer holds it for ~200 UPDATEs at a time and lets go in between, so the worst any concurrent
+    writer waits is one chunk. It is an explicit POST, it is idempotent, and it writes only columns
+    no other writer owns. A bulk INSERT from the API process is still forbidden, for the reason
+    stated above and unchanged.
+
 Threading model
 ---------------
 Every public function here is SYNCHRONOUS and blocking. Callers in async code wrap them:
@@ -198,6 +214,55 @@ _INT_SET = frozenset(_METRIC_INT)
 # of the ON CONFLICT below.
 _WRITABLE: tuple[str, ...] = ("d", "symbol", "ts") + _METRIC_COLS + ("unmeasured",)
 
+# ------------------------------------------------------------------ derived: percentile ranks
+
+# SWT-4. These are written by a LATER PASS (app/percentiles.py) over a night that is already stored,
+# and they are deliberately NOT in `_METRIC_COLS` or `_WRITABLE`: the nightly job measures, the pass
+# ranks, and neither may overwrite the other's columns. That separation is what
+# `test_reinserting_a_night_preserves_a_column_written_after_the_original_insert` has been pinning
+# down since before these columns existed.
+#
+# The suffix is `_pctile`, not `_pct`: `_pct` already means "this number is expressed in percent" on
+# a third of the metric columns, and `adr20_pct_pct` names nothing at all.
+PCT_SUFFIX = "_pctile"
+
+# The ten metrics worth a cross-sectional rank. Everything else in `_METRIC_COLS` is left unranked
+# ON PURPOSE, in three groups:
+#
+#   * PER-SHARE DOLLAR LEVELS — price, sma20/50/150/200, ema20/50, atr14. A percentile over these
+#     ranks share PRICE, which says nothing about a company: a $480 name is not "in the 99th
+#     percentile" of anything a reader cares about, it just has few shares outstanding.
+#   * THE BOOLEANS and `bars` — above_sma50, above_sma200, ma_stacked have two states, not a
+#     distribution, and `bars` measures how much history OUR FETCH returned, which is a fact about
+#     the pipeline rather than about the market.
+#   * THE NEAR-DUPLICATES — atr14_pct (adr20_pct already carries the volatility axis), clv,
+#     pct_vs_sma50, pct_vs_sma200 (pct_off_52w_high already carries the extension axis). These are
+#     rankable and simply are not read on any screen today; each is one entry in this tuple plus one
+#     column in two places below, whenever one of them is.
+PCT_METRICS: tuple[str, ...] = (
+    "rel_strength_3mo",
+    "rel_volume",
+    "adr20_pct",
+    "adx14",
+    "mom_20d",
+    "mom_60d",
+    "rsi14",
+    "pct_off_52w_high",
+    "ema20_slope_pct",
+    "dollar_volume_20d",
+)
+
+# metric -> the column its rank is stored in. Published so a caller can build the percentile half of
+# a response without hardcoding the suffix, and so a metric that is not ranked is visibly absent
+# from the mapping rather than silently returning nothing.
+PCT_COLUMNS: dict[str, str] = {m: m + PCT_SUFFIX for m in PCT_METRICS}
+_PCT_COLS: tuple[str, ...] = tuple(PCT_COLUMNS.values())
+
+# Rows per transaction in write_percentiles(). See its docstring: this number is the entire reason a
+# backfill from the API process is defensible where a bulk insert would not be.
+_PCT_CHUNK = 200
+
+
 # `sort="rel_strength"` is the ergonomic name callers use; the column is `rel_strength_3mo` because
 # the contract pins the horizon into the metric's name. Aliased in one place rather than letting
 # every caller learn the difference.
@@ -261,6 +326,21 @@ CREATE TABLE IF NOT EXISTS scan (
     ma_stacked          INTEGER,
 
     unmeasured TEXT,                -- JSON array of the metric names that came back None
+
+    -- SWT-4 percentile ranks, written by app/percentiles.py AFTER the night is stored, never by
+    -- insert_night. NULL means "not ranked" — a metric we could not measure, or a metric too little
+    -- of the night could be measured on. It NEVER means the 0th percentile, which would be a
+    -- confident claim that this name is the worst in the market. Also add any new one to _migrate().
+    rel_strength_3mo_pctile   REAL,
+    rel_volume_pctile         REAL,
+    adr20_pct_pctile          REAL,
+    adx14_pctile              REAL,
+    mom_20d_pctile            REAL,
+    mom_60d_pctile            REAL,
+    rsi14_pctile              REAL,
+    pct_off_52w_high_pctile   REAL,
+    ema20_slope_pct_pctile    REAL,
+    dollar_volume_20d_pctile  REAL,
 
     PRIMARY KEY (d, symbol)
 ) WITHOUT ROWID;
@@ -345,7 +425,7 @@ def _migrate(db: sqlite3.Connection) -> None:
     instead of a full scan.
     """
     have = {r["name"] for r in db.execute("PRAGMA table_info(scan)")}
-    for col, decl in ():           # ("new_col", "REAL"), ... — also add it to _SCHEMA above
+    for col, decl in tuple((c, "REAL") for c in _PCT_COLS):   # also add it to _SCHEMA above
         if col not in have:
             db.execute(f"ALTER TABLE scan ADD COLUMN {col} {decl}")
 
@@ -469,6 +549,64 @@ def retire_absent(d: str, symbols: Iterable[str]) -> int:
     except Exception:  # noqa: BLE001 — housekeeping must never sink the run that calls it; a night
         # carrying a few stale rows is recoverable, a job that dies before writing its summary is not.
         log.warning("scan_store: retire_absent failed for %s", d, exc_info=True)
+        return 0
+
+
+def write_percentiles(d: str, values: dict[str, dict[str, Any]]) -> int:
+    """Write the SWT-4 percentile columns onto rows of night `d` THAT ALREADY EXIST. Rows updated.
+
+    `values` is {symbol: {percentile_column: rank_or_None}}. app/percentiles.py computes it; this
+    function only stores it, exactly as this module stores metrics it does not compute.
+
+    UPDATE, not the ON CONFLICT upsert `insert_night` uses, and the difference is load-bearing. An
+    upsert for a symbol that is not in this night would INSERT a row carrying nothing but ranks — an
+    all-null phantom name that lands in the cross-section, counts in breadth's coverage denominator,
+    and is indistinguishable afterwards from a stock we tried and failed to measure. An UPDATE that
+    matches no row is a silent no-op, which is the correct answer to "rank a symbol this night does
+    not contain".
+
+    EVERY percentile column is named on EVERY row, so a metric the caller passes nothing for is
+    CLEARED. That is deliberate. When a metric that ranked cleanly last night falls under its
+    coverage floor tonight, NULL is the honest state; leaving yesterday's rank sitting in the row
+    would show a stale market position with tonight's date stamped on it, which is the exact defect
+    class the rest of this file is built to avoid.
+
+    CHUNKED, and this is the paragraph to read before reusing the pattern. The module docstring
+    above rules out a bulk write from the API process because it would hold the single write lock
+    for the ~100ms of a 3,200-row commit in the middle of the trading day. This writer holds it for
+    `_PCT_CHUNK` rows at a time and releases between chunks, so a concurrent `record_gate` waits out
+    one small chunk instead of a whole pass. The price is that a backfill is NOT atomic: an
+    interrupted one leaves the remainder of the night NULL, which reads as "not ranked yet" and is
+    repaired by running it again. An absent rank is recoverable; a wrong one is not.
+    """
+    try:
+        night = _norm_d(d)
+        # Columns come from _PCT_COLS, never from the caller's keys: the names are interpolated into
+        # SQL, and a whitelist is the only version of that which is safe by construction.
+        sql = (f"UPDATE scan SET {','.join(f'{c}=?' for c in _PCT_COLS)}"
+               f" WHERE d = ? AND symbol = ?")
+        params: list[list[Any]] = []
+        for sym, cols in (values or {}).items():
+            s = str(sym or "").strip().upper()
+            if not s:
+                continue
+            got = cols or {}
+            params.append([_num(got.get(c)) for c in _PCT_COLS] + [night, s])
+
+        updated = 0
+        for i in range(0, len(params), _PCT_CHUNK):
+            with _lock:
+                db = _db()
+                cur = db.executemany(sql, params[i:i + _PCT_CHUNK])
+                db.commit()
+                # Read INSIDE the lock: rowcount belongs to this cursor, and a count that is only
+                # correct because no other thread happened to be writing is not a count.
+                updated += max(0, int(cur.rowcount or 0))
+        return updated
+    except Exception:  # noqa: BLE001 — a failed rank pass must not sink the nightly job whose rows
+        # are already committed, nor 500 a backfill request. The measurements are intact either way
+        # and the ranks are re-derivable from them by running the pass again; 0 says nothing landed.
+        log.warning("scan_store: write_percentiles failed for %s", d, exc_info=True)
         return 0
 
 

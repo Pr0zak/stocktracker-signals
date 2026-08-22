@@ -52,7 +52,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from . import market_calendar, scan_store, swing, universe
+from . import market_calendar, percentiles, scan_store, swing, universe
 from .market import fetch_series
 
 log = logging.getLogger("signals.market_scan")
@@ -442,6 +442,21 @@ async def run_market_scan(*, force: bool = False, limit: int | None = None) -> d
         scan_store.retire_absent(d, [r["symbol"] for r in rows])
         if (rows and limit is None) else 0
     )
+    # SWT-4 — rank the night we just stored, IN THIS PROCESS. That placement is the whole design,
+    # not a convenience: scan_store's single-writer invariant is the entire basis for there being no
+    # cross-process lock on scan.db, and the pass writing from here is the sole writer doing one more
+    # thing before it exits rather than a second one appearing. It runs AFTER retire_absent so a row
+    # this run no longer produces cannot sit in the distribution it is ranked against.
+    #
+    # It ranks whatever the stored night CONTAINS, which on a `--limit` run is the full night (the
+    # limited pass refreshed a slice of it and retired nothing) or, on a first-ever limited run, the
+    # sample itself. `percentiles.run` reports the row count it ranked over for exactly that reason.
+    #
+    # Skipped when nothing landed: ranking a night the store just refused would be ranking last
+    # night's rows and filing the result under tonight's summary.
+    summary["percentiles"] = (
+        await asyncio.to_thread(percentiles.run, d) if summary["rows_written"] else None
+    )
     summary["duration_s"] = round(time.monotonic() - t0, 1)
     status = "ok" if rows else "empty"
     reason = None if rows else "every symbol failed or was too short — nothing was stored"
@@ -473,6 +488,9 @@ def _blank_summary(d: str, night: dt.date) -> dict:
         "suspect_series": None,
         "rows_written": None,
         "retired": None,
+        # The SWT-4 rank pass's own summary, or None on every path that never got as far as running
+        # it. None is not "0 rows ranked" — see this function's docstring.
+        "percentiles": None,
         "benchmark": None,
         "concurrency": None,
         "unmeasured_top": None,
@@ -540,6 +558,13 @@ def summary_line(out: dict) -> str:
         parts.append(f"stored {out.get('rows_written')}")
         if out.get("retired"):
             parts.append(f"retired {out['retired']}")
+        pct = out.get("percentiles") or {}
+        if pct.get("status"):
+            # Both numbers, always: "ranked 3101" alone cannot show that a metric went unranked.
+            parts.append(
+                f"percentiles {pct.get('status')} {pct.get('updated')}/{pct.get('rows')}"
+                f" on {len(pct.get('ranked') or [])} metric(s)"
+            )
         parts.append(
             f"concurrency {conc.get('final')} (peak {conc.get('high_water')},"
             f" backoffs {conc.get('backoffs')}, throttles {conc.get('throttle_signals')})"

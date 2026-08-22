@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import chase, congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import dashboard, gaps, gate, market_calendar, market_scan_job, memory, rebalance_check, heatmap, sandbox_job, sandbox_store, scan_store, screener, smartmoney, universe, valuetrap
+from . import dashboard, gaps, gate, market_calendar, market_scan_job, memory, percentiles, rebalance_check, heatmap, sandbox_job, sandbox_store, scan_store, screener, smartmoney, universe, valuetrap
 from .analyst import (
     analyze,
     daily_brief,
@@ -2294,6 +2294,22 @@ def _market_scan_note(shown: int, total: int | None, prov: dict) -> str:
             "CONTEXT, NOT A BUY SIGNAL.")
 
 
+def _market_scan_percentiles(row: dict | None) -> dict:
+    """SWT-4 — the rank half of a row: {metric: percentile or None}, EVERY metric always present.
+
+    Always present, and null when it is not there, because the alternative is a client reading an
+    absent key as zero — "this name is at the bottom of the market" assembled out of a pass that has
+    not run yet. A night stored before the pass existed, a night whose backfill has not been run, and
+    a metric too little of the market could be measured on all report the same honest null.
+
+    These are RANKS, not scores: 96 means 96% of the names measured that night were lower, for a
+    metric whose "good" end is the reader's judgement and not this service's. See app/percentiles.py
+    before averaging any of them together.
+    """
+    r = row or {}
+    return {metric: r.get(col) for metric, col in scan_store.PCT_COLUMNS.items()}
+
+
 def _market_scan_bool(name: str, raw: str) -> bool:
     """A query-string boolean, refused rather than guessed at.
 
@@ -2366,6 +2382,12 @@ async def market_scan_endpoint(request: Request, limit: int = 50,
     rather than a filter that quietly does nothing. `limit` is capped at 200 — the whole night is a
     bulk export, not a payload.
 
+    Every row also carries SWT-4's `<metric>_pctile` columns — where that name sat in the night's
+    full cross-section, ranked ascending, `percentiles_over` names deep. They are RANKS, not scores
+    (high RSI is not "good"), and a null is "not ranked": the pass has not run for that night, or too
+    little of the market was measurable on that metric. A null is never a zero, and a client that
+    defaults it to one is claiming the name is the worst in the market.
+
     503 when no scan has ever run: an empty cross-section rendered as a market reading is the exact
     defect this service keeps correcting.
     """
@@ -2393,6 +2415,11 @@ async def market_scan_endpoint(request: Request, limit: int = 50,
     rows = await asyncio.to_thread(scan_store.top, night, sort=sort, limit=limit, **filters)
     # What the slice is a slice OF. len(rows) can only ever report `limit` back.
     total = await asyncio.to_thread(scan_store.count, night, **filters)
+    # SWT-4 — the denominator the `*_pctile` columns on each row were ranked against. Unfiltered on
+    # purpose: a percentile is a position in the whole night, not in the slice being served, and a
+    # client that labelled "98th of 50 shown" would be describing the wrong population. Re-uses
+    # `total` when no filter narrowed it, rather than asking the same COUNT twice.
+    ranked_over = total if not filters else await asyncio.to_thread(scan_store.count, night)
     prov = await asyncio.to_thread(_market_scan_provenance, night)
 
     payload = {
@@ -2401,6 +2428,8 @@ async def market_scan_endpoint(request: Request, limit: int = 50,
         "sort": sort,
         "limit": limit,
         "total_matching": total,
+        "percentiles_over": ranked_over,
+        "percentile_columns": dict(scan_store.PCT_COLUMNS),
         "results": rows,
         "note": _market_scan_note(len(rows), total, prov),
         "cached": False,
@@ -2449,6 +2478,12 @@ async def market_scan_symbol_endpoint(symbol: str) -> dict:
     CONTEXT, NOT A BUY SIGNAL: these are measurements of this name's own price history plus where it
     sits against the market, and nothing here is a view on it.
 
+    `row` is the night's raw measurements; `percentiles` is where each of ten of them sat in that
+    night's whole cross-section (`percentiles_over` names deep). Read them together — the rank is
+    what makes the raw number legible, and the raw number is what the rank is a rank OF. A null
+    percentile means the pass has not run for that night or too little of the market could be
+    measured on that metric; it is never a zero, and never "worst in the market".
+
     404 — "we looked and there is no data for this symbol" — when the name is in no night we hold.
     The row returned is that symbol's MOST RECENT one, which is not necessarily the most recent
     night overall: a name that was halted or failed to fetch last night still has an older
@@ -2466,15 +2501,24 @@ async def market_scan_symbol_endpoint(symbol: str) -> dict:
     # Provenance for the night THIS ROW came from, not for the latest one — see
     # _market_scan_provenance. An older row gets null counters, which is the truth about it.
     prov = await asyncio.to_thread(_market_scan_provenance, row.get("d"))
+    # The population THIS ROW's ranks were computed against — its own night, not the latest one, for
+    # the same reason its provenance is. A three-day-old row's percentile is a position in a
+    # three-day-old market and saying so is the only way the number stays true.
+    ranked_over = await asyncio.to_thread(scan_store.count, row.get("d"))
     return {
         "symbol": sym,
         "as_of": row.get("d"),
         "latest_scan_date": night,
         "is_latest_night": bool(night) and row.get("d") == night,
         "row": row,
+        # Alongside the raw row, never instead of it: the reader needs both "RSI 81.4" and "higher
+        # than 96% of the names measured that night", and the second is meaningless without the
+        # first. Nulls here mean "not ranked", never the 0th percentile.
+        "percentiles": _market_scan_percentiles(row),
+        "percentiles_over": ranked_over,
         **prov,
-        "note": ("One name's measurements from the nightly market-wide scan — "
-                 "CONTEXT, NOT A BUY SIGNAL."),
+        "note": ("One name's measurements from the nightly market-wide scan, and where each sits in "
+                 "that night's cross-section — a RANK, not a score. CONTEXT, NOT A BUY SIGNAL."),
     }
 
 
@@ -2498,6 +2542,39 @@ async def market_scan_run_endpoint(force: bool = False, limit: int | None = None
     # answer would keep being served for the rest of the TTL.
     _invalidate_market_scan_cache()
     return out
+
+
+@app.post("/market_scan/percentiles")
+async def market_scan_percentiles_endpoint(d: str | None = None) -> dict:
+    """SWT-4 — rank an ALREADY-STORED night and write the percentiles onto it. No LLM, no fetches.
+
+    The pass normally runs at the tail of the nightly job, in that job's own process. This is the
+    door for the nights that predate it, or one whose pass was interrupted: `d` is a YYYYMMDD (the
+    latest stored night by default), and it is idempotent — it reads only the measured columns, so
+    running it twice writes the same ranks twice.
+
+    A POST because it is bulk work over ~3,100 rows, in keeping with every other expensive operation
+    here, and because it WRITES — the API process is otherwise a read-only consumer of scan.db.
+    `scan_store.write_percentiles` commits in small chunks specifically so this cannot hold the
+    single write lock for the length of a whole pass; see the third-writer note in that module.
+
+    422 on a date that is not a date, 404 on a night that holds no rows, 503 when nothing has ever
+    been scanned. None of the three invents an empty result to hand back: a rank pass that ran over
+    no rows and one that never ran are different facts.
+    """
+    out = await asyncio.to_thread(percentiles.run, d)
+    status = out.get("status")
+    if status == "refused":
+        raise HTTPException(status_code=422, detail=out.get("reason") or "unusable date")
+    if status == "no_scan":
+        raise HTTPException(status_code=503, detail="no market scan has run yet — POST /market_scan/run")
+    if status == "empty":
+        raise HTTPException(status_code=404, detail=out.get("reason") or f"night {d!r} holds no rows")
+    # The ranks are columns on rows a cached slice already served without them. The cache keys on the
+    # night, which a backfill does not change, so nothing else would ever evict them.
+    _invalidate_market_scan_cache()
+    return {**out, "note": ("Where each name sits in that night's cross-section, metric by metric — "
+                            "a RANK, not a score, and not a buy signal.")}
 
 
 
