@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
-from . import congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
+from . import chase, congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
 from . import dashboard, gaps, gate, market_calendar, market_scan_job, memory, rebalance_check, heatmap, sandbox_job, sandbox_store, scan_store, screener, smartmoney, universe, valuetrap
 from .analyst import (
     analyze,
@@ -247,6 +247,21 @@ def _sanitize_plan(p, cash: float, crypto: bool) -> None:
         p.suggested_shares = (
             round(p.allocation_usd / mid, 6) if crypto else float(int(p.allocation_usd / mid))
         )
+
+
+async def _chase_price(symbol: str) -> float | None:
+    """The price a chase read has to be taken at: the CURRENT session's print (pre/post included),
+    not the frozen 4pm close — "am I paying up?" is a question about right now.
+
+    None on any failure, and the caller must keep it None rather than substituting a close. A chase
+    read against a price we could not fetch is not a read.
+    """
+    assert _http is not None
+    try:
+        quotes = await market_now.fetch_quotes(_http, [symbol])
+    except Exception:  # noqa: BLE001 — a missing quote costs the chase read, never the plan itself
+        return None
+    return market_now.session_price(quotes.get(symbol.upper()) or {})
 
 
 async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | None = None) -> dict:
@@ -1622,7 +1637,11 @@ async def plan(
 ) -> dict:
     """Scenario: "if I deployed $cash into this symbol" — one asset's entry plan (action, entry zone,
     share count, stop/target, timing). Optional shares+avg_cost tell the analyst it's already held.
-    `refresh=true` bypasses the cache to force a fresh plan."""
+    `refresh=true` bypasses the cache to force a fresh plan.
+
+    Also carries the SWT-3 chase read (`chase_pct`/`chase_status`/`chase_warning`/`chase_price`) —
+    server-side arithmetic putting the live price against the analyst's own entry zone, so the screen
+    can say "you are 4.7% above the plan's zone" instead of printing two numbers and hoping."""
     if cash <= 0:
         raise HTTPException(status_code=422, detail="cash must be > 0")
     cfg = settings_store.get()
@@ -1630,7 +1649,11 @@ async def plan(
     now = time.time()
     hit = _cache.get(key)
     if hit and not refresh and now - hit[0] < cfg["verdict_ttl_seconds"]:
-        return {**hit[1], "cached": True}
+        # The chase read is recomputed on the way out and deliberately NOT stored in the cache entry.
+        # Plans cache for verdict_ttl_seconds (4h by default) and the whole point of the read is
+        # where the price is NOW: "you're inside the zone" measured four hours ago is precisely the
+        # stale-number-worn-as-a-fact defect this app keeps having to delete.
+        return chase.annotate({**hit[1], "cached": True}, await _chase_price(hit[1]["symbol"]))
 
     summary = await _snapshot(symbol, crypto=crypto)
     pos = _position_block(summary, shares, avg_cost)
@@ -1653,7 +1676,10 @@ async def plan(
         "cached": False,
     }
     _cache[key] = (now, payload)
-    return payload
+    # Live quote first; the snapshot's own last print is the fallback, and only here — on this path
+    # it is seconds old and is the very number the analyst drew the zone against. (The cached path
+    # above has no such fresh price and reports the read as absent rather than inventing one.)
+    return chase.annotate(payload, await _chase_price(payload["symbol"]) or summary.get("price"))
 
 
 class Holding(BaseModel):
@@ -2112,10 +2138,40 @@ async def scan(req: ScanRequest) -> dict:
 
 @app.get("/scan/latest")
 async def scan_latest() -> dict:
-    """The most recent nightly-scan result (what the app polls). Empty until the first scan runs."""
+    """The most recent nightly-scan result (what the app polls).
+
+    `scan_available` is the field clients must branch on. When it is False there is NO scan on disk
+    (none has ever run, or the stored one is unreadable) and every list comes back null rather than
+    empty — because "we looked and the market is calm" and "we could not look" are different claims
+    and only the first is ours to make. The app rendered a reassuring "No dips right now" for both,
+    which is the reassuring one being the lie.
+
+    On a scan that did run, `dip_rejects` carries the names the dip radar TURNED DOWN with the reason
+    for each, and `dip_counts` partitions the scanned set (qualified + near_miss + nowhere_near +
+    unmeasured == scanned). A symbol whose data failed to fetch is `unmeasured`, never "no dip".
+    """
+    reason = "no scan has run yet"
     if LATEST.exists():
-        return json.loads(LATEST.read_text())
-    return {"generated_at": None, "results": [], "flips": [], "total_cost_usd": 0.0}
+        try:
+            payload = json.loads(LATEST.read_text())
+        except (OSError, ValueError) as e:
+            # A corrupt/half-written file is a FAILURE to read the scan, not an empty scan. Fall
+            # through to the unavailable payload rather than 500-ing or serving fabricated calm.
+            _log.warning("scan/latest: stored scan unreadable (%s) — reporting unavailable, not empty", e)
+            reason = "the stored scan could not be read"
+        else:
+            payload["scan_available"] = True
+            # A scan written before the reject fields existed carries neither. Null them explicitly
+            # rather than leaving the keys missing: a client reading an absent `dip_counts` as zeros
+            # would report "0 near misses" about a scan that never measured any.
+            payload.setdefault("dip_rejects", None)
+            payload.setdefault("dip_counts", None)
+            return payload
+    return {
+        "generated_at": None, "scan_available": False, "unavailable_reason": reason,
+        "results": None, "flips": None, "crossed_below_200wma": None, "dip_alerts": None,
+        "dip_rejects": None, "dip_counts": None, "date_alerts": None, "total_cost_usd": None,
+    }
 
 
 @app.post("/scan/run")

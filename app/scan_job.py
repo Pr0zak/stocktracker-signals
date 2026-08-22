@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import datetime as dt
 from datetime import date, timedelta
@@ -45,28 +46,180 @@ _BACKFILL_PER_RUN = 12
 LATEST = Path(__file__).resolve().parent.parent / "data" / "scan_latest.json"
 
 
+# A reject this close to the nearest tier threshold is a NEAR MISS rather than one of the names
+# that are nowhere near a dip. 1.5 percentage points is roughly ONE ORDINARY SESSION for a liquid US
+# equity (median absolute daily move sits near 1%), so it reads as "one normal day from qualifying" —
+# which is the only reason a rejected name is worth a line on the screen at all. It is also well
+# clear of the 0.1pp rounding on the inputs, so rounding alone can never push a name across the
+# boundary. Widening it much past this swallows the whole watchlist in a rising tape, and a near-miss
+# list nobody can read is no more checkable than no list at all.
+_NEAR_MISS_MARGIN_PP = 1.5
+
+
+def _off_phrase(pct: float, what: str) -> str:
+    """Renders a distance-from-high as 4.2% off its 3-month high, or at its 3-month high when it is
+    sitting on one. The special case exists so a rounded -0.04 never prints as "-0.0% off"."""
+    return f"at its {what}" if pct >= -0.05 else f"{-pct:.1f}% off its {what}"
+
+
+def _dip_reject(
+    pct_off_recent: float | None, pct_off_52w: float | None,
+    weekly_oversold: bool | None, lt: dict | None,
+) -> dict:
+    """WHY a symbol is not in a dip tier, in plain language and grounded in its own numbers.
+
+    A screener that only ever shows what qualified is something you have to trust: a name that
+    missed by a hair and a name nowhere near a dip are both simply absent, and so is a name whose
+    data never arrived. This returns the measurement that turned the name down plus how far it sits
+    from the nearest threshold, so the near-misses can be listed apart from the flat middle.
+
+    `measured` is False only when NO dip criterion could be evaluated at all — that symbol is
+    UNMEASURED, which is not the same claim as "no dip" and must never be merged with it.
+    `gap_pp` is in percentage points of price; the 14-week RSI is reported in the reason but never
+    used as a gap, because RSI points and percentage points are different units and averaging them
+    would produce a near-miss margin that means nothing.
+
+    PRECONDITION: only call this for a symbol `_dip_tier` turned down. The reason text is written
+    as a shortfall ("0.8 points short"), which only reads correctly when the name really is short of
+    every threshold. Handed a symbol that would have QUALIFIED — say 9.4% off its three-month high,
+    which clears the 5% pullback tier — it renders the arithmetic faithfully and the English
+    nonsensically, as "-4.4 points short". The single caller below guards this by returning early
+    whenever `tier is not None`, so the state is unreachable today; it is written down because the
+    guard and this function are eighty lines apart and nothing else enforces the pairing.
+    """
+    lt = lt or {}
+    line_pct = lt.get("price_vs_200w_sma_pct")
+    rsi_w = lt.get("rsi_14w")
+    gaps: list[tuple[float, str]] = []   # (points still needed, phrase naming what it missed by)
+    notes: list[str] = []
+
+    if pct_off_recent is not None:
+        gap = round(pct_off_recent + 5.0, 1)   # further decline needed to reach pullback_5
+        notes.append(_off_phrase(pct_off_recent, "3-month high"))
+        gaps.append((gap, f"{notes[-1]} — needs 5%, {gap:.1f} points short"))
+    if pct_off_52w is not None:
+        gap = round(pct_off_52w + 20.0, 1)     # further decline needed to reach mega_dip
+        notes.append(_off_phrase(pct_off_52w, "52-week high"))
+        gaps.append((gap, f"{notes[-1]} — needs 20%, {gap:.1f} points short"))
+    if isinstance(line_pct, (int, float)) and line_pct >= 0:
+        gap = round(float(line_pct), 1)        # how far above the 200-week line it still is
+        notes.append(f"{gap:.1f}% above its 200-week line")
+        gaps.append((gap, f"{notes[-1]}, {gap:.1f} points from crossing below"))
+    if isinstance(rsi_w, (int, float)):
+        notes.append(f"14-week RSI {float(rsi_w):.0f} — oversold needs under 30")
+    elif weekly_oversold is False:  # measured, just not oversold, and the value itself is missing
+        notes.append("not oversold on the 14-week RSI")
+
+    if not notes:
+        # Nothing was measurable. Say so; do NOT invent a "no dip" verdict out of missing data.
+        return {"measured": False, "near_miss": None, "gap_pp": None,
+                "reason": "no usable price history — this symbol was not measured for a dip"}
+    if not gaps:
+        return {"measured": True, "near_miss": False, "gap_pp": None,
+                "reason": ", ".join(notes) + " — no dip on any measure"}
+    gap_pp, nearest = min(gaps, key=lambda g: g[0])
+    if gap_pp <= _NEAR_MISS_MARGIN_PP:
+        return {"measured": True, "near_miss": True, "gap_pp": gap_pp, "reason": nearest}
+    return {"measured": True, "near_miss": False, "gap_pp": gap_pp,
+            "reason": ", ".join(notes) + " — no dip on any measure"}
+
+
 def _dip_tier(
-    closes: list[float], pct_off_52w: float | None, below_200wma: bool | None, weekly_oversold: bool | None,
+    closes: list[float], pct_off_52w: float | None, below_200wma: bool | None,
+    weekly_oversold: bool | None, lt: dict | None = None,
 ) -> dict:
     """How much of a 'good time to add' this is, most-severe first: mega_dip (>=20% off the 52-week
     high) > below_line (below its 200-week line) > oversold (weekly RSI<30) > pullback_10 / pullback_5
-    (off a ~3-month high). None = no dip. A layered 'add EXTRA on weakness' cue, never 'buy signal'."""
-    price = closes[-1]
+    (off a ~3-month high). None = no dip. A layered 'add EXTRA on weakness' cue, never 'buy signal'.
+
+    When no tier applies it also carries WHY (see `_dip_reject`), so the screen can show what it
+    turned down instead of only what it let through.
+    """
+    price = closes[-1] if closes else None
     recent_high = max(closes[-63:]) if len(closes) >= 5 else price   # ~3 months of daily bars
-    pct_off_recent = round((price - recent_high) / recent_high * 100, 1) if recent_high else 0.0
+    # None, not 0.0, when there is no usable high to measure against: a 0.0 here would read as
+    # "sitting exactly on its 3-month high", which is a claim about price, not about missing data.
+    pct_off_recent = (
+        round((price - recent_high) / recent_high * 100, 1)
+        if (price is not None and recent_high) else None
+    )
     if pct_off_52w is not None and pct_off_52w <= -20:
         tier = "mega_dip"
     elif below_200wma:
         tier = "below_line"
     elif weekly_oversold:
         tier = "oversold"
-    elif pct_off_recent <= -10:
+    elif pct_off_recent is not None and pct_off_recent <= -10:
         tier = "pullback_10"
-    elif pct_off_recent <= -5:
+    elif pct_off_recent is not None and pct_off_recent <= -5:
         tier = "pullback_5"
     else:
         tier = None
-    return {"dip": tier, "pct_off_recent_high": pct_off_recent, "pct_off_52w_high": pct_off_52w}
+    out = {"dip": tier, "pct_off_recent_high": pct_off_recent, "pct_off_52w_high": pct_off_52w}
+    if tier is not None:
+        # It qualified, so "why not" does not apply. None rather than False/"" — an inapplicable
+        # field is absent, and a client that renders `dip_near_miss == False` as "near miss: no"
+        # for a name that actually QUALIFIED is the same lie in the other direction.
+        out.update(dip_measured=True, dip_reject_reason=None, dip_gap_pp=None, dip_near_miss=None)
+        return out
+    rej = _dip_reject(pct_off_recent, pct_off_52w, weekly_oversold, lt)
+    out.update(
+        dip_measured=rej["measured"], dip_reject_reason=rej["reason"],
+        dip_gap_pp=rej["gap_pp"], dip_near_miss=rej["near_miss"],
+    )
+    return out
+
+
+# The four mutually exclusive verdicts every scanned symbol lands in. They MUST partition the
+# scanned set — "how many did we look at" is only a checkable number if the buckets sum to it.
+DIP_CLASSES = ("qualified", "near_miss", "nowhere_near", "unmeasured")
+
+
+def classify_dip(r: dict) -> str:
+    """Which bucket one scan row belongs to.
+
+    The defect this exists to prevent: a symbol whose fetch failed is UNMEASURED, never "no dip".
+    Absence of a measurement is not evidence of calm, and the reassuring reading is the wrong one to
+    default to — so anything without a completed dip measurement falls to `unmeasured`.
+    """
+    if r.get("error") or not r.get("dip_measured"):
+        return "unmeasured"
+    if r.get("dip"):
+        return "qualified"
+    return "near_miss" if r.get("dip_near_miss") else "nowhere_near"
+
+
+def _scrub(msg: str) -> str:
+    """Fetch errors carry upstream URLs (`... for url 'https://query1.finance.yahoo.com/...'`) and
+    these reasons are rendered in the app, so the URL is stripped before it ships."""
+    return re.sub(r"https?://\S+", "an upstream source", str(msg))[:200]
+
+
+def dip_verdicts(results: list[dict]) -> tuple[dict, dict]:
+    """(rejects, counts) for a finished scan.
+
+    Five distinct facts, never merged: how many were scanned, qualified, near-missed, were nowhere
+    near, and could not be measured at all. `rejects` is keyed so it can never be read as the
+    qualifying list — nothing in it is a dip.
+    """
+    rejects: dict[str, list[dict]] = {"near_miss": [], "nowhere_near": [], "unmeasured": []}
+    counts = {"scanned": len(results), "qualified": 0, "near_miss": 0, "nowhere_near": 0, "unmeasured": 0}
+    for r in results:
+        bucket = classify_dip(r)
+        counts[bucket] += 1
+        if bucket == "qualified":
+            continue
+        reason = r.get("dip_reject_reason")
+        if r.get("error"):
+            reason = f"not measured — {_scrub(r['error'])}"
+        rejects[bucket].append({
+            "symbol": r.get("symbol"),
+            "reason": reason or "not measured — the scan produced no dip measurement for this symbol",
+            "gap_pp": r.get("dip_gap_pp"),
+            "pct_off_recent_high": r.get("pct_off_recent_high"),
+            "pct_off_52w_high": r.get("pct_off_52w_high"),
+        })
+    return rejects, counts
 
 
 # ATM-IV logging window (OC-6a): a ~30-45 DTE expiry — cheaper/shorter-dated than the OC-1 45-90 band.
@@ -104,10 +257,14 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
     squeeze = None
     below_200wma = None
     weekly_oversold = None
+    # Kept in scope for _dip_tier: the 200-week distance and the 14-week RSI are what let a REJECTED
+    # name say which measure turned it down, and they were previously discarded inside the try.
+    lt_block: dict | None = None
     if crypto:
         try:
             summary.update(await cycle.crypto_context(client, series.symbol, series.closes))
             lt = summary.get("long_term_trend", {})
+            lt_block = lt or None
             below_200wma = lt.get("below_line")
             weekly_oversold = lt.get("weekly_oversold")
         except Exception:  # noqa: BLE001
@@ -125,6 +282,7 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
             pass
         try:
             lt = (await cycle.crypto_context(client, series.symbol, series.closes)).get("long_term_trend")
+            lt_block = lt or None
             below_200wma = lt.get("below_line") if lt else None
             weekly_oversold = lt.get("weekly_oversold") if lt else None
             # Also hand it to the analyst. It was computed here and deliberately withheld ("a neutral
@@ -166,7 +324,9 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
         # sessions instead of 20, against a window documented in trading days.
         if market_calendar.is_trading_day(dt.date.today()):
             await _log_atm_iv(client, series.symbol)
-    dip = _dip_tier(series.closes, summary.get("pct_off_52w_high"), below_200wma, weekly_oversold)
+    dip = _dip_tier(
+        series.closes, summary.get("pct_off_52w_high"), below_200wma, weekly_oversold, lt_block,
+    )
     return {
         "symbol": series.symbol,
         "signal": verdict.signal.value,
@@ -174,7 +334,8 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
         "thesis": verdict.thesis,
         "squeeze": squeeze,
         "below_200wma": below_200wma,
-        **dip,  # dip tier + pct_off_recent_high + pct_off_52w_high — the "good time to add" read
+        # dip tier + the two distances + (when no tier applies) why it was rejected and by how much
+        **dip,
         "cost_usd": usage["cost_usd"],
     }
 
@@ -186,7 +347,7 @@ def _prev_state() -> dict[str, dict]:
         return {
             r["symbol"]: {"signal": r.get("signal"), "squeeze": r.get("squeeze"),
                           "below_200wma": r.get("below_200wma"), "dip": r.get("dip")}
-            for r in json.loads(LATEST.read_text()).get("results", [])
+            for r in (json.loads(LATEST.read_text()).get("results") or [])
             if "signal" in r
         }
     except Exception:  # noqa: BLE001
@@ -418,8 +579,15 @@ async def run_scan() -> dict:
     except Exception:  # noqa: BLE001 — alerts are enrichment
         pass
 
+    # What the dip radar TURNED DOWN, and why. Without this the screen can only ever show its
+    # winners, and "nothing qualified tonight" is indistinguishable from "the scan never looked".
+    dip_rejects, dip_counts = dip_verdicts(results)
+
     payload = {
         "generated_at": time.time(),
+        # Stamped by the producer so a scan that RAN says so in the payload itself, and stays
+        # distinguishable from GET /scan/latest's "there is no scan" answer even when both are empty.
+        "scan_available": True,
         "results": results,
         "flips": [r["symbol"] for r in results if r.get("flipped")],
         "crossed_below_200wma": [r["symbol"] for r in results if r.get("crossed_below_200wma")],
@@ -428,6 +596,12 @@ async def run_scan() -> dict:
              "pct_off_recent_high": r.get("pct_off_recent_high"), "pct_off_52w_high": r.get("pct_off_52w_high")}
             for r in results if r.get("dip_new")
         ],
+        # NOT a list of dips — every symbol in here was rejected. Split three ways so a name that
+        # missed by a hair, a name nowhere near a dip, and a name we could not measure at all stay
+        # three different statements. Always real lists on a scan that ran, even an empty one.
+        "dip_rejects": dip_rejects,
+        # scanned == qualified + near_miss + nowhere_near + unmeasured, by construction.
+        "dip_counts": dip_counts,
         "date_alerts": date_alerts,
         "memory_scored": scored,
         "memory_seeded": seeded or None,
@@ -440,4 +614,7 @@ async def run_scan() -> dict:
 
 if __name__ == "__main__":
     out = asyncio.run(run_scan())
-    print(f"scanned {len(out['results'])} · flips {out['flips']} · ${out['total_cost_usd']}")
+    c = out["dip_counts"]
+    print(f"scanned {c['scanned']} · flips {out['flips']} · ${out['total_cost_usd']}")
+    print(f"dips {c['qualified']} · near miss {c['near_miss']} · no dip {c['nowhere_near']} "
+          f"· unmeasured {c['unmeasured']}")
