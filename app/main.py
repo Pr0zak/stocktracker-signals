@@ -3060,7 +3060,7 @@ def _extension_lookup(book: dict) -> "Callable[[str], float | None]":
 
 async def _run_extra_arm(
     arm: str, *, now, price_of, spy_price: float | None, shared_plan: dict | None,
-    candidates: list[dict], macro_block, force: bool,
+    candidates: list[dict], macro_block, force: bool, held_rows: list[dict] | None = None,
     rejected: dict[str, list[dict]] | None = None,
     gate: dict | None = None,
 ) -> dict:
@@ -3117,6 +3117,9 @@ async def _run_extra_arm(
     # Bound before the engine fork: only the llm branch can populate it, but every branch reaches
     # the trade-log write below, and a name defined in one arm of a fork is not defined in the others.
     _review_skips: list[dict] = []
+    # Same reason. Also stays empty for the rules and rejects engines by design: they consult no
+    # candidates at all, so recording main's pool under their name would log an input they never got.
+    arm_candidates: list[dict] = []
     flat = sandbox_job.exit_date_flatten_orders(blob, price_of)
     if flat is not None:
         orders, source, posture = flat, "exit_date", "Exit date reached — flattening to cash."
@@ -3138,6 +3141,13 @@ async def _run_extra_arm(
     else:
         holdings = [Holding(symbol=p["symbol"], shares=p["shares"], avg_cost=p["avg_cost"])
                     for p in blob["positions"]]
+        # This arm's universe: the pool main assembled, plus the names main holds that this arm does
+        # not, minus whatever this arm holds itself (already in its positions block) and its own
+        # exclusions. Without this the arm inherits main's blind spots — see
+        # sandbox_job.candidates_for_arm.
+        arm_candidates = sandbox_job.candidates_for_arm(
+            candidates, held_rows or [],
+            held=[p["symbol"] for p in blob["positions"]], exclusions=exclude)
         try:
             book = (await _build_portfolio_snapshot(holdings, blob["cash"], include_trend=True)
                     if holdings else
@@ -3147,7 +3157,7 @@ async def _run_extra_arm(
             # Per-arm backbone. None = the service's configured scan model, so an arm that does not
             # set one is a true copy of main rather than a second variable.
             decision, usage = await sandbox_decision(
-                book, candidates, cash=blob["cash"],
+                book, arm_candidates, cash=blob["cash"],
                 settings=sandbox_job.settings_for_prompt(settings),
                 strategy_note=shared_plan, macro=macro_block, deep=False,
                 model=(str(settings.get("model")).strip() or None) if settings.get("model") else None,
@@ -3162,7 +3172,7 @@ async def _run_extra_arm(
             if settings.get("review_enabled") and _arm_orders:
                 try:
                     verdict, rusage = await review_decision(
-                        decision, book, candidates, cash=blob["cash"],
+                        decision, book, arm_candidates, cash=blob["cash"],
                         settings=sandbox_job.settings_for_prompt(settings),
                         strategy_note=shared_plan, deep=True)
                     usage_store.record(rusage, symbol=f"SANDBOX:{arm}", kind="sandbox_review")
@@ -3227,10 +3237,11 @@ async def _run_extra_arm(
     sandbox_store.save(new_blob, arm)
     for r in filled + skipped + _review_skips:
         sandbox_store.append_trade(r, arm)
-    if candidates:
+    # What THIS arm was shown, not what main was shown.
+    if arm_candidates:
         sandbox_store.append_inputs({
             "ts": time.time(), "date": sandbox_job.today_et_str(now), "arm": arm,
-            "candidates": sandbox_job.candidate_fingerprint(candidates),
+            "candidates": sandbox_job.candidate_fingerprint(arm_candidates),
         }, arm)
     sandbox_store.append_nav(nav, arm)
     return {"arm": arm, "label": label, "engine": engine, "status": "ok", "posture": posture,
@@ -3450,6 +3461,9 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         # entirely, and the fill recorder after validate_and_fill still reads this. `macro_block` is
         # bound here for the same reason: the extra arms read it after this block on every path.
         candidates: list[dict] = []
+        # Same reason as `candidates` and `macro_block`: the extra arms read it after this block on
+        # every path, including the ones that skip the decision entirely.
+        held_rows: list[dict] = []
         macro_block = None
         # Orders the review model refused, per arm, for this tick only. Consumed by any engine
         # "rejects" arm further down. Never persisted: a rejected order is a statement about today's
@@ -3501,6 +3515,15 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 bench_closes = None
             candidates = [c for c in await asyncio.gather(
                 *[_sandbox_candidate(s, bench_closes, core_set) for s in candidate_syms]) if c]
+            # Rows for the names MAIN holds. `select_candidates` strips them from the pool above,
+            # correctly — main already sees them in its own positions block — but the pool is then
+            # handed to every comparison arm, and an arm that does not hold them has no row and no
+            # price for them anywhere. See sandbox_job.candidates_for_arm for what that cost.
+            # Fetched only when a comparison arm exists, and only for what is missing.
+            _arm_ids = [a for a in sandbox_store.list_arms() if a != sandbox_store.MAIN_ARM]
+            _missing = [s for s in held if s not in set(candidate_syms)] if _arm_ids else []
+            held_rows = [c for c in await asyncio.gather(
+                *[_sandbox_candidate(s, bench_closes, core_set) for s in _missing]) if c]
             source = "haiku_tick"
             # Exogenous risk overlay (NEWS-4). None when there is no usable read, which the prompt
             # is told to treat as "backdrop unknown" rather than "backdrop clear".
@@ -3681,6 +3704,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 arms.append(await _run_extra_arm(
                     _arm, now=now, price_of=price_of, spy_price=spy_price,
                     shared_plan=new_blob.get("last_strategy_note"), candidates=candidates,
+                    held_rows=held_rows,
                     macro_block=macro_block, force=force, rejected=rejected_by_arm,
                     gate=gate_verdict))
             except Exception as e:  # noqa: BLE001 — a side arm must never break the real account

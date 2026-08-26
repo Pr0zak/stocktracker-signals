@@ -142,6 +142,53 @@ def select_candidates(
     return watch_syms[:max_watchlist] + disc_syms, watch_syms[max_watchlist:]
 
 
+def candidates_for_arm(
+    shared: list[dict],
+    extra: list[dict],
+    *,
+    held: Iterable[str],
+    exclusions: Iterable[str],
+) -> list[dict]:
+    """The candidate rows ONE arm should see, out of the pool main assembled for itself.
+
+    The shared pool is built against MAIN's book. `select_candidates` strips held names on purpose,
+    because a held name already reaches the model through the positions block carrying its own price
+    and technicals -- listing it twice wastes a slot and reads as two different opportunities. That
+    is right for main and wrong for every other arm, because `run_sandbox_tick` then hands the same
+    pool to all of them unchanged ("on the snapshot main just used"). An arm that does not hold what
+    main holds gets no row, and therefore no price, for those names anywhere in its input.
+
+    What that cost, measured before this was written: `reviewed` carried an 11% GOLD target against
+    0% actual for three consecutive sessions. `target_gaps` told it about the gap every day; GLD was
+    stripped from the pool because MAIN holds GLD; so the model was asked to fill a gap in an
+    instrument it had never been shown a price for, and wrote the price from memory. GLD entry zones
+    of $170-180 (2026-08-21), $195-210 (08-25) and $195-202 (08-26) against a market of $421-427,
+    and an FBTC zone of $355-365 against $68.31. The ledger's zone guard refused all four, so no
+    money moved -- but the allocation never got filled either, and the trade log recorded a
+    badly-priced order rather than the missing input that caused it.
+
+    It also biased the experiment the arms exist to run. The further an arm's book drifted from
+    main's, the more of the universe silently vanished from its prompt, so an arm differed from main
+    by what it could SEE as well as by the one setting under test.
+
+    `extra` carries rows for the names main holds. Each arm keeps whatever it does not hold itself,
+    minus its own exclusions, so every arm is offered the same universe and the only thing that
+    differs is the book it is judged against. Order is preserved and `shared` wins on a duplicate,
+    so an arm's list stays the pool it would have had, with the missing names appended.
+    """
+    held_set = {str(s).upper() for s in held}
+    exclude = {str(s).upper() for s in exclusions}
+    out: list[dict] = []
+    seen: set[str] = set()
+    for row in list(shared) + list(extra):
+        sym = str(row.get("symbol") or "").upper()
+        if not sym or sym in seen or sym in held_set or sym in exclude:
+            continue
+        seen.add(sym)
+        out.append(row)
+    return out
+
+
 def unaffordable(
     symbols: list[str],
     *,
