@@ -1696,8 +1696,26 @@ for _s in ("BTC", "IBIT", "FBTC", "GBTC", "BITB", "ARKB", "BTCO", "HODL", "BRRR"
     _EXPOSURE_GROUP[_s] = "BTC"          # bitcoin + US spot-bitcoin ETFs
 for _s in ("ETH", "FETH", "ETHA", "ETHE", "ETHW", "CETH", "EZET", "ETHV"):
     _EXPOSURE_GROUP[_s] = "ETH"          # ether + US spot-ether ETFs
-for _s in ("GLD", "IAU", "GLDM", "SGOL", "IAUM", "BAR", "AAAU"):
+for _s in ("GLD", "IAU", "GLDM", "SGOL", "IAUM", "OUNZ", "BAR", "AAAU"):
     _EXPOSURE_GROUP[_s] = "GOLD"         # gold-bullion ETFs
+# Broad international ex-US — one exposure, for the same reason US_EQUITY is. Measured on 2y of
+# daily returns (2026-08-27) against VXUS: IXUS 0.999, VEU 0.998, SPDW 0.986, VEA 0.987, SCHF 0.985,
+# IEFA 0.967, VWO 0.913. Every one clears the 0.90 bar this file already uses, and VXUS-VTI came
+# back at 0.773 on the same run, confirming the deliberate split from US equity still holds.
+#
+# VWO is included despite being emerging-markets ONLY rather than a substitute for VXUS. Left
+# ungrouped it reproduces the exact failure that created US_EQUITY: two funds at 0.913 each drawing
+# their own cap, so a book could hold twice the intended international weight while its risk model
+# reported two diversified positions. An EM tilt is still expressible inside the group; it just
+# shares the one international ceiling, which is the conservative default and the point of a cap.
+#
+# "VXUS" maps to INTL as well, which does double duty: it is the ticker's group AND the alias for
+# the group name standing plans have been using ("13% shortfall vs plan" resolved against "VXUS"),
+# so notes written before this regrouping keep resolving. See SUPERSEDED GROUP NAMES below.
+for _s in ("VXUS", "IXUS", "VEU",            # all-world ex-US
+           "VEA", "SCHF", "SPDW", "IEFA",    # developed ex-US
+           "VWO"):                           # emerging markets
+    _EXPOSURE_GROUP[_s] = "INTL"
 # Broad US equity — ONE exposure, not several. Measured on 2y of daily returns (2026-08-05):
 # SPY-VTI 0.997, VOO-VTI 0.997, SPY-VOO 0.998, QQQM-SPY 0.951, and SPMO joins the same cluster at
 # 0.90. Treating these as independent let the 25% per-group cap apply once EACH, so the sandbox held
@@ -1723,8 +1741,14 @@ for _s in ("SP500",):
     _EXPOSURE_GROUP[_s] = "US_EQUITY"
 
 
-# Fund expense ratios, % per year. Fetched live from Yahoo's fundProfile 2026-08-05 — re-check
-# occasionally, issuers do cut them.
+# Fund expense ratios, % per year. Fetched live from Yahoo's fundProfile, refreshed 2026-08-27 —
+# re-check occasionally, issuers do cut them. Every figure the 2026-08-05 pass had came back
+# unchanged on the refresh, which is the reason to trust the ones it added.
+#
+# ETFs only. Yahoo's `annualReportExpenseRatio` is not reliable for MUTUAL FUNDS: the same call
+# returned 0.590% for FZILX and 1.760% for FZROX, which are Fidelity ZERO funds priced at 0.00%.
+# Whatever that field carries for a mutual fund, it is not the number a holder pays, so no mutual
+# fund belongs in this map until the figure comes from somewhere that can be trusted.
 #
 # This matters BECAUSE of the grouping above: once two funds are 0.997 correlated, the exposure is
 # identical and cost is the only durable difference left between them. SPY charges 0.095% for what
@@ -1734,10 +1758,23 @@ for _s in ("SP500",):
 # Absent from this map = unknown, not free. Single stocks have no expense ratio at all and are simply
 # omitted rather than recorded as 0.
 _EXPENSE_RATIO_PCT: dict[str, float] = {
-    "SPLG": 0.020, "VTI": 0.030, "VOO": 0.030, "IVV": 0.030, "ITOT": 0.030, "SCHB": 0.030,
-    "SPY": 0.095, "SPMO": 0.130, "QQQM": 0.150, "QQQ": 0.180,
-    "VXUS": 0.050, "SCHD": 0.060,
-    "FBTC": 0.250, "IBIT": 0.250,
+    "SPLG": 0.020, "VTI": 0.030, "VOO": 0.030, "ITOT": 0.030, "SCHB": 0.030, "SPTM": 0.030,
+    "IVV": 0.030, "SPY": 0.095, "SPMO": 0.130, "QQQM": 0.150, "QQQ": 0.180,
+    # International. VXUS is the cheapest TRUE total-international vehicle here: VEA/SCHF/SPDW look
+    # cheaper only because they drop emerging markets, and IXUS buys the identical exposure for more.
+    "VEA": 0.030, "SCHF": 0.030, "SPDW": 0.030, "VEU": 0.040, "VXUS": 0.050,
+    "VWO": 0.060, "IXUS": 0.070, "IEFA": 0.070,
+    # Dividend funds are NOT one exposure — measured against SCHD on 2026-08-27: DGRO 0.892,
+    # VYM 0.857, FDVV 0.783, all under the 0.90 bar. Priced here, grouped separately on purpose.
+    "VYM": 0.040, "SCHD": 0.060, "SPYD": 0.070, "DGRO": 0.080, "FDVV": 0.150,
+    # Gold. The widest like-for-like gap in this map: GLD charges 4x GLDM for the same bullion from
+    # the same issuer, and the group above means the ledger already refuses to churn one into the
+    # other — so this number can only ever steer NEW money, which is the only place it belongs.
+    "IAUM": 0.090, "GLDM": 0.100, "SGOL": 0.170, "IAU": 0.250, "OUNZ": 0.250, "GLD": 0.400,
+    # Spot bitcoin. HODL and BRRR are 0.000 by PROMOTIONAL WAIVER, not by pricing — both revert on
+    # expiry, so re-check these two before treating them as the cheap option.
+    "HODL": 0.000, "BRRR": 0.000, "BITB": 0.200, "ARKB": 0.210,
+    "FBTC": 0.250, "IBIT": 0.250, "BTCO": 0.250, "GBTC": 1.500,
 }
 
 
