@@ -2833,7 +2833,7 @@ _SANDBOX_CORE = [
     "VTI", "VOO", "SPY", "QQQM", "IWM",   # US broad market / large cap / small cap
     "VXUS", "VEA", "VWO",                 # international developed + emerging
     "SCHD", "VYM",                        # dividend / quality tilt
-    "GLD",                                # non-equity diversifier
+    "GLD", "GLDM",                        # gold bullion — the preference filter below keeps one
     "FBTC", "IBIT",                       # spot-bitcoin ETFs (still gated by allow_crypto_etf)
 ]
 
@@ -3406,9 +3406,14 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         # fragment one position across three tickers. prefer_btc_etf already reroutes a stray BUY,
         # but a candidate slot spent on a vehicle that will be redirected anyway is a wasted slot
         # and a confusing line of reasoning in the trade log.
-        _pref = str(settings.get("preferred_btc_etf") or "").strip().upper()
-        if _pref in sandbox_job.BTC_ETFS:
-            core = [s for s in core if s not in sandbox_job.BTC_ETFS or s == _pref]
+        # Same for gold: GLD and GLDM hold the same bullion at 0.400% and 0.100%, so offering both
+        # is not a choice between exposures, it is an invitation to fragment one position across two
+        # tickers — and a candidate slot spent on a vehicle prefer_gold_etf will redirect anyway.
+        for _family, _key in ((sandbox_job.BTC_ETFS, "preferred_btc_etf"),
+                              (sandbox_job.GOLD_ETFS, "preferred_gold_etf")):
+            _pref = str(settings.get(_key) or "").strip().upper()
+            if _pref in _family:
+                core = [s for s in core if s not in _family or s == _pref]
         try:
             # Ask for more than the budget: the vehicle and exclusion filters below run AFTER this
             # cap, so requesting exactly the budget lets a few filtered names shrink the screen's
@@ -3434,14 +3439,20 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 f"universe truncated — {len(dropped_syms)} symbol(s) were not considered: "
                 f"{', '.join(dropped_syms)}")
 
-        # The preferred bitcoin ETF must always be priced, even when it didn't make the candidate
-        # cut — sandbox_job.prefer_btc_etf can only route a buy onto something it can fill, so
-        # without a price the preference silently does nothing.
+        # A preferred vehicle must always be priced, even when it didn't make the candidate cut —
+        # prefer_vehicle can only route a buy onto something it can fill, so without a price the
+        # preference silently does nothing.
         pref_etf = str(settings.get("preferred_btc_etf") or "").strip().upper()
+        pref_gold = str(settings.get("preferred_gold_etf") or "").strip().upper()
         price_syms = list(candidate_syms)
         if (pref_etf in sandbox_job.BTC_ETFS and settings.get("allow_crypto_etf", True)
                 and pref_etf not in price_syms and pref_etf not in held):
             price_syms.append(pref_etf)
+        # No allow_* gate on gold: it is an ordinary ETF, covered by allow_etf like the rest of the
+        # shelf, and `core` is already empty when that is off.
+        if (pref_gold in sandbox_job.GOLD_ETFS and settings.get("allow_etf", True)
+                and pref_gold not in price_syms and pref_gold not in held):
+            price_syms.append(pref_gold)
 
         # Every group the STANDING PLAN names must be priceable, whether or not it made the candidate
         # cut. A target is an instruction to hold something, and a group that cannot be priced cannot
@@ -3455,7 +3466,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
             # exist yet and a truthful price_of here would reject every candidate representative.
             _rep = sandbox_job.group_representative(
                 _g, positions=blob["positions"], price_of=lambda _s: 1.0, group_of=_exposure_group,
-                preferred_btc_etf=pref_etf or "FBTC")
+                preferred_btc_etf=pref_etf or "FBTC", preferred_gold_etf=pref_gold or "GLDM")
             if _rep and _rep not in plan_syms:
                 plan_syms.append(_rep)
         # Arms other than main hold their own book; those symbols need marks too or their NAV is
@@ -3787,6 +3798,7 @@ class SandboxSettingsPatch(BaseModel):
     allow_crypto: bool | None = None
     allow_crypto_etf: bool | None = None
     preferred_btc_etf: str | None = None
+    preferred_gold_etf: str | None = None
     allow_etf: bool | None = None
     min_market_cap: float | None = None
     exclusions: list[str] | None = None
@@ -4200,17 +4212,19 @@ async def sandbox_set_settings_endpoint(
                            f"(have: {', '.join(sandbox_store.list_arms())})")
         if "account_type" in d and str(d["account_type"]).lower() in ("cash", "margin"):
             s["account_type"] = str(d["account_type"]).lower()
-        if "preferred_btc_etf" in d:
-            # Validated against the known spot-bitcoin ETFs, so a typo can't silently disable the
-            # preference (prefer_btc_etf ignores an unrecognised value). Empty string = no preference.
-            v = str(d["preferred_btc_etf"] or "").strip().upper()
-            if not v or v in sandbox_job.BTC_ETFS:
-                s["preferred_btc_etf"] = v
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"unknown bitcoin ETF {v!r} — expected one of "
-                           f"{', '.join(sorted(sandbox_job.BTC_ETFS))} (or empty for no preference)")
+        # Validated against the known vehicles, so a typo can't silently disable the preference
+        # (prefer_vehicle ignores an unrecognised value). Empty string = no preference.
+        for _key, _family, _what in (("preferred_btc_etf", sandbox_job.BTC_ETFS, "bitcoin ETF"),
+                                     ("preferred_gold_etf", sandbox_job.GOLD_ETFS, "gold ETF")):
+            if _key in d:
+                v = str(d[_key] or "").strip().upper()
+                if not v or v in _family:
+                    s[_key] = v
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"unknown {_what} {v!r} — expected one of "
+                               f"{', '.join(sorted(_family))} (or empty for no preference)")
         for k in ("current_age", "retirement_age"):
             if k in d:
                 v = d[k]

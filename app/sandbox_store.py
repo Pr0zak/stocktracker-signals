@@ -113,6 +113,14 @@ DEFAULT_SETTINGS = {
     # exposure — the user's call, not the model's. Enforced on BUYS server-side (see
     # sandbox_job.prefer_btc_etf); sells are never redirected, since you can only sell what you hold.
     "preferred_btc_etf": "FBTC",
+    # Same idea for gold, and a bigger number: every ETF in the GOLD group holds the identical
+    # bullion, so the choice is cost and liquidity rather than exposure. GLD charges 0.400% for what
+    # GLDM holds at 0.100% — 4x, from the same issuer. Defaults to GLDM rather than to the GLD every
+    # arm already owns, because this only ever steers NEW gold exposure: prefer_gold_etf leaves an
+    # add to an existing GLD position alone rather than fragmenting the holding across two tickers,
+    # and selling GLD to buy GLDM would realise a gain to save 0.30%/yr — the 2026-08-06 SPY->VTI
+    # mistake with a different ticker on it.
+    "preferred_gold_etf": "GLDM",
     "allow_etf": True,
     # Smallest company the market screen may propose, in USD of market cap. The universe reaches the
     # whole market now, and the screens that give it breadth (actives, gainers, small-cap growth) are

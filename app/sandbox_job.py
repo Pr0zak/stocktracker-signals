@@ -368,13 +368,24 @@ def _usd(x: float) -> str:
 # Spot-bitcoin ETFs. Every one holds the same asset, so which you own is a question about custody,
 # liquidity and fees — the user's call, not the model's.
 BTC_ETFS = frozenset({"IBIT", "FBTC", "GBTC", "BITB", "ARKB", "BTCO", "HODL", "BRRR", "EZBC", "BTCW"})
+# Gold-bullion ETFs, the same situation as the bitcoin shelf and for the same reason: every one of
+# these holds the identical metal, so the choice between them is cost, liquidity and custody rather
+# than exposure -- the user's call, not the model's. The spread here is wider than bitcoin's: GLD
+# charges 0.400% for what GLDM holds at 0.100% and IAUM at 0.090%, from the same two issuers.
+GOLD_ETFS = frozenset({"GLD", "GLDM", "IAU", "IAUM", "SGOL", "OUNZ", "BAR", "AAAU"})
 
 
-def prefer_btc_etf(
+def prefer_vehicle(
     orders: list[dict], *, preferred: str, positions: list[dict],
     price_of: Callable[[str], float | None],
+    family: frozenset[str] = BTC_ETFS, label: str = "bitcoin ETF",
 ) -> tuple[list[dict], list[str]]:
-    """Redirect BUYs of a spot-bitcoin ETF onto the user's chosen vehicle.
+    """Redirect BUYs of one interchangeable vehicle onto the user's chosen one.
+
+    `family` is a set of tickers holding the SAME underlying, so that swapping between them changes
+    cost and nothing else -- the spot-bitcoin ETFs, or the gold-bullion ETFs. `label` names it in the
+    trade log. The rules below were written for bitcoin and are identical for gold, which is why this
+    is one function rather than two that drift.
 
     Returns (orders, notes). Pure: `orders` is a new list, inputs are not mutated.
 
@@ -392,7 +403,7 @@ def prefer_btc_etf(
       rewrite would make the log disagree with what the model actually proposed.
     """
     pref = (preferred or "").strip().upper()
-    if not pref or pref not in BTC_ETFS:
+    if not pref or pref not in family:
         return list(orders), []
     held = {str(p.get("symbol", "")).upper() for p in positions if (p.get("shares") or 0) > 0}
     out: list[dict] = []
@@ -400,7 +411,7 @@ def prefer_btc_etf(
     for o in orders:
         sym = str(o.get("symbol") or "").strip().upper()
         side = str(o.get("side") or "").strip().lower()
-        if side != "buy" or sym not in BTC_ETFS or sym == pref:
+        if side != "buy" or sym not in family or sym == pref:
             out.append(o)
             continue
         if sym in held and pref not in held:
@@ -433,10 +444,33 @@ def prefer_btc_etf(
         sub["symbol"] = pref
         sub["dollars"] = round(dollars, 2)
         reason = str(o.get("reason") or "").strip()
-        sub["reason"] = (reason + f" [routed {sym}→{pref}: preferred bitcoin ETF]").strip()
+        sub["reason"] = (reason + f" [routed {sym}→{pref}: preferred {label}]").strip()
         out.append(sub)
-        notes.append(f"{sym}→{pref} (preferred bitcoin ETF)")
+        notes.append(f"{sym}→{pref} (preferred {label})")
     return out, notes
+
+
+def prefer_btc_etf(
+    orders: list[dict], *, preferred: str, positions: list[dict],
+    price_of: Callable[[str], float | None],
+) -> tuple[list[dict], list[str]]:
+    """Spot-bitcoin vehicles. See prefer_vehicle for the rules."""
+    return prefer_vehicle(orders, preferred=preferred, positions=positions, price_of=price_of,
+                          family=BTC_ETFS, label="bitcoin ETF")
+
+
+def prefer_gold_etf(
+    orders: list[dict], *, preferred: str, positions: list[dict],
+    price_of: Callable[[str], float | None],
+) -> tuple[list[dict], list[str]]:
+    """Gold-bullion vehicles. See prefer_vehicle for the rules.
+
+    The "consolidate, don't fragment" rule carries real weight here: every arm currently holds GLD,
+    so a preference for GLDM changes nothing today. It takes effect on NEW gold exposure, which is
+    the only place a fee comparison belongs -- selling GLD to buy GLDM would realise a gain to save
+    0.30% a year, which is the 2026-08-06 SPY->VTI trade wearing a different ticker."""
+    return prefer_vehicle(orders, preferred=preferred, positions=positions, price_of=price_of,
+                          family=GOLD_ETFS, label="gold ETF")
 
 
 def intra_group_swaps(orders: list[dict], *, group_of: Callable[[str], str]) -> set[int]:
@@ -808,6 +842,7 @@ GROUP_REPRESENTATIVE: dict[str, tuple[str, ...]] = {
 def group_representative(
     group: str, *, positions: list[dict], price_of: Callable[[str], float | None],
     group_of: Callable[[str], str], preferred_btc_etf: str = "FBTC",
+    preferred_gold_etf: str = "GLDM",
 ) -> str | None:
     """The ticker to buy in order to express a target stated as an exposure GROUP.
 
@@ -821,12 +856,14 @@ def group_representative(
     if held:
         return max(held, key=lambda p: float(p["shares"]) * (price_of(p["symbol"]) or 0.0)
                    )["symbol"].upper()
-    if group == "BTC":
-        # Same rule prefer_btc_etf enforces on the LLM's buys: which bitcoin vehicle to own is the
-        # user's call, so the mechanical path must not quietly pick a different one.
-        c = (preferred_btc_etf or "").strip().upper()
-        if c and price_of(c):
-            return c
+    # Same rule prefer_vehicle enforces on the LLM's buys: which vehicle to own inside an
+    # interchangeable family is the user's call, so the mechanical path must not quietly pick a
+    # different one. Reached only when nothing in the group is held, so it never fragments.
+    for _grp, _pref in (("BTC", preferred_btc_etf), ("GOLD", preferred_gold_etf)):
+        if group == _grp:
+            c = (_pref or "").strip().upper()
+            if c and price_of(c):
+                return c
     for c in GROUP_REPRESENTATIVE.get(group, ()):
         if price_of(c):
             return c
@@ -897,7 +934,8 @@ def rules_decision(
             break
         sym = group_representative(
             g, positions=positions, price_of=price_of, group_of=group_of,
-            preferred_btc_etf=str(settings.get("preferred_btc_etf") or "FBTC"))
+            preferred_btc_etf=str(settings.get("preferred_btc_etf") or "FBTC"),
+            preferred_gold_etf=str(settings.get("preferred_gold_etf") or "GLDM"))
         if not sym:
             continue
         px = price_of(sym) or 0.0
@@ -1124,6 +1162,10 @@ def validate_and_fill(
     if not liquidation:
         orders, _routed = prefer_btc_etf(
             orders, preferred=str(s.get("preferred_btc_etf") or ""),
+            positions=positions, price_of=price_of,
+        )
+        orders, _routed_gold = prefer_gold_etf(
+            orders, preferred=str(s.get("preferred_gold_etf") or ""),
             positions=positions, price_of=price_of,
         )
 

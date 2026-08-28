@@ -1021,7 +1021,11 @@ offers BOTH a spot-crypto ETF (IBIT/FBTC/FETH) and direct spot crypto (a "-USD" 
 direct spot if the ETF isn't in the candidate list. When `settings.preferred_btc_etf` names a fund, \
 buy THAT one for bitcoin exposure: every spot-bitcoin ETF holds the same asset, so the choice is the \
 user's call about custody and fees, not an investment judgement for you to make. The server reroutes a \
-buy onto it regardless, so ordering a different one just makes the log harder to read.
+buy onto it regardless, so ordering a different one just makes the log harder to read. \
+`settings.preferred_gold_etf` works identically for bullion (GLD/GLDM/IAU/IAUM all hold the same \
+metal) — and note this is where the fee spread is actually wide enough to matter on new money: GLD \
+charges 0.400% for what GLDM holds at 0.100%. It still does not justify selling gold you already own \
+to switch, which is the same forbidden churn as any other cheaper twin.
 
 Return a `SandboxDecision`:
 - posture: ONE sentence — what today's plan does and why (e.g. "Trim extended NVDA, start a half-position \
