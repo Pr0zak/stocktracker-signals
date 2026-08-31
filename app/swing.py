@@ -431,6 +431,29 @@ def _complete_ohlc_tail(
     )
 
 
+def clean_tail_atr(
+    highs: list | None, lows: list | None, closes: list | None, period: int = _ATR_PERIOD,
+) -> float | None:
+    """ATR(`period`) over the longest clean RECENT run of bars, or None.
+
+    The pairing metrics() already does by hand, lifted so market.summarize() can reuse it without
+    reaching for a private helper. atr() refuses the WHOLE series if any bar anywhere carries a
+    non-finite high, low or previous close, and market.py appends None for every bar Yahoo omits one
+    on, so calling atr() on the raw arrays would report "unmeasured" across a large share of the
+    universe for a cosmetic reason: on a 60-bar series with one nulled high 40 bars back, atr(raw) is
+    None where the clean tail still answers.
+
+    When the hole is the LATEST bar the tail is empty by design and this returns None. An ATR from
+    the previous session must never be quoted beside this session's price.
+
+    The `or []` lives here rather than in the caller because _align() takes min(len(s) for s in seqs)
+    with no guard and raises TypeError on None, and summarize() is called with duck-typed stubs that
+    expose only `closes`.
+    """
+    hh, ll, cc = _complete_ohlc_tail(highs or [], lows or [], closes or [])
+    return atr(hh, ll, cc, period)
+
+
 def _round(v: float | None, ndigits: int = 2) -> float | None:
     return round(v, ndigits) if v is not None else None
 
@@ -533,6 +556,27 @@ def metrics(series: Series, *, bench_closes: list[float] | None = None) -> dict:
     _high_ok = bool(price and ref_high and ref_high > 0)
     pct_off_high = min((price / ref_high - 1.0) * 100.0, 0.0) if _high_ok else None
 
+    # The mirror, built the same way for the same reasons. Without it the breadth read is one-sided:
+    # a market where BOTH new highs and new lows are elevated — the classic internal-divergence
+    # tape — is indistinguishable from one where only highs are, because the low half is not
+    # measured at all.
+    #
+    # Same completeness rule as the high side: an intraday low window is used only when it is
+    # complete, otherwise the close window, never a half-populated mix. A close-based low OVERstates
+    # the real low, which makes pct_off_low slightly smaller — the symmetric cost of the same
+    # conservative choice.
+    low_window = lows[len(lows) - min(len(lows), _YEAR_BARS):]
+    if low_window and len(low_window) >= len(close_window) and all(_finite(x) for x in low_window):
+        ref_low: float | None = min(float(x) for x in low_window)
+    elif close_window:
+        ref_low = min(close_window)
+    else:
+        ref_low = None
+    # Cannot be negative by construction (the min includes the last bar); clamped so float noise
+    # never prints a name -0.0001% BELOW its own 52-week low.
+    _low_ok = bool(price and ref_low and ref_low > 0)
+    pct_off_low = max((price / ref_low - 1.0) * 100.0, 0.0) if _low_ok else None
+
     out: dict = {
         "price": _round(price, 4),
         "bars": len(closes),
@@ -558,6 +602,7 @@ def metrics(series: Series, *, bench_closes: list[float] | None = None) -> dict:
         "mom_60d": _round(momentum_pct(closes, 60)),
         "rsi14": _round(rsi(closes)),
         "pct_off_52w_high": _round(pct_off_high),
+        "pct_off_52w_low": _round(pct_off_low),
         "pct_vs_sma50": _round((price / sma50 - 1.0) * 100.0) if (price and sma50) else None,
         "pct_vs_sma200": _round((price / sma200 - 1.0) * 100.0) if (price and sma200) else None,
         "rel_strength_3mo": _round(rel_strength_pct(closes, bench_closes)),

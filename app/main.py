@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from . import observability, selfupdate, settings_store, usage_store
 from . import chase, congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
-from . import dashboard, gaps, gate, market_calendar, market_scan_job, memory, percentiles, plan_replay, rebalance_check, heatmap, sandbox_job, sandbox_store, scan_store, screener, smartmoney, universe, valuetrap
+from . import dashboard, gaps, gate, market_calendar, market_scan_job, memory, percentiles, plan_check, plan_replay, rebalance_check, heatmap, sandbox_job, sandbox_store, scan_store, screener, smartmoney, universe, valuetrap
 from .analyst import (
     analyze,
     daily_brief,
@@ -1671,7 +1671,9 @@ async def plan(
         "model": usage["model"],
         "as_of": now,
         "cash": cash,
-        "plan": entry.model_dump(),
+        # `summary` IS the snapshot this plan was drawn against — same scope, no lookup, so the
+        # volatility the check measures against is by construction this symbol's.
+        "plan": plan_check.annotate(entry.model_dump(), summary),
         "usage": usage,
         "cached": False,
     }
@@ -2142,7 +2144,9 @@ async def recommendations(req: RecommendRequest) -> dict:
         "discovered": discovered,
         "considered": len(snaps),
         "overview": recs.overview,
-        "picks": [p.model_dump() for p in recs.picks],
+        # Per-pick lookup: one /recommendations call ranks many symbols, and annotating a plan with
+        # a neighbour's volatility would be worse than not annotating it at all.
+        "picks": plan_check.annotate_picks([p.model_dump() for p in recs.picks], snaps),
         "passed": recs.passed,
         "usage": usage,
         "cached": False,

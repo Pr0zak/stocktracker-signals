@@ -98,9 +98,14 @@ SQLite work runs ON the event loop of a single-worker uvicorn and blocks every o
 duration. That is survivable for a few-thousand-row aggregate over memory.db; over a 288k-row
 cross-section it would not be.
 
-Known gap: `breadth()["new_52w_lows"]` is always None — see the comment at its return site. The
-metrics contract measures distance from the 52-week HIGH and has no low-side equivalent, and None
-("we do not know") is the only honest thing to report for it.
+Closed 2026-08-31: `breadth()["new_52w_lows"]` used to be permanently None, because the metrics
+contract measured distance from the 52-week HIGH and had no low-side equivalent. `pct_off_52w_low`
+now joins the contract, so the low side is measured, and `high_low_diff` reports the difference
+between the two BAND counts — the strict counts compare a closing extreme against intraday extremes
+and read ~0 on almost every night, so their difference would be noise, not divergence.
+
+Nights stored before that date hold NULL in the new column and report None here. They cannot be
+backfilled: this store keeps recent nights, not 52 weeks of history per row.
 """
 
 from __future__ import annotations
@@ -172,6 +177,19 @@ _AT_52W_HIGH_PCT = -0.01
 # not an event — so the two can never be confused for one another.
 _NEAR_52W_HIGH_PCT = -1.0
 
+# The low-side mirrors, with the SAME reasoning inverted. `pct_off_52w_low` is
+# (close / min(52w lows) - 1) * 100, so a close that undercuts every prior print of the year lands at
+# exactly 0.0; the tolerance is float rounding and nothing else.
+#
+# And the strict count has the SAME defect the high side documents: a CLOSING low measured against
+# INTRADAY lows can only fire when a name closes on the exact low tick of its year, so it reads ~0 on
+# most nights. Measured against the live universe, the strict high-side count read 0/5/6/1/3 per
+# night out of ~3,103. A high-low DIFFERENTIAL built on two numbers that are both nearly always zero
+# is not a divergence signal, it is noise — so the differential below is built on the BAND form,
+# which is the only one of the pair that moves.
+_AT_52W_LOW_PCT = 0.01
+_NEAR_52W_LOW_PCT = 1.0
+
 # Two adjusted closes from two different nightly fetches are not always comparable: Yahoo re-adjusts
 # a whole series retroactively, so a split between last night and tonight shows up here as a -75%
 # "decline" for a 4:1 and a +900% "advance" for a 1:10 reverse. Pairs that moved more than this in
@@ -196,7 +214,7 @@ _METRIC_REAL: tuple[str, ...] = (
     "adr20_pct", "atr14", "atr14_pct", "adx14",
     "clv", "rel_volume", "dollar_volume_20d",
     "mom_20d", "mom_60d", "rsi14",
-    "pct_off_52w_high", "pct_vs_sma50", "pct_vs_sma200",
+    "pct_off_52w_high", "pct_off_52w_low", "pct_vs_sma50", "pct_vs_sma200",
     "rel_strength_3mo", "ema20_slope_pct",
 )
 _METRIC_INT: tuple[str, ...] = ("bars",)
@@ -316,6 +334,7 @@ CREATE TABLE IF NOT EXISTS scan (
     mom_60d             REAL,
     rsi14               REAL,
     pct_off_52w_high    REAL,
+    pct_off_52w_low     REAL,
     pct_vs_sma50        REAL,
     pct_vs_sma200       REAL,
     rel_strength_3mo    REAL,
@@ -425,8 +444,14 @@ def _migrate(db: sqlite3.Connection) -> None:
     instead of a full scan.
     """
     have = {r["name"] for r in db.execute("PRAGMA table_info(scan)")}
-    for col, decl in tuple((c, "REAL") for c in _PCT_COLS):   # also add it to _SCHEMA above
+    for col, decl in tuple((c, "REAL") for c in _PCT_COLS) + (("pct_off_52w_low", "REAL"),):
+        # also add it to _SCHEMA above
         if col not in have:
+            # Nights stored before this column existed keep NULL in it, and that is the correct
+            # value: the low side genuinely was not measured on those nights. It cannot be
+            # backfilled — the store keeps recent nights, not 52 weeks of history per row — so
+            # anything reading it must render "-" for them and must never substitute 0, which would
+            # claim no name made a new low on a night nobody looked.
             db.execute(f"ALTER TABLE scan ADD COLUMN {col} {decl}")
 
     # Same treatment for the gate table, which arrived after scan did: a database created before it
@@ -773,15 +798,23 @@ def breadth(d: str | None = None) -> dict:
                 "  SUM(above_sma200 IS NOT NULL) m200, SUM(above_sma200) a200,"
                 "  SUM(pct_off_52w_high IS NOT NULL) mhh,"
                 "  SUM(pct_off_52w_high >= ?) nh,"
-                "  SUM(pct_off_52w_high >= ?) nearh"
+                "  SUM(pct_off_52w_high >= ?) nearh,"
+                "  SUM(pct_off_52w_low IS NOT NULL) mll,"
+                "  SUM(pct_off_52w_low <= ?) nl,"
+                "  SUM(pct_off_52w_low <= ?) nearl"
                 " FROM scan WHERE d = ?",
-                (_AT_52W_HIGH_PCT, _NEAR_52W_HIGH_PCT, night),
+                (_AT_52W_HIGH_PCT, _NEAR_52W_HIGH_PCT, _AT_52W_LOW_PCT, _NEAR_52W_LOW_PCT, night),
             ).fetchone()
             n = int(row["n"] or 0)
             if not n:
                 return _no_breadth()
             adv, dcl = _advance_decline(db, night, n)
             latest_ts = float(row["ts"]) if row["ts"] is not None else None
+            # Bound once: _count applies the coverage floor, so calling it twice per side inside the
+            # dict below would compute the same guard four times and read as if the two sides were
+            # independently derived.
+            _near_h = _count(row["nearh"], row["mhh"], n)
+            _near_l = _count(row["nearl"], row["mll"], n)
 
         return {
             "available": True,
@@ -795,14 +828,24 @@ def breadth(d: str | None = None) -> dict:
             # Proximity, not an event — see _NEAR_52W_HIGH_PCT. Read alongside new_52w_highs, never
             # instead of it: one counts names that closed at a new yearly high, this counts names
             # trading within 1% of one.
-            "near_52w_high": _count(row["nearh"], row["mhh"], n),
+            "near_52w_high": _near_h,
             "near_52w_high_pct": abs(_NEAR_52W_HIGH_PCT),
-            # Always None, and deliberately so. The metrics contract measures distance from the
-            # 52-week HIGH and has no low-side equivalent, and this store cannot derive one: it
-            # keeps 90 nights, not 52 weeks. 0 would read as "nothing made a new low" — a bullish
-            # all-clear invented out of a missing column. Wire this up when a low-side metric joins
-            # the contract; until then None is the true answer.
-            "new_52w_lows": None,
+            # The low side, live since 2026-08-31. Nights stored before then hold NULL in
+            # `pct_off_52w_low` and therefore report None here — not 0, which would claim no name
+            # made a new low on a night nobody measured one. There is no backfill: the store keeps
+            # recent nights, not a year of history per row.
+            "new_52w_lows": _count(row["nl"], row["mll"], n),
+            "near_52w_low": _near_l,
+            "near_52w_low_pct": abs(_NEAR_52W_LOW_PCT),
+            # The differential, and the reason it is built on the BAND counts rather than the strict
+            # ones: both strict counts read ~0 on almost every night by construction, so their
+            # difference is noise dressed as a divergence signal. This is the classic internal
+            # divergence — an index making ground while more names sit near their lows than near
+            # their highs — and it is the reading the gate's participation leg cannot see.
+            # None whenever either side is unmeasured, so a one-sided night reports nothing at all.
+            "high_low_diff": (
+                (_near_h - _near_l) if (_near_h is not None and _near_l is not None) else None
+            ),
             "age_hours": round((time.time() - latest_ts) / 3600.0, 2) if latest_ts else None,
         }
     except Exception:  # noqa: BLE001 — breadth is decoration on every screen that shows it; an
@@ -835,6 +878,9 @@ def _no_breadth() -> dict:
         # without having to hardcode the band its own copy of.
         "near_52w_high_pct": abs(_NEAR_52W_HIGH_PCT),
         "new_52w_lows": None,
+        "near_52w_low": None,
+        "near_52w_low_pct": abs(_NEAR_52W_LOW_PCT),
+        "high_low_diff": None,
         "age_hours": None,
     }
 

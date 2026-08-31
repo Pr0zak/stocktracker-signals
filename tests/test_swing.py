@@ -308,7 +308,7 @@ def test_metrics_returns_the_whole_contract_and_leaves_nothing_unmeasured_on_a_f
         "price", "bars", "sma20", "sma50", "sma150", "sma200", "ema20", "ema50",
         "above_sma50", "above_sma200", "ma_stacked", "adr20_pct", "atr14", "atr14_pct",
         "adx14", "clv", "rel_volume", "dollar_volume_20d", "mom_20d", "mom_60d", "rsi14",
-        "pct_off_52w_high", "pct_vs_sma50", "pct_vs_sma200", "rel_strength_3mo",
+        "pct_off_52w_high", "pct_off_52w_low", "pct_vs_sma50", "pct_vs_sma200", "rel_strength_3mo",
         "ema20_slope_pct", "unmeasured",
     }
     assert m["unmeasured"] == [], f"a clean 260-bar series measured nothing at: {m['unmeasured']}"
