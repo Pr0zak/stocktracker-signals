@@ -233,6 +233,11 @@ zone below), wait (no edge now — name the trigger that would change that in `t
 - entry_low-entry_high is your realistic entry zone: for buy_now it brackets the current price; for \
 buy_on_pullback it sits at support below. stop goes below the zone, target above it — sanity-check \
 risk:reward is at least ~1.5 before recommending any buy.
+- `atr14` is the average true range of one session, in price units, and `atr14_pct` the same as a \
+percentage of price. Use them to size the stop: a stop less than one atr14 below the entry zone is \
+inside an ordinary day's movement and will be hit by noise rather than by the thesis failing. When \
+atr14 is null it could not be measured — say so in `timing` and place the stop on structure instead \
+of guessing a distance.
 - allocation_usd is how much of the cash to deploy (<= cash; a partial tranche is fine — say so in \
 `timing`). suggested_shares = allocation / entry midpoint: whole shares for stocks (0 is allowed if \
 one share doesn't fit a sensible allocation — explain in the thesis), fractional up to 6 dp for crypto.
@@ -266,6 +271,10 @@ not exceed the cash.
 you'd wait on. Each pick gets a full plan: entry zone, stop, target (risk:reward at least ~1.5), \
 suggested_shares = allocation / entry midpoint (whole shares for stocks, fractional for crypto), \
 and timing.
+- Size each stop against that candidate's own `atr14` (one session's average true range, in price \
+units): a stop inside one atr14 of the entry zone is inside an ordinary day's movement. `atr14_pct` \
+is the same figure as a percentage, which is how you compare volatility ACROSS candidates — a 7%-a-day \
+name and a 0.8%-a-day name cannot carry the same stop distance. A null means it could not be measured.
 - Prefer diversification: an existing large position argues against adding more of the same name \
 unless its setup is clearly the best available.
 - If NOTHING has a decent setup, return zero picks and say why in the overview — keeping the cash \

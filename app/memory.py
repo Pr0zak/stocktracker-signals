@@ -211,6 +211,12 @@ _FEATURES: tuple[tuple[str, float, float, bool], ...] = (
     ("pct_vs_sma50",      12.0,   1.0,    True),
     ("macd_hist_pct",      1.5,   0.7,    False),   # a confirmer; allowed to disagree
     ("bollinger_pct_b",    0.4,   0.7,    False),
+    # BASIS CHANGE 2026-08-30: stochastic_k switched from a close-basis window to Pine's ta.stoch
+    # over bar highs/lows. Rows written before that date hold the old basis, which saturated at 0 or
+    # 100 on roughly 30% of bars, so a historical neighbour can look far closer or further on this
+    # axis than it really was. It is weight 0.5 and non-veto, and _distance skips dimensions a row
+    # lacks, so the damage is bounded — but the mixed population is real until those rows are either
+    # re-derived or nulled.
     ("stochastic_k",      30.0,   0.5,    False),
     ("pct_off_52w_high",  15.0,   1.0,    True),
     ("rel_strength",       0.12,  0.8,    True),    # weaker weight, but still setup-defining

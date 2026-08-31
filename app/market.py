@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from . import swing
+
 _UA = "Mozilla/5.0 (Linux; Android 14; Mobile) StockTracker-Signals/1.0"
 _HOSTS = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
 
@@ -239,12 +241,43 @@ def _bollinger_pct_b(values: list[float], period: int = 20) -> float | None:
     return (values[-1] - lower) / (upper - lower)
 
 
-def _stochastic_k(values: list[float], period: int = 14) -> float | None:
-    if len(values) < period:
+def _stochastic_k(
+    closes: list[float],
+    highs: list | None = None,
+    lows: list | None = None,
+    period: int = 14,
+) -> float | None:
+    """Pine's ta.stoch: 100 * (close - lowest(low, n)) / (highest(high, n) - lowest(low, n)).
+
+    The window extremes come from the BAR HIGHS AND LOWS. Taking them from the closes — which this
+    did until 2026-08-30 — makes %K read exactly 0 whenever the last close is the window's lowest
+    close and exactly 100 whenever it is the highest. Measured over 1-2 years of daily bars on AAPL,
+    NVDA, MSFT, AMD, SPY and BTC-USD that is ~30% of bars, against 0-1% for a true stochastic, and
+    9-19% of bars land on the other side of the 20/80 zone call. The value is shipped to the analyst
+    on every call and persisted per verdict by memory.py, so the saturation fed both.
+
+    Returns None — never a close-basis fallback — when the window's extremes are not all present,
+    aligned and coherent. scan_job.py's memory backfill builds a Series with `highs=[]` and
+    `lows=[]`, and summarize() is also called with stubs exposing only `closes`; substituting closes
+    there would write one basis into the same column the other basis writes to, which is precisely
+    what memory.py then matches rows against.
+    """
+    if len(closes) < period:
         return None
-    window = values[-period:]
-    lo, hi = min(window), max(window)
-    return 100.0 * (values[-1] - lo) / (hi - lo) if hi > lo else 50.0
+    if not highs or not lows:
+        return None
+    if len(highs) != len(closes) or len(lows) != len(closes):
+        return None
+
+    hw, lw = highs[-period:], lows[-period:]
+    for h, lo_ in zip(hw, lw):
+        if h is None or lo_ is None:
+            return None
+        if not (math.isfinite(h) and math.isfinite(lo_)) or h < lo_:
+            return None
+
+    hi, lo = max(hw), min(lw)
+    return 100.0 * (closes[-1] - lo) / (hi - lo) if hi > lo else 50.0
 
 
 def relative_strength(closes: list[float], bench: list[float] | None, period: int = 63) -> float | None:
@@ -286,12 +319,63 @@ def summarize(series: Series, bench_closes: list[float] | None) -> dict:
         "pct_vs_sma50": _pct(price, sma50),
         "golden_cross": (sma20 > sma50) if (sma20 and sma50) else None,
         "bollinger_pct_b": _round(_bollinger_pct_b(c)),
-        "stochastic_k": _round(_stochastic_k(c)),
+        # getattr, not series.highs: swing.py's docstring records that summarize() is called with
+        # duck-typed stubs and with scan_job's truncated Series, neither of which carries extremes.
+        "stochastic_k": _round(
+            _stochastic_k(c, getattr(series, "highs", None), getattr(series, "lows", None))
+        ),
         "fifty_two_week_high": series.fifty_two_high,
         "fifty_two_week_low": series.fifty_two_low,
         "pct_off_52w_high": _pct(price, series.fifty_two_high),
         "rel_strength_3mo_vs_benchmark": _round(rs, 4),
+        # Volatility. Until 2026-08-31 this snapshot carried no magnitude of movement at all, so the
+        # analyst placed entry_low/entry_high/stop/target with no idea whether the name travels 0.8%
+        # or 7% in an ordinary session — while PLAN_SYSTEM already asked it to sanity-check a 1.5
+        # risk:reward, a rule requested on every plan and verified on none.
+        #
+        # ATR rather than a close-to-close deviation because it carries the overnight gap, which is
+        # what actually takes a stop out. Read through getattr and swing.clean_tail_atr: summarize()
+        # is called with duck-typed stubs exposing only `closes` and with scan_job's truncated Series
+        # whose extremes are empty, and both must yield null rather than raise or substitute closes.
+        **_volatility(series, price),
     }
+
+
+# Guarded separately from the dict literal so the two keys can be absent together, and so the
+# series-integrity check reads once rather than per key.
+def _volatility(series, price: float) -> dict:
+    closes = getattr(series, "closes", None) or []
+    a = swing.clean_tail_atr(
+        getattr(series, "highs", None), getattr(series, "lows", None), closes
+    )
+    # A mixed split basis corrupts ATR harder than any other metric here — a pre-split bar beside a
+    # post-split one reads as one enormous session's range. swing.implausible_jump is applied on the
+    # market_scan path but never reached from summarize(), so /plan and /recommendations would
+    # otherwise quote that number to the analyst as fact and then divide a stop distance by it.
+    if a is not None and swing.implausible_jump(closes) is not None:
+        a = None
+    return {
+        "atr14": _round_sig(a, 4),
+        # `is not None`, never a truthiness test: a genuinely flat series measures 0.0, and treating
+        # a measurement as an absence inverts the invariant this whole file is careful about.
+        "atr14_pct": _round(a / price * 100.0, 2) if (a is not None and price) else None,
+    }
+
+
+def _round_sig(v: float | None, sig: int = 4) -> float | None:
+    """Round to significant figures, not decimal places.
+
+    Decimal rounding is wrong for this field specifically. A sub-penny asset — the crypto the app
+    supports and the tests pin — has a true ATR of order 1e-07, which `round(v, 4)` flattens to 0.0:
+    a measured zero range on a name that moves several percent a day, published beside an
+    `atr14_pct` that says otherwise. Significant figures keep the magnitude at every price scale.
+    """
+    if v is None or not math.isfinite(v):
+        return None
+    if v == 0.0:
+        return 0.0
+    from math import floor, log10
+    return round(v, -int(floor(log10(abs(v)))) + (sig - 1))
 
 
 def _round(v: float | None, ndigits: int = 2) -> float | None:

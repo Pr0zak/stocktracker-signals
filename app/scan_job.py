@@ -434,12 +434,21 @@ async def backfill_memory(symbols: list[str], *, every: int = 3, rng: str = "2y"
             # Start at 60 so SMA50/RSI are warm; stop 21 bars from the end so only rows that can
             # actually be scored get written.
             for i in range(60, len(s.closes) - 21, max(1, every)):
+                # highs/lows are sliced alongside the closes, not dropped. summarize()'s
+                # stochastic_k is Pine's ta.stoch over the window's bar extremes and returns None
+                # without them, so a truncated Series that omitted them would write NULL into the
+                # same memory column live rows fill — splitting the recorded population by origin
+                # rather than by anything about the setup. Guarded on length because a Webull-sourced
+                # series carries closes with no extremes at all.
+                aligned_bars = len(s.highs) == len(s.closes) and len(s.lows) == len(s.closes)
                 sub = Series(
                     symbol=s.symbol, closes=s.closes[:i + 1], opens=s.opens[:i + 1],
                     volumes=s.volumes[:i + 1], dates=s.dates[:i + 1],
                     fifty_two_high=max(s.closes[max(0, i - 252):i + 1]),
                     fifty_two_low=min(s.closes[max(0, i - 252):i + 1]),
                     currency=s.currency,
+                    highs=s.highs[:i + 1] if aligned_bars else [],
+                    lows=s.lows[:i + 1] if aligned_bars else [],
                 )
                 bc = None
                 if bench and not crypto:
