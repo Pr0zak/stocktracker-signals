@@ -15,9 +15,15 @@ import datetime as dt
 import time
 from datetime import date
 
+import logging
+
 import httpx
 
 from . import settings_store
+from .news import RATE
+
+_WAIT = 20.0  # an on-demand route; it waits briefly for a slot, then reports absence
+log = logging.getLogger("signals.insider")
 
 _BASE = "https://finnhub.io/api/v1"
 _cache: dict[str, tuple[float, dict | None]] = {}
@@ -44,6 +50,14 @@ async def insider_buying(client: httpx.AsyncClient, symbol: str) -> dict | None:
     hit = _cache.get(sym)
     if hit and time.time() - hit[0] < _TTL:
         return hit[1]
+
+    # The Finnhub budget belongs to the KEY, not to a call site (NEWS-7). smartmoney.sweep() fans
+    # this out over the whole watchlist, so leaving it unmetered would let it blow the same 60/min
+    # limit the news paths were just taught to respect. A refusal is NOT cached: caching it would
+    # freeze "we could not look" for the full TTL and render it as "nobody is buying".
+    if not await RATE.acquire(_WAIT):
+        log.warning("insider: %s skipped — Finnhub rate budget exhausted", sym)
+        return None
 
     out: dict | None = None
     try:

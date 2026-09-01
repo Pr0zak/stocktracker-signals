@@ -33,6 +33,8 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from . import settings_store
+from .news import RATE
+from .redact import http_error
 
 log = logging.getLogger("signals.macro")
 
@@ -64,12 +66,18 @@ async def fetch_general(client: httpx.AsyncClient, *, limit: int = 100) -> list[
     key = settings_store.get().get("finnhub_api_key", "")
     if not key:
         return []
+    if not await RATE.acquire(30.0):
+        log.warning("macro: general news fetch skipped — Finnhub rate budget exhausted")
+        return []
     try:
         r = await client.get(f"{_BASE}/news", params={"category": "general", "token": key}, timeout=20)
         r.raise_for_status()
         raw = r.json()
-    except Exception:  # noqa: BLE001 — the caller decides what a failed pull means; see run_macro
-        log.warning("macro: general news fetch failed", exc_info=True)
+    except Exception as e:  # noqa: BLE001 — the caller decides what a failed pull means; see run_macro
+        # NOT exc_info=True. The traceback's last line is httpx's message, which is the whole request
+        # URL, and the Finnhub key is a query parameter in it (SEC-1). redact.http_error keeps the
+        # status and the path, which is the part worth reading anyway.
+        log.warning("macro: general news fetch failed (%s)", http_error(e))
         return []
     if not isinstance(raw, list):
         return []

@@ -555,13 +555,18 @@ Russell 2000) with % change, the VIX level + change, the SPDR sectors split into
 market-wide top movers, the user's WATCHLIST movers, and `catalysts_today` — a list of the user's \
 tickers reporting earnings (or other dated events) today.
 
+`catalysts_complete` says whether the earnings calendar was actually READ this morning. When it is \
+false, `catalysts_today` is UNKNOWN rather than empty — say nothing about who reports, and do not \
+write that there are no catalysts; a `catalysts_note` explains why. When it is true, an empty \
+`catalysts_today` genuinely means nobody on the watchlist reports today.
+
 Return a structured brief:
 - title: the notification TITLE — a punchy morning headline UNDER ~8 words, leading with the tape's tone \
 or the single most notable item (e.g. "Futures soft; NVDA reports today").
 - body: 2 to 3 SHORT sentences, UNDER ~55 words total, in this priority order: (1) the tape — indices + \
 VIX in one line; (2) the 1-2 most notable moves in the user's OWN watchlist, by name; (3) any \
-`catalysts_today` — name who reports today (this is the highest-value line when present). Skip a bucket \
-if there's nothing worth saying; never pad.
+`catalysts_today` — name who reports today (this is the highest-value line when present), but ONLY if \
+`catalysts_complete` is true. Skip a bucket if there's nothing worth saying; never pad.
 - tone: exactly one of "risk-on", "risk-off", or "mixed", grounded in indices AND the VIX.
 Ground EVERY claim in the snapshot numbers — never invent news, price levels, or catalysts not in \
 `catalysts_today`. In PRE phase, treat moves as thin-volume futures/pre-market. Plain text, no markdown, \
