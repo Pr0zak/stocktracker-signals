@@ -133,3 +133,30 @@ def annotate(payload: dict, price) -> dict:
         "chase_warning": r.warning,
         "chase_price": _num(price),
     }
+
+
+def annotate_pick(pick: dict, price) -> dict:
+    """A copy of one /recommendations pick with the chase read attached, in place on the pick.
+
+    Same four keys and the same always-present contract as `annotate`, differing only in where the
+    entry zone is read from: a pick carries `entry_low`/`entry_high` on itself, where a /plan payload
+    nests them under `plan`.
+    """
+    r = read(price, pick.get("entry_low"), pick.get("entry_high"))
+    pick["chase_pct"] = r.pct
+    pick["chase_status"] = r.status
+    pick["chase_warning"] = r.warning
+    pick["chase_price"] = _num(price)
+    return pick
+
+
+def annotate_picks(picks: list[dict], prices: dict) -> list[dict]:
+    """Annotate each pick with ITS OWN symbol's live price (SWT-15).
+
+    One /recommendations call ranks many symbols, so the price lookup is per-pick. A symbol missing
+    from `prices` is annotated with None — which the app renders as no chase line at all, rather than
+    as a comfortable 0%. `prices` is keyed by UPPERCASE symbol.
+    """
+    for p in picks:
+        annotate_pick(p, prices.get(str(p.get("symbol") or "").strip().upper()))
+    return picks

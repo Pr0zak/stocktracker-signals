@@ -274,6 +274,29 @@ async def _chase_price(symbol: str) -> float | None:
     return market_now.session_price(quotes.get(symbol.upper()) or {})
 
 
+async def _chase_prices(symbols: list[str]) -> dict[str, float | None]:
+    """Session prices for many symbols in ONE batched quote, for /recommendations (SWT-15).
+
+    The per-symbol `_chase_price` would be one Yahoo round trip per pick. Same rule as there: a
+    symbol whose price could not be read is absent from the result, and the caller must let it stay
+    absent — a chase read against a price we could not fetch is not a read.
+    """
+    assert _http is not None
+    syms = sorted({s.strip().upper() for s in symbols if s and s.strip()})
+    if not syms:
+        return {}
+    try:
+        quotes = await market_now.fetch_quotes(_http, syms)
+    except Exception:  # noqa: BLE001 — a missing quote costs the chase read, never the picks
+        return {}
+    out: dict[str, float | None] = {}
+    for s in syms:
+        px = market_now.session_price(quotes.get(s) or {})
+        if px is not None:
+            out[s] = px
+    return out
+
+
 async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | None = None) -> dict:
     """Fetch + summarize one asset's daily technicals (plus news/earnings for stocks). Pass
     `bench_closes` to reuse an already-fetched S&P series (batch callers); stocks fetch it otherwise."""
@@ -2130,7 +2153,15 @@ async def recommendations(req: RecommendRequest) -> dict:
     now = time.time()
     hit = _cache.get(key)
     if hit and now - hit[0] < cfg["verdict_ttl_seconds"]:
-        return {**hit[1], "cached": True}
+        # The chase read is recomputed on the way out and deliberately NOT stored in the cache entry,
+        # exactly as /plan does it. The ranking is a judgement that keeps for the TTL; "am I paying up
+        # right now?" is not, and serving an hour-old chase percentage as current would be worse than
+        # serving none.
+        cached = {**hit[1], "cached": True}
+        picks = [dict(p) for p in (cached.get("picks") or [])]
+        cached["picks"] = chase.annotate_picks(
+            picks, await _chase_prices([p.get("symbol") or "" for p in picks]))
+        return cached
 
     bench: list[float] | None = None
     if stocks or discovered:  # fetch the S&P once for all equity snapshots
@@ -2190,7 +2221,10 @@ async def recommendations(req: RecommendRequest) -> dict:
         "overview": recs.overview,
         # Per-pick lookup: one /recommendations call ranks many symbols, and annotating a plan with
         # a neighbour's volatility would be worse than not annotating it at all.
-        "picks": plan_check.annotate_picks([p.model_dump() for p in recs.picks], snaps),
+        "picks": chase.annotate_picks(
+            plan_check.annotate_picks([p.model_dump() for p in recs.picks], snaps),
+            await _chase_prices([p.symbol for p in recs.picks]),
+        ),
         "passed": recs.passed,
         "usage": usage,
         "cached": False,
