@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from . import market_calendar, options
+from .redact import redact
 
 _ET = ZoneInfo("America/New_York")
 
@@ -77,7 +78,7 @@ async def fetch_quotes(client: httpx.AsyncClient, symbols: list[str]) -> dict[st
         except Exception as e:  # noqa: BLE001 — fail over to the next host
             last_err = e
     if data is None:
-        raise RuntimeError(f"Yahoo quote fetch failed: {last_err}")
+        raise RuntimeError(f"Yahoo quote fetch failed: {redact(last_err)}")
     out: dict[str, dict] = {}
     for q in (data.get("quoteResponse") or {}).get("result") or []:
         sym = (q.get("symbol") or "").upper()

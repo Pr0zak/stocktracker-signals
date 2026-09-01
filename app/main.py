@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from . import observability, selfupdate, settings_store, usage_store
+from . import observability, redact, selfupdate, settings_store, usage_store
 from . import chase, congress, cycle, fundamentals, insider, market_now, options, seasonality, shorts, webull
 from . import dashboard, gaps, gate, market_calendar, market_scan_job, memory, percentiles, plan_check, plan_replay, rebalance_check, heatmap, sandbox_job, sandbox_store, scan_store, screener, smartmoney, universe, valuetrap
 from .analyst import (
@@ -35,7 +35,7 @@ from .analyst import (
 )
 from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
-from .news import fetch_context, fetch_dated_news
+from .news import earnings_on, fetch_context, fetch_dated_news, fetch_next_earnings
 from . import macro, scan_job, sectors
 from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
@@ -49,12 +49,19 @@ _MARKET_NOW_TTL = 180  # market-now overview cached ~3 min so repeated taps don'
 # into an hour of confidently wrong "no news".
 _NEWS_FAIL_TTL_OFFSET = 3600 - 60
 _DAILY_BRIEF_TTL = 1800  # morning brief cached ~30 min — the app fires it once/day; this just guards retries
+# ...unless its catalysts came back unknown, in which case it is held just long enough to coalesce a
+# burst of retries rather than to settle the question for the morning.
+_BRIEF_INCOMPLETE_TTL = 300
 _log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _http
+    # SEC-1, and it goes FIRST: every log line emitted from here on is scrubbed of secret-bearing
+    # query parameters. uvicorn has finished configuring logging by the time lifespan runs, so this
+    # sees the handlers records will actually reach.
+    redact.install_log_filter()
     _http = httpx.AsyncClient()
     try:
         memory.seed_research()  # idempotent by slug; safe on every restart
@@ -271,7 +278,7 @@ async def _snapshot(symbol: str, *, crypto: bool, bench_closes: list[float] | No
     try:
         series = await fetch_series(_http, symbol)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
+        raise HTTPException(status_code=502, detail=f"data fetch failed: {redact.redact(e)}")
     if len(series.closes) < 30:
         raise HTTPException(status_code=422, detail="not enough history for a signal")
 
@@ -371,7 +378,7 @@ async def _build_signal(
     try:
         verdict, usage = await analyze(summary, deep=deep)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+        raise HTTPException(status_code=502, detail=f"analyst failed: {redact.redact(e)}")
     usage_store.record(usage, symbol=summary.get("symbol", symbol.upper()), kind="deep" if deep else "signal")
     memory.record_verdict(
         symbol=summary.get("symbol", symbol.upper()), summary=summary, verdict=verdict.model_dump(),
@@ -437,7 +444,7 @@ async def shorts_endpoint(symbol: str) -> dict:
     try:
         series = await fetch_series(_http, symbol)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
+        raise HTTPException(status_code=502, detail=f"data fetch failed: {redact.redact(e)}")
     sp = await shorts.short_pressure(
         _http, series.symbol, dates=series.dates, closes=series.closes, volumes=series.volumes,
     )
@@ -497,7 +504,7 @@ async def market_now_endpoint(deep: bool = False, count: int = 6) -> dict:
     try:
         snap = await market_now.build_snapshot(_http, watchlist)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"market snapshot failed: {e}")
+        raise HTTPException(status_code=502, detail=f"market snapshot failed: {redact.redact(e)}")
     # Market-wide movers are a bonus — never let them fail the overview.
     try:
         snap["market_movers"] = {
@@ -510,7 +517,7 @@ async def market_now_endpoint(deep: bool = False, count: int = 6) -> dict:
     try:
         ov, usage = await market_overview(snap, deep=deep)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+        raise HTTPException(status_code=502, detail=f"analyst failed: {redact.redact(e)}")
     usage_store.record(usage, symbol="", kind="market_now")
 
     # `overview` stays a (now grouped, multi-line) string so existing app builds render it prettier
@@ -597,7 +604,7 @@ async def regime_endpoint(deep: bool = False, count: int = 6) -> dict:
     try:
         snap = await market_now.build_snapshot(_http, watchlist)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"market snapshot failed: {e}")
+        raise HTTPException(status_code=502, detail=f"market snapshot failed: {redact.redact(e)}")
 
     # The S&P's structural trend — what makes this a "regime" read rather than a snapshot. 200-day SMA is
     # computed here (summarize only carries the 50-day).
@@ -622,7 +629,7 @@ async def regime_endpoint(deep: bool = False, count: int = 6) -> dict:
     try:
         reg, usage = await market_regime(snap, deep=deep)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+        raise HTTPException(status_code=502, detail=f"analyst failed: {redact.redact(e)}")
     usage_store.record(usage, symbol="", kind="regime")
 
     payload = {
@@ -656,7 +663,7 @@ async def daily_brief_endpoint(deep: bool = False, count: int = 6) -> dict:
     try:
         snap = await market_now.build_snapshot(_http, watchlist)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"market snapshot failed: {e}")
+        raise HTTPException(status_code=502, detail=f"market snapshot failed: {redact.redact(e)}")
     try:
         snap["market_movers"] = {
             "gainers": await _movers_side("day_gainers", count),
@@ -665,35 +672,38 @@ async def daily_brief_endpoint(deep: bool = False, count: int = 6) -> dict:
     except Exception as e:  # noqa: BLE001
         _log.warning("daily_brief movers failed: %s", e)
 
-    # Today's catalysts: which of the user's (equity) names report earnings today, in ET. Best-effort —
-    # a Finnhub hiccup just drops the catalysts line, it never fails the brief.
+    # Today's catalysts: which of the user's (equity) names report earnings today, in ET.
+    #
+    # NEWS-7. This used to call news.fetch_context() once per equity, and that helper makes TWO
+    # Finnhub requests of which this reads one — 100 requests inside a second for a 50-name
+    # watchlist, against a 60-a-minute free tier. About forty of them were refused with HTTP 429
+    # every trading day, and because the per-symbol failure was swallowed and returned None, a name
+    # whose lookup was refused was indistinguishable from a name that is not reporting. The brief
+    # then narrated "no catalysts today" over an answer drawn from roughly 40% of the watchlist.
+    #
+    # One market-wide call for today's date answers the whole list, and it either succeeds or says
+    # it did not.
     from datetime import datetime
     from zoneinfo import ZoneInfo
     today_et = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     equities = [s for s in (cfg.get("watchlist") or []) if not s.upper().endswith("-USD")]
-    _earn_sem = asyncio.Semaphore(8)
-
-    async def _reports_today(s: str) -> str | None:
-        async with _earn_sem:
-            try:
-                if (await fetch_context(_http, s)).get("next_earnings") == today_et:
-                    return s.upper()
-            except Exception:  # noqa: BLE001
-                pass
-            return None
-
     try:
-        snap["catalysts_today"] = [
-            s for s in await asyncio.gather(*[_reports_today(s) for s in equities]) if s
-        ]
+        reporting, catalysts_ok = await earnings_on(_http, today_et, equities, wait=15.0)
     except Exception as e:  # noqa: BLE001
-        _log.warning("daily_brief catalysts failed: %s", e)
-        snap["catalysts_today"] = []
+        _log.warning("daily_brief catalysts failed: %s", redact.redact(e))
+        reporting, catalysts_ok = set(), False
+    snap["catalysts_today"] = sorted(reporting)
+    # Carried into the snapshot the analyst is handed, and out in the payload, so neither the model
+    # nor the client can read an empty list as a checked one.
+    snap["catalysts_complete"] = catalysts_ok
+    if not catalysts_ok:
+        snap["catalysts_note"] = ("the earnings calendar could not be read this morning, so it is "
+                                  "unknown whether any watchlist name reports today")
 
     try:
         brief, usage = await daily_brief(snap, deep=deep)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+        raise HTTPException(status_code=502, detail=f"analyst failed: {redact.redact(e)}")
     usage_store.record(usage, symbol="", kind="daily_brief")
 
     payload = {
@@ -701,13 +711,20 @@ async def daily_brief_endpoint(deep: bool = False, count: int = 6) -> dict:
         "body": brief.body,
         "tone": brief.tone,
         "catalysts_today": snap.get("catalysts_today", []),
+        # False = the calendar could not be read; an empty catalysts_today is then UNKNOWN, not "none".
+        "catalysts_complete": snap.get("catalysts_complete", False),
         "session": snap["session"],
         "model": usage["model"],
         "as_of": now,
         "usage": usage,
         "cached": False,
     }
-    _cache[key] = (now, payload)
+    # A brief whose catalysts could not be read is held only briefly, the same way a failed news
+    # lookup is (see _NEWS_FAIL_TTL_OFFSET). Freezing "we could not check" for the full half hour
+    # would mean a single rate-limit blip decides the morning, and every retry inside that window
+    # is served the same unknown without ever asking again.
+    age = 0.0 if snap.get("catalysts_complete") else (_DAILY_BRIEF_TTL - _BRIEF_INCOMPLETE_TTL)
+    _cache[key] = (now - age, payload)
     return payload
 
 
@@ -728,16 +745,28 @@ async def calendar_endpoint(symbol: str | None = None) -> dict:
         return {**hit[1], "cached": True}
     assert _http is not None
     # Finnhub next-earnings per symbol, fetched CONCURRENTLY (was a sequential await-loop → ~30s for a
-    # full watchlist). A small semaphore caps the burst so we don't trip Finnhub's 60/min rate limit.
+    # full watchlist). NEWS-7: this asks for the earnings date ALONE rather than through
+    # fetch_context(), which also fetched headlines this route discards — halving the request count
+    # for a full watchlist from 100 to 50, under the 60/min free tier. news.RATE paces what remains,
+    # so the semaphore here is only about not opening fifty sockets at once.
+    #
+    # Unlike the brief, this cannot use one market-wide call: the window is 90 days, and Finnhub
+    # truncates that at 1500 rows without saying so (see news._CALENDAR_ROW_CAP).
     _earn_sem = asyncio.Semaphore(8)
+    unchecked: list[str] = []
 
     async def _next_earnings(s: str) -> tuple[str, str | None]:
         async with _earn_sem:
             try:
-                ctx = await fetch_context(_http, s)
-                return s, ctx.get("next_earnings")
+                got = await fetch_next_earnings(_http, s, wait=15.0)
             except Exception:  # noqa: BLE001
+                unchecked.append(s.upper())
                 return s, None
+            if not got.ok:
+                # A refused lookup drops this symbol's earnings event silently otherwise, which reads
+                # on the calendar exactly like a company with nothing scheduled.
+                unchecked.append(s.upper())
+            return s, got.date
 
     earnings: dict[str, str] = {
         s: e for s, e in await asyncio.gather(*[_next_earnings(s) for s in syms]) if e
@@ -755,7 +784,9 @@ async def calendar_endpoint(symbol: str | None = None) -> dict:
             "label": "Bitcoin halving (~estimated from block schedule)", "kind": "btc_halving",
         })
         events.sort(key=lambda x: x["date"])
-    payload = {"as_of": now, "symbol": symbol.upper() if symbol else None, "events": events, "cached": False}
+    payload = {"as_of": now, "symbol": symbol.upper() if symbol else None, "events": events,
+               # Symbols whose earnings lookup FAILED. Their events are missing, not absent.
+               "earnings_unchecked": sorted(set(unchecked)), "cached": False}
     _cache[key] = (now, payload)
     return payload
 
@@ -768,7 +799,7 @@ async def cycle_endpoint(symbol: str) -> dict:
     try:
         series = await fetch_series(_http, symbol)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
+        raise HTTPException(status_code=502, detail=f"data fetch failed: {redact.redact(e)}")
     ctx = await cycle.crypto_context(_http, series.symbol, series.closes)
     if not ctx:
         raise HTTPException(status_code=404, detail="no long-term data for this symbol")
@@ -790,7 +821,7 @@ async def trend(symbol: str) -> dict:
     try:
         series = await fetch_series(_http, symbol)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
+        raise HTTPException(status_code=502, detail=f"data fetch failed: {redact.redact(e)}")
     ctx = await cycle.crypto_context(_http, series.symbol, series.closes)
     lt = ctx.get("long_term_trend")
     if not lt or "sma_200w" not in lt:
@@ -807,7 +838,7 @@ async def universe_build_endpoint() -> dict:
     try:
         blob = await universe.build(_http)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"universe build failed: {e}")
+        raise HTTPException(status_code=502, detail=f"universe build failed: {redact.redact(e)}")
     # Same decision as the nightly hook, made in one place so the two cannot drift apart — the
     # coverage guard used to live here only, leaving the unattended path unprotected.
     ok, why = universe.publish(blob, previous=universe.load())
@@ -856,7 +887,7 @@ async def sectors_endpoint(symbols: str = "") -> dict:
         # 502 rather than an empty map. An empty map is indistinguishable from "none of these could
         # be classified", which would file the caller's entire watchlist under Other and look like an
         # answer. A failure has to read as a failure.
-        raise HTTPException(status_code=502, detail=f"sector lookup failed: {e}")
+        raise HTTPException(status_code=502, detail=f"sector lookup failed: {redact.redact(e)}")
     return {"sectors": {s: {"sector": (found.get(s) or {}).get("sector"),
                             "industry": (found.get(s) or {}).get("industry")} for s in want}}
 
@@ -905,7 +936,7 @@ async def heatmap_endpoint(mode: str = "market", limit: int = 80, refresh: bool 
     try:
         quotes = await market_now.fetch_quotes(_http, syms)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"quote fetch failed: {e}")
+        raise HTTPException(status_code=502, detail=f"quote fetch failed: {redact.redact(e)}")
     phase = None
     try:
         phase = market_now.session_phase()
@@ -984,7 +1015,7 @@ async def value_screener(limit: int = 20, below_line_only: bool = True,
         try:
             syms = await screener.build_universe(_http, extra=extra)
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"universe build failed: {e}")
+            raise HTTPException(status_code=502, detail=f"universe build failed: {redact.redact(e)}")
     if not syms:
         raise HTTPException(status_code=502, detail="no candidates could be screened")
 
@@ -1028,7 +1059,7 @@ async def touches(symbol: str) -> dict:
         dates, weekly, _ = await cycle._weekly_max(_http, symbol.upper())
         spy_dates, spy_weekly = await cycle.spy_weekly(_http)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"data fetch failed: {e}")
+        raise HTTPException(status_code=502, detail=f"data fetch failed: {redact.redact(e)}")
     study = cycle.wma_touch_study(dates, weekly, spy_dates, spy_weekly)
     if study is None:
         raise HTTPException(status_code=404, detail="not enough weekly history for a 200-week touch study")
@@ -1146,7 +1177,7 @@ async def news_moves_endpoint(symbol: str, deep: bool = False, refresh: bool = F
     try:
         series = await fetch_series(_http, sym)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"price fetch failed: {e}")
+        raise HTTPException(status_code=502, detail=f"price fetch failed: {redact.redact(e)}")
 
     # Notable daily moves over the last ~15 trading days: |move| >= 3%, keep the 4 most extreme, newest
     # first. A YYYYMMDD date → YYYY-MM-DD so it lines up with the news dates.
@@ -1202,7 +1233,7 @@ async def news_moves_endpoint(symbol: str, deep: bool = False, refresh: bool = F
     try:
         nm, usage = await news_moves(sym, moves, news, deep=deep)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+        raise HTTPException(status_code=502, detail=f"analyst failed: {redact.redact(e)}")
     usage_store.record(usage, symbol=sym, kind="news_moves")
 
     payload = {"symbol": sym, "news_moves": nm.model_dump(), "model": usage["model"],
@@ -1662,7 +1693,7 @@ async def plan(
     try:
         entry, usage = await plan_entry(summary, cash=cash, deep=deep)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+        raise HTTPException(status_code=502, detail=f"analyst failed: {redact.redact(e)}")
     _sanitize_plan(entry, cash, crypto)
     usage_store.record(usage, symbol=summary.get("symbol", symbol), kind="plan")
 
@@ -1970,7 +2001,7 @@ async def portfolio_review_endpoint(req: PortfolioReviewRequest) -> dict:
     try:
         review, usage = await review_portfolio(portfolio, cash=req.cash, deep=req.deep)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+        raise HTTPException(status_code=502, detail=f"analyst failed: {redact.redact(e)}")
     usage_store.record(usage, symbol="", kind="portfolio")
     # Same rule as the rebalance path: the book is authoritative, the model is a proposal. An action
     # naming a symbol the user does not hold, or an action string outside trim/hold/add/watch,
@@ -2024,7 +2055,7 @@ async def portfolio_rebalance_endpoint(req: RebalanceRequest) -> dict:
     try:
         plan, usage = await rebalance_portfolio(portfolio, max_position_pct=mpp, deep=req.deep)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+        raise HTTPException(status_code=502, detail=f"analyst failed: {redact.redact(e)}")
     usage_store.record(usage, symbol="", kind="rebalance")
     # The plan is a PROPOSAL; the priced snapshot is authoritative. Nothing used to check that a sell
     # was of shares actually held, that the buys were affordable, that `dollars` agreed with
@@ -2121,7 +2152,7 @@ async def recommendations(req: RecommendRequest) -> dict:
     try:
         recs, usage = await recommend(snaps, cash=req.cash, deep=req.deep)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"analyst failed: {e}")
+        raise HTTPException(status_code=502, detail=f"analyst failed: {redact.redact(e)}")
     # Enforce what the prompt only asks for: actionable picks, allocations that sum within the cash.
     actionable = [p for p in recs.picks if p.action in ("buy_now", "buy_on_pullback")]
     dropped = [p.symbol for p in recs.picks if p.action not in ("buy_now", "buy_on_pullback")]
@@ -3658,7 +3689,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 liquidation=(source == "exit_date"))
         except AssertionError as e:
             _log.error("sandbox tick ABORTED (cash not conserved): %s", e)
-            raise HTTPException(status_code=500, detail=f"sandbox tick aborted (cash not conserved): {e}")
+            raise HTTPException(status_code=500, detail=f"sandbox tick aborted (cash not conserved): {redact.redact(e)}")
 
         if source == "exit_date":
             left = [p["symbol"] for p in new_blob["positions"] if float(p.get("shares") or 0) > 0]
@@ -4110,7 +4141,7 @@ async def sandbox_fill_parked_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dic
         try:
             prices = await _sandbox_prices([p["symbol"].upper() for p in blob["positions"]], syms)
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"quote fetch failed: {e}")
+            raise HTTPException(status_code=502, detail=f"quote fetch failed: {redact.redact(e)}")
 
         def price_of(sym: str):
             return prices.get(sym.upper())

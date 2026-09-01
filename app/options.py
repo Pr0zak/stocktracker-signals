@@ -33,6 +33,8 @@ from pathlib import Path
 
 import httpx
 
+from .redact import redact
+
 # A realistic desktop-browser UA — Yahoo's crumb endpoint is pickier than the chart host.
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -152,7 +154,7 @@ async def _authenticate(client: httpx.AsyncClient) -> str:
     r.raise_for_status()
     crumb = r.text.strip()
     if not crumb or "<" in crumb or len(crumb) > 40:  # HTML/empty means the cookie didn't take
-        raise RuntimeError(f"Yahoo returned no usable crumb (got {crumb!r:.60})")
+        raise RuntimeError(f"Yahoo returned no usable crumb (got {type(crumb).__name__}, length {len(crumb) if crumb else 0})")
     _crumb = crumb
     _cookies = {c.name: c.value for c in client.cookies.jar}
     return crumb
@@ -196,7 +198,7 @@ async def _get_options(client: httpx.AsyncClient, symbol: str, crumb: str, expir
             return await client.get(f"https://{host}/{path}", params=params, headers=_headers(), timeout=20)
         except Exception as e:  # noqa: BLE001 — try the next host on a transport error
             last_err = e
-    raise RuntimeError(f"Yahoo options fetch failed for {symbol}: {last_err}")
+    raise RuntimeError(f"Yahoo options fetch failed for {symbol}: {redact(last_err)}")
 
 
 def _f(v) -> float | None:

@@ -12,9 +12,15 @@ from __future__ import annotations
 
 import time
 
+import logging
+
 import httpx
 
 from . import settings_store
+from .news import RATE
+
+_WAIT = 20.0
+log = logging.getLogger("signals.fundamentals")
 
 _BASE = "https://finnhub.io/api/v1"
 _cache: dict[str, tuple[float, dict | None]] = {}
@@ -45,6 +51,11 @@ async def fetch_quality(client: httpx.AsyncClient, symbol: str) -> dict | None:
         out = {"dividend_aristocrat": True} if aristocrat else None
         _cache[sym] = (time.time(), out)
         return out
+
+    # Shares the process-wide Finnhub budget — see insider.py for why a refusal is not cached.
+    if not await RATE.acquire(_WAIT):
+        log.warning("fundamentals: %s quality skipped — Finnhub rate budget exhausted", sym)
+        return {"dividend_aristocrat": True} if aristocrat else None
 
     out: dict | None = None
     try:
@@ -121,6 +132,9 @@ async def fetch_financials(client: httpx.AsyncClient, symbol: str) -> dict | Non
     key = settings_store.get().get("finnhub_api_key", "")
     out: dict | None = None
     if key:
+        if not await RATE.acquire(_WAIT):
+            log.warning("fundamentals: %s financials skipped — Finnhub rate budget exhausted", sym)
+            return None
         try:
             r = await client.get(
                 f"{_BASE}/stock/financials-reported",
