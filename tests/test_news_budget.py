@@ -254,7 +254,9 @@ def test_a_refused_slot_sends_nothing_at_all():
         return _calendar([])
 
     async def body():
-        for _ in range(news.RATE.per_window):
+        # Exhausting the per-SECOND ceiling is enough to close the door on a caller that will not
+        # wait; filling the whole minute would just take a minute.
+        for _ in range(news._CALLS_PER_BURST):
             assert await news.RATE.acquire(0.0)
         async with _client(handler) as c:
             return await fetch_next_earnings(c, "AAPL", wait=0.0)
@@ -265,12 +267,14 @@ def test_a_refused_slot_sends_nothing_at_all():
 
 
 def test_a_fifty_name_watchlist_fits_inside_one_minute_of_budget():
-    """The /calendar path is still per-symbol. One request each, against the window, has to fit —
-    otherwise the fix has only moved the burst rather than removed it."""
+    """The /calendar path is still per-symbol. Fifty requests have to fit inside the minute —
+    otherwise the fix has only moved the burst rather than removed it. They are PACED across it
+    now, not admitted at once, which is what the per-second rule exists to enforce."""
 
     async def body():
         r = _RateLimiter()
-        return r.per_window, [await r.acquire(0.0) for _ in range(50)]
+        got = [await r.acquire(30.0) for _ in range(50)]
+        return r.per_window, got
 
     per_window, got = run(body())
     assert per_window >= 50
@@ -284,7 +288,7 @@ def test_the_limiter_is_shared_so_two_fan_outs_cannot_each_spend_the_minute():
         raise AssertionError("the shared budget was already spent")
 
     async def body():
-        for _ in range(news.RATE.per_window):
+        for _ in range(news._CALLS_PER_BURST):
             assert await news.RATE.acquire(0.0)
         async with _client(handler) as c:
             return await earnings_on(c, "2026-09-01", ["AAPL"], wait=0.0)
@@ -443,3 +447,33 @@ def test_the_nightly_scan_s_whole_watchlist_still_gets_its_news():
     run(body())
     assert len(got) == 100
     assert all(got), f"{got.count(False)} of 100 scan lookups would have been dropped"
+
+
+def test_the_minute_s_quota_may_not_be_spent_in_one_second():
+    """Found by verifying against the live service rather than by review. /calendar admitted 50
+    lookups inside one second — under the 55-per-minute cap — and exactly 20 came back 429, all
+    stamped the same second: the free tier enforces a per-second ceiling too. A window that permits
+    a whole minute's quota in one instant is not a limiter for this upstream."""
+    r = _RateLimiter()
+    assert r._rules == sorted(r._rules, key=lambda x: -x[0]), "widest rule first"
+    stamps: list[float] = []
+
+    async def body():
+        async def one():
+            if await r.acquire(30.0):
+                stamps.append(time.monotonic())
+        await asyncio.gather(*[one() for _ in range(50)])
+
+    run(body())
+    assert len(stamps) == 50, "all 50 still get through — paced, not dropped"
+    stamps.sort()
+    for i, start in enumerate(stamps):
+        in_second = sum(1 for t in stamps[i:] if t - start < news._BURST_SECONDS)
+        assert in_second <= news._CALLS_PER_BURST, f"{in_second} requests inside one second"
+
+
+def test_a_short_test_window_is_not_shackled_by_the_per_second_rule():
+    """A burst rule no tighter than the main window is meaningless and must drop out, or every
+    sub-second test window would silently inherit a 1-second ceiling."""
+    r = _RateLimiter(per_window=10, window=0.20)
+    assert r._rules == [(0.20, 10)]

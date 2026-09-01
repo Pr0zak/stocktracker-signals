@@ -48,6 +48,14 @@ _BASE = "https://finnhub.io/api/v1"
 # with anything else holding it — the app's own quote fetches included. 55 leaves that headroom.
 _WINDOW_SECONDS = 60.0
 _CALLS_PER_WINDOW = 55
+# The free tier enforces a PER-SECOND ceiling as well as the per-minute one, and only the per-minute
+# figure is the one everybody quotes. Measured on the deployed container on 2026-09-01: /calendar
+# admitted 50 lookups inside one second — comfortably under 55 in the minute — and exactly 20 of them
+# came back 429, all stamped the same second. Roughly thirty got through, which is the documented
+# per-second cap. A window that permits its whole minute's quota in one instant is therefore not a
+# limiter for this upstream; 20 leaves headroom for anything else holding the key.
+_BURST_SECONDS = 1.0
+_CALLS_PER_BURST = 20
 # What a caller with no opinion is willing to wait for a slot. Sized for the nightly scan, which
 # fans out over the whole watchlist at once and would rather take a minute than lose its context.
 # Interactive handlers pass something far shorter.
@@ -62,9 +70,15 @@ class _RateLimiter:
     window holds the guarantee that matters to the upstream: no more than N in any 60-second span.
     """
 
-    def __init__(self, per_window: int = _CALLS_PER_WINDOW, window: float = _WINDOW_SECONDS) -> None:
+    def __init__(self, per_window: int = _CALLS_PER_WINDOW, window: float = _WINDOW_SECONDS,
+                 per_burst: int = _CALLS_PER_BURST, burst: float = _BURST_SECONDS) -> None:
         self.per_window = per_window
         self.window = window
+        # Two ceilings, because the upstream has two. The burst rule is dropped when it would be no
+        # tighter than the main one, which is what a short test window wants.
+        self._rules: list[tuple[float, int]] = [(window, per_window)]
+        if burst < window and per_burst > 0:
+            self._rules.append((burst, per_burst))
         self._hits: collections.deque[float] = collections.deque()
         self._lock = asyncio.Lock()
 
@@ -85,12 +99,19 @@ class _RateLimiter:
         while True:
             async with self._lock:
                 now = time.monotonic()
-                while self._hits and now - self._hits[0] >= self.window:
+                widest = max(w for w, _ in self._rules)
+                while self._hits and now - self._hits[0] >= widest:
                     self._hits.popleft()
-                if len(self._hits) < self.per_window:
+                sleep_for = 0.0
+                for w, cap in self._rules:
+                    # Oldest-first, so index -cap is the hit that has to age out of this rule.
+                    inside = [t for t in self._hits if now - t < w]
+                    if len(inside) >= cap:
+                        sleep_for = max(sleep_for, w - (now - inside[-cap]))
+                if sleep_for <= 0.0:
                     self._hits.append(now)
                     return True
-                sleep_for = max(self.window - (now - self._hits[0]), 0.01)
+                sleep_for = max(sleep_for, 0.01)
             if time.monotonic() + sleep_for > deadline:
                 return False
             await asyncio.sleep(sleep_for)
