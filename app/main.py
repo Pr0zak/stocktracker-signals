@@ -52,6 +52,9 @@ _DAILY_BRIEF_TTL = 1800  # morning brief cached ~30 min — the app fires it onc
 # ...unless its catalysts came back unknown, in which case it is held just long enough to coalesce a
 # burst of retries rather than to settle the question for the morning.
 _BRIEF_INCOMPLETE_TTL = 300
+# How many catalyst rows /calendar returns. Generous — the payload is small and the lookups behind it
+# are now one request each — but still bounded, and the response says when it bit.
+_CALENDAR_MAX_EVENTS = 60
 _log = logging.getLogger(__name__)
 
 
@@ -784,7 +787,17 @@ async def calendar_endpoint(symbol: str | None = None) -> dict:
             "label": "Bitcoin halving (~estimated from block schedule)", "kind": "btc_halving",
         })
         events.sort(key=lambda x: x["date"])
-    payload = {"as_of": now, "symbol": symbol.upper() if symbol else None, "events": events,
+    # CAL-1. The row cap lives here, applied AFTER the halving joins the list, and it reports itself.
+    # It used to sit inside shorts.calendar() at `events[:30]`, where nothing downstream could tell a
+    # short calendar from a truncated one — and the halving was appended after the slice, so the
+    # payload quietly carried 31 of a capped 30.
+    total = len(events)
+    shown = events[:_CALENDAR_MAX_EVENTS]
+    payload = {"as_of": now, "symbol": symbol.upper() if symbol else None, "events": shown,
+               # Present whether or not anything was cut, so a client never has to infer completeness
+               # from a length it would have to know the cap to interpret.
+               "events_total": total,
+               "truncated_after": shown[-1]["date"] if total > len(shown) else None,
                # Symbols whose earnings lookup FAILED. Their events are missing, not absent.
                "earnings_unchecked": sorted(set(unchecked)), "cached": False}
     _cache[key] = (now, payload)

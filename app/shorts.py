@@ -309,9 +309,23 @@ def _add_business_days(d: date, n: int) -> date:
     return d
 
 
-async def calendar(client: httpx.AsyncClient, symbols: list[str], earnings: dict[str, str] | None = None) -> list[dict]:
+async def calendar(client: httpx.AsyncClient, symbols: list[str], earnings: dict[str, str] | None = None,
+                   *, horizon_days: int = 120) -> list[dict]:
     """Watchlist-wide catalyst calendar: global dates once (SI settlement/publication, OPEX) plus
-    per-symbol speculative T+35 echoes and known earnings dates. Sorted soonest-first."""
+    per-symbol speculative T+35 echoes and known earnings dates. Sorted soonest-first.
+
+    Returns EVERY event inside `horizon_days`. This used to end at `events[:30]`, a row cap applied
+    with no marker, so the app rendered a calendar that simply stopped — measured on the real
+    watchlist on 2026-09-01, the last earnings shown was GOOGL on 10-27 while AAPL (10-28), XOM
+    (10-29) and Berkshire (10-30) were all successfully looked up and then silently dropped by the
+    slice. A caller that wants to show a fixed number of rows should cap them itself AND say that it
+    did; that decision does not belong in the layer that gathers the data, which is the only place
+    that still knows how many there were.
+
+    The horizon is a real bound rather than a row count: the earnings lookup reaches ~90 days out and
+    the T+35 echoes ~60, so 120 days holds everything either can produce without the list running on
+    forever if a source ever returns a far-future date.
+    """
     events: list[dict] = [{**e, "symbol": None} for e in upcoming_dates(None)]
     today = date.today()
     for sym in symbols:
@@ -331,7 +345,8 @@ async def calendar(client: httpx.AsyncClient, symbols: list[str], earnings: dict
         if e:
             events.append({"date": e, "symbol": sym, "label": "Earnings", "kind": "earnings"})
     events.sort(key=lambda x: x["date"])
-    return events[:30]
+    horizon = (today + timedelta(days=horizon_days)).isoformat()
+    return [e for e in events if e["date"] <= horizon]
 
 
 def upcoming_dates(ftd_spikes: list[str] | None = None) -> list[dict]:
