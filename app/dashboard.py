@@ -28,17 +28,43 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>StockTracker Signals</title>
 <style>
-  :root { color-scheme: light dark; --accent:#2563eb; --ok:#16a34a; --err:#dc2626; --warn:#d97706;
-          --muted:#8a8a8a; --line:#8883; --card:rgba(127,127,127,.05); --radius:.85rem; }
+  /* Colour roles, mobile-first spacing, one breakpoint. Two of the old values were failing contrast
+     outright and most of this page's actual information is rendered in them:
+       --muted #8a8a8a is 3.5:1 on white — under the 4.5:1 floor — and it carries every hint, table
+         header, stat label and log row, i.e. most of the words on the page.
+       --accent #2563eb is ~3.4:1 against a dark ground and is used as TEXT (the selected tab, the
+         headline figures on the usage and cost cards), so dark mode was the failing case.
+     The replacements are 6.0:1 / 5.9:1 and 6.9:1 / 7.4:1 against their own grounds. Names are kept
+     so the ~40 existing references inherit the fix with no call-site edits. */
+  :root {
+    color-scheme: light dark;
+    --accent:#1d4ed8; --ok:#0f7a34; --err:#c02626; --warn:#96590d;
+    --muted:#5b6270; --line:#d9dce3; --card:#ffffff; --bg:#f6f7f9; --ink:#16181d;
+    --radius:.85rem;
+    /* Spacing and density scale with the viewport rather than being fixed at desktop values. */
+    --pad:.8rem; --gap:.7rem; --card-pad:.85rem .9rem; --cell-pad:.34rem .45rem;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --accent:#7ea6ff; --ok:#4cc172; --err:#ff6f6f; --warn:#e0a63f;
+            --muted:#9aa2b1; --line:#2a2f38; --card:#171a20; --bg:#101216; --ink:#e7eaf0; }
+  }
+  @media (min-width: 46rem) {
+    :root { --pad:1rem; --gap:1rem; --card-pad:1rem 1.1rem; --cell-pad:.42rem .6rem; }
+  }
   * { box-sizing: border-box; }
+  /* The header is sticky, so any anchor jump — every tab switch writes a #hash — lands the target
+     UNDER it. Without this the first card's stat labels sit behind the tab bar, which is exactly
+     where "Last scan" was hiding. 8rem clears the title, subtitle and tabs at phone widths, where
+     the header is tallest because the tab strip wraps closest to the text above it. */
+  html { scroll-padding-top: 8rem; }
   body { font-family: system-ui, -apple-system, sans-serif; margin: 0; line-height: 1.5;
-         background: Canvas; color: CanvasText; }
-  .wrap { max-width: 82rem; margin: 0 auto; padding: 0 1rem 3rem; }
+         background: var(--bg); color: var(--ink); }
+  .wrap { max-width: 82rem; margin: 0 auto; padding: 0 var(--pad) 3rem; }
 
   /* header + tabs: sticky, so switching views never needs a scroll back up */
-  header { position: sticky; top: 0; z-index: 20; background: Canvas;
+  header { position: sticky; top: 0; z-index: 20; background: var(--bg);
            border-bottom: 1px solid var(--line); }
-  .head-in { max-width: 82rem; margin: 0 auto; padding: .9rem 1rem .1rem; }
+  .head-in { max-width: 82rem; margin: 0 auto; padding: .9rem var(--pad) .1rem; }
   h1 { font-size: 1.15rem; margin: 0; letter-spacing: -.01em; }
   .sub { color: var(--muted); margin: .1rem 0 .7rem; font-size: .82rem; }
   .tabs { display: flex; gap: .15rem; overflow-x: auto; scrollbar-width: none; }
@@ -51,11 +77,20 @@ PAGE = """<!doctype html>
   .panel[hidden] { display: none; }
 
   /* a real grid — explicit order, predictable wrapping */
-  .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr));
+  /* `min(24rem, 100%)` rather than a bare 24rem. auto-fit honours the minimum literally, so a hard
+     24rem (384px) floor against a phone's ~379px content box makes the COLUMN wider than the screen
+     and the whole page scrolls sideways — measured on a 411dp viewport, where it pushed the arms
+     scoreboard's equity and return columns off the right edge entirely. Wrapping the minimum in
+     min(..., 100%) lets the track collapse to the viewport when there is not room for the ideal. */
+  .grid { display: grid; gap: var(--gap); grid-template-columns: repeat(auto-fit, minmax(min(24rem, 100%), 1fr));
           align-items: start; margin-top: 1rem; }
   .grid.one { grid-template-columns: 1fr; }
   .span2 { grid-column: 1 / -1; }
-  .card { border: 1px solid var(--line); border-radius: var(--radius); padding: 1rem 1.1rem;
+  /* min-width:0 is load-bearing, not defensive. A grid item defaults to `min-width:auto`, which means
+     it refuses to shrink below its content's intrinsic width — so a wide table inside a card made the
+     CARD wide, and the `.scroll { overflow-x:auto }` wrapper around every table never engaged. The
+     wrappers were correct all along and could not fire. */
+  .card { min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); padding: var(--card-pad);
           background: var(--card); }
   .card h2 { font-size: .95rem; margin: 0 0 .8rem; display: flex; align-items: baseline;
              gap: .5rem; flex-wrap: wrap; }
@@ -121,8 +156,41 @@ PAGE = """<!doctype html>
 
   .scroll { overflow-x: auto; margin: .3rem -.2rem 0; }
   table.tbl { width: 100%; border-collapse: collapse; font-size: .82rem; }
-  table.tbl th, table.tbl td { text-align: left; padding: .32rem .45rem; border-bottom: 1px solid #8882;
+  /* `white-space: nowrap` is the third cause of the sideways scroll, and the one that survived the
+     grid fixes. It makes every cell contribute its full unwrapped width to the table's min-content
+     size, so a nine-column scoreboard is ~1200px wide no matter how narrow its container gets — the
+     `.scroll` wrapper then hands the reader a swipe to reach the equity and return columns, which on
+     the tab where those numbers ARE the content is not a fix. It stays at width, where the table is
+     genuinely the right shape and wrapping would only make it ragged; below the breakpoint the cells
+     wrap and the label column pins so the arm's name stays on screen while the numbers scroll. */
+  table.tbl th, table.tbl td { text-align: left; padding: var(--cell-pad); border-bottom: 1px solid var(--line);
                                white-space: nowrap; }
+  @media (max-width: 46rem) {
+    /* Tables that stay tabular pin their label column, so the row you are reading stays identified
+       while the numbers scroll under your thumb. Letting the cells WRAP instead was tried and is
+       worse than the swipe: nine columns squeezed into 411dp broke "$11,428" across four lines as
+       "$1 / 1, / 42 / 8". A table too wide for the screen needs fewer columns, not narrower ones. */
+    table.tbl:not(.stack) th:first-child, table.tbl:not(.stack) td:first-child {
+      position: sticky; left: 0; z-index: 1; background: var(--card); box-shadow: 1px 0 0 var(--line); }
+    table.tbl td.thesis { max-width: min(15rem, 42vw); }
+
+    /* ...and the scoreboard, where the numbers ARE the content, stops being a table altogether and
+       becomes one card per arm. Every field stays visible — this hides nothing, it re-flows the same
+       nine cells down the screen instead of across it — and the header row is dropped because each
+       cell now carries its own label from `data-l`. */
+    table.tbl.stack, table.tbl.stack tbody, table.tbl.stack tr, table.tbl.stack td { display: block; width: auto; }
+    table.tbl.stack thead { display: none; }
+    table.tbl.stack tr { border: 1px solid var(--line); border-radius: var(--radius);
+                         padding: .55rem .7rem; margin: 0 0 .55rem; background: var(--card); }
+    table.tbl.stack tr.sel { outline: 2px solid var(--accent); outline-offset: -2px; }
+    table.tbl.stack td { border: 0; padding: .16rem 0; display: flex; align-items: baseline;
+                         justify-content: space-between; gap: 1rem; white-space: normal; }
+    table.tbl.stack td::before { content: attr(data-l); color: var(--muted); font-size: .68rem;
+                                 font-weight: 600; text-transform: uppercase; letter-spacing: .02em; flex: none; }
+    table.tbl.stack td:first-child { display: block; padding-bottom: .35rem; }
+    table.tbl.stack td:first-child::before, table.tbl.stack td:empty::before { content: none; }
+    table.tbl.stack td[colspan] { display: block; text-align: center; }
+  }
   table.tbl th { color: var(--muted); font-weight: 600; font-size: .68rem; text-transform: uppercase; }
   table.tbl td.num { text-align: right; font-variant-numeric: tabular-nums; }
   table.tbl td.thesis { max-width: 15rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -253,7 +321,7 @@ PAGE = """<!doctype html>
         arm's own S&amp;P shadow — raw equity is not comparable when arms are funded with different
         amounts on different days.
       </p>
-      <div class="scroll"><table class="tbl" id="arms-tbl">
+      <div class="scroll"><table class="tbl stack" id="arms-tbl">
         <thead><tr>
           <th>Arm</th><th>Engine</th><th>Model</th><th class="num">Equity</th><th class="num">Cash</th>
           <th class="num">Return</th><th class="num">vs S&amp;P</th><th>State</th><th></th>
@@ -514,7 +582,12 @@ PAGE = """<!doctype html>
     try { renderSynced((await (await fetch("/api/settings")).json()).watchlist_synced_at); } catch (e) {}
   }
 
-  const fmt = (n) => Number(n).toLocaleString();
+  // Counts, with absence preserved. `Number(n).toLocaleString()` renders null as "0" and undefined
+  // as "NaN" — the identical substitution money() was just fixed for, sitting one line away and
+  // formatting every token and call count on the page. A token count nobody measured must not
+  // render as a confident zero.
+  const fmt = (n) => (n === null || n === undefined || !isFinite(Number(n)))
+    ? "\u2014" : Number(n).toLocaleString();
   function drawUsageChart(series) {
     const box = $("usage-chart");
     const W = 520, H = 130, padL = 6, padT = 8, padB = 18;
@@ -524,7 +597,7 @@ PAGE = """<!doctype html>
     const bars = series.map((d, i) => {
       const h = (d.tokens / max) * (H - padT - padB);
       const x = padL + i * bw, y = H - padB - h;
-      const t = d.date + ": " + fmt(d.tokens) + " tokens · $" + d.cost_usd.toFixed(4) +
+      const t = d.date + ": " + fmt(d.tokens) + " tokens · " + money(d.cost_usd) +
         " · " + d.calls + " call" + (d.calls === 1 ? "" : "s");
       return '<rect class="bar' + (d.tokens ? '' : ' zero') + '" x="' + x.toFixed(1) +
         '" y="' + y.toFixed(1) + '" width="' + Math.max(1, bw - 1.5).toFixed(1) +
@@ -542,14 +615,14 @@ PAGE = """<!doctype html>
       const bp = u.by_provider || {};
       const billed = (bp.api && bp.api.cost_usd) || 0;
       const notional = (bp.cli && bp.cli.cost_usd) || 0;
-      let cost = "<b>$" + billed.toFixed(4) + "</b> billed";
-      if (notional > 0) cost += ' · <span class="hint">$' + notional.toFixed(4) + " notional (subscription)</span>";
+      let cost = "<b>" + money(billed) + "</b> billed";
+      if (notional > 0) cost += ' · <span class="hint">' + money(notional) + " notional (subscription)</span>";
       $("usage-totals").innerHTML = "<b>" + fmt(u.total_tokens) + "</b> tokens · " + cost + " · " +
         fmt(u.total_calls) + " calls" +
         ' <span class="hint">(' + fmt(u.total_input_tokens) + " in / " + fmt(u.total_output_tokens) + " out, all-time)</span>";
       drawUsageChart(u.series);
       const models = Object.entries(u.by_model).sort((a, b) => b[1].cost_usd - a[1].cost_usd)
-        .map(([m, v]) => m + " — " + fmt(v.calls) + " calls · $" + v.cost_usd.toFixed(4)).join("<br>");
+        .map(([m, v]) => m + " — " + fmt(v.calls) + " calls · " + money(v.cost_usd)).join("<br>");
       $("usage-models").innerHTML = models || "No calls recorded yet.";
     } catch (e) { $("usage-totals").textContent = "usage unavailable"; }
   }
@@ -617,7 +690,24 @@ PAGE = """<!doctype html>
     while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
     return (i === 0 ? n : n.toFixed(1)) + " " + u[i];
   }
-  const money = (n) => "$" + Number(n || 0).toFixed(4);
+  // Money, at a precision that matches the magnitude — and ABSENT stays absent.
+  //
+  // This was `"$" + Number(n || 0).toFixed(4)`, which got both halves wrong. Four decimal places on
+  // every figure printed "$1.7143 billed" and "$55.5482 notional", where the extra digits are noise
+  // that makes a page of costs harder to scan, not more accurate. And `n || 0` turned null into
+  // "$0.0000" — a precise-looking zero standing in for a number nobody measured, which is the one
+  // substitution this codebase does not allow anywhere else. The cost card was showing
+  // "MTD $0.0000 · projected $0.0000" for figures that were simply absent.
+  //
+  // Sub-cent values keep their digits, because a per-call cost of $0.0134 is the whole point of
+  // showing it and rounding it to $0.01 would flatten the range the reader is comparing.
+  const money = (n) => {
+    if (n === null || n === undefined || !isFinite(Number(n))) return "—";
+    const v = Number(n);
+    if (v === 0) return "$0";
+    const abs = Math.abs(v);
+    return "$" + v.toFixed(abs >= 1 ? 2 : abs >= 0.01 ? 3 : 4);
+  };
   const esc = (s) => { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML.replace(/"/g, "&quot;"); };
 
   let nextScanTs = null;
@@ -866,13 +956,16 @@ PAGE = """<!doctype html>
     const vs = a.vs_benchmark_pct;
     // An arm with no benchmark shadow yet has no comparable number. "—", never a confident 0.00%.
     const vsCls = vs === null || vs === undefined ? "" : (vs >= 0 ? "pos" : "neg");
+    // `data-l` is what lets the phone layout drop the header row and still label every value — see
+    // `table.tbl.stack td::before`. The labels must match the <thead> text or the two layouts would
+    // be naming the same number differently.
     tr.innerHTML =
-      '<td><b></b><div class="hint"></div></td>' +
-      '<td><span class="badge eng"></span></td>' +
-      '<td class="hint"></td>' +
-      '<td class="num"></td><td class="num"></td>' +
-      '<td class="num"></td><td class="num ' + vsCls + '"></td>' +
-      '<td></td><td></td>';
+      '<td data-l="Arm"><b></b><div class="hint"></div></td>' +
+      '<td data-l="Engine"><span class="badge eng"></span></td>' +
+      '<td data-l="Model" class="hint"></td>' +
+      '<td data-l="Equity" class="num"></td><td data-l="Cash" class="num"></td>' +
+      '<td data-l="Return" class="num"></td><td data-l="vs S&amp;P" class="num ' + vsCls + '"></td>' +
+      '<td data-l="State"></td><td></td>';
     const td = tr.children;
     td[0].querySelector("b").textContent = a.label || a.arm;
     td[0].querySelector(".hint").textContent = a.arm;
