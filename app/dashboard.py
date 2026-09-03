@@ -46,7 +46,7 @@ PAGE = """<!doctype html>
   }
   @media (prefers-color-scheme: dark) {
     :root { --accent:#7ea6ff; --ok:#4cc172; --err:#ff6f6f; --warn:#e0a63f;
-            --muted:#9aa2b1; --line:#2a2f38; --card:#171a20; --bg:#101216; --ink:#e7eaf0; }
+            --muted:#9aa2b1; --line:#333a45; --card:#1c212a; --bg:#0d0f13; --ink:#e7eaf0; }
   }
   @media (min-width: 46rem) {
     :root { --pad:1rem; --gap:1rem; --card-pad:1rem 1.1rem; --cell-pad:.42rem .6rem; }
@@ -82,8 +82,16 @@ PAGE = """<!doctype html>
      and the whole page scrolls sideways — measured on a 411dp viewport, where it pushed the arms
      scoreboard's equity and return columns off the right edge entirely. Wrapping the minimum in
      min(..., 100%) lets the track collapse to the viewport when there is not room for the ideal. */
-  .grid { display: grid; gap: var(--gap); grid-template-columns: repeat(auto-fit, minmax(min(24rem, 100%), 1fr));
+  /* TWO columns at width, never three. auto-fit fitted three 384px tracks into the 82rem wrap, and
+     the cards placed there have wildly unequal heights — a four-row Status beside a fifteen-row Cost
+     breakdown — so the third column sat empty from the first card's bottom edge to the end of the
+     page. The Scan tab was worse: `Latest scan` is `.span2`, so auto-placement could not use the
+     leftover third track at all and left a hole the full height of the card beside it. Two wider
+     columns halve the height disparity, give every table room, and leave no track that nothing can
+     be placed in. */
+  .grid { display: grid; gap: var(--gap); grid-template-columns: 1fr;
           align-items: start; margin-top: 1rem; }
+  @media (min-width: 62rem) { .grid { grid-template-columns: 1fr 1fr; } }
   .grid.one { grid-template-columns: 1fr; }
   .span2 { grid-column: 1 / -1; }
   /* min-width:0 is load-bearing, not defensive. A grid item defaults to `min-width:auto`, which means
@@ -155,6 +163,10 @@ PAGE = """<!doctype html>
   .badge.off { background: #8883; color: var(--muted); margin-left: 0; }
 
   .scroll { overflow-x: auto; margin: .3rem -.2rem 0; }
+  /* A long table is a scroll region, not a reason for its card to stand three times its neighbour's
+     height. The cost breakdown is fifteen rows and was doing exactly that. */
+  .scroll.capped { max-height: 22rem; overflow-y: auto; }
+  .scroll.capped thead th { position: sticky; top: 0; background: var(--card); z-index: 1; }
   table.tbl { width: 100%; border-collapse: collapse; font-size: .82rem; }
   /* `white-space: nowrap` is the third cause of the sideways scroll, and the one that survived the
      grid fixes. It makes every cell contribute its full unwrapped width to the table's min-content
@@ -260,7 +272,7 @@ PAGE = """<!doctype html>
 <!-- ============================== OVERVIEW ============================== -->
 <section class="panel" id="p-overview">
   <div class="grid">
-    <div class="card" id="status-card">
+    <div class="card span2" id="status-card">
       <h2>Status <span class="hint" id="uptime"></span></h2>
       <div class="stat-grid">
         <div class="stat"><div class="k">Last scan</div><div class="v" id="scan-when">…</div>
@@ -287,14 +299,14 @@ PAGE = """<!doctype html>
       <h2>AI usage <span class="hint">last 30 days</span></h2>
       <div id="usage-totals" class="usage-totals">loading…</div>
       <div id="usage-chart"></div>
-      <div class="hint">Hover a bar for that day's detail.</div>
+      <div class="hint" id="usage-readout">&nbsp;</div>
       <div id="usage-models" class="hint"></div>
     </div>
 
     <div class="card">
       <h2>Cost breakdown</h2>
       <div class="cost-head" id="cost-head">loading…</div>
-      <div class="scroll"><table class="tbl" id="cost-tbl">
+      <div class="scroll capped"><table class="tbl" id="cost-tbl">
         <thead><tr><th>Kind</th><th class="num">Calls</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead>
         <tbody id="cost-body"></tbody>
       </table></div>
@@ -918,9 +930,76 @@ PAGE = """<!doctype html>
   };
 
   load(); checkVersion(); loadUsage();
-  loadStatus(); loadScan(); loadSources(); loadCost(); loadLogs();
+  // The market gate. This card shipped as markup with no loader at all — six element ids that
+  // nothing ever wrote to, so it read "loading…" forever on a page whose whole job is telling you
+  // whether things are running. The CSS for its three leg states was already here, which is how it
+  // is clear the function was designed and simply never written.
+  //
+  // The card's own copy states the distinction this has to honour: UNDECIDED IS NOT CLOSED. A leg
+  // nobody could measure is not a bearish market, so a gate that failed to evaluate must never
+  // render in the same colour as one that evaluated and shut.
+  async function loadGate() {
+    let g;
+    try { g = await (await fetch("/gate")).json(); }
+    catch (e) {
+      $("gate-state").className = "banner unknown";
+      $("gate-state").textContent = "gate unavailable — could not be read";
+      $("gate-body").innerHTML = '<tr><td colspan="4" class="empty">gate unavailable</td></tr>';
+      $("gate-age").textContent = ""; $("gate-failing").textContent = "";
+      $("gate-unmeasured").textContent = ""; $("gate-note").textContent = "";
+      return;
+    }
+    const legs = g.legs || [], failing = g.failing || [], unmeasured = g.unmeasured || [];
+    const score = g.market_score;
+
+    $("gate-age").textContent = g.evaluated_at ? "· " + agoText(g.evaluated_at) : "";
+
+    const b = $("gate-state");
+    if (g.available === false) {
+      b.className = "banner unknown";
+      b.textContent = "Gate could not be evaluated";
+    } else if (g.passed === true) {
+      b.className = "banner ok";
+      b.textContent = "Gate OPEN — all measured legs pass";
+    } else if (failing.length) {
+      b.className = "banner err";
+      b.textContent = "Gate CLOSED — " + failing.length + " leg" + (failing.length > 1 ? "s" : "") + " failing";
+    } else {
+      // Nothing failed, so this is not a closed gate; it is a gate that could not finish.
+      b.className = "banner warn";
+      b.textContent = "Gate UNDECIDED — nothing failed, but " + unmeasured.length + " leg"
+        + (unmeasured.length === 1 ? "" : "s") + " could not be measured";
+    }
+    if (score !== null && score !== undefined) {
+      const sub = document.createElement("span");
+      sub.className = "sub2";
+      sub.textContent = "market score " + Number(score).toFixed(1) + " / 100"
+        + (g.as_of ? " · session " + g.as_of : "");
+      b.appendChild(sub);
+    }
+
+    const num = (v) => (v === null || v === undefined || !isFinite(Number(v)))
+      ? "\u2014" : Number(v).toLocaleString(undefined, {maximumFractionDigits: 2});
+    $("gate-body").innerHTML = legs.length ? legs.map((l) => {
+      // ok === null is a leg that could not be measured, and it must not look like a failure.
+      const cls = l.ok === true ? "leg-ok" : l.ok === false ? "leg-fail" : "leg-unk";
+      const mark = l.ok === true ? "pass" : l.ok === false ? "fail" : "unmeasured";
+      return '<tr><td>' + esc(l.name || l.key || "\u2014") +
+        (l.note ? '<div class="hint">' + esc(l.note) + "</div>" : "") + "</td>" +
+        '<td class="' + cls + '">' + mark + "</td>" +
+        '<td class="num">' + num(l.value) + "</td>" +
+        '<td class="num">' + num(l.threshold) + "</td></tr>";
+    }).join("") : '<tr><td colspan="4" class="empty">no legs reported</td></tr>';
+
+    $("gate-failing").textContent = failing.length ? "Failing: " + failing.join(", ") : "";
+    $("gate-unmeasured").textContent = unmeasured.length
+      ? "Unmeasured (not counted as failures): " + unmeasured.join(", ") : "";
+    $("gate-note").textContent = g.note || "";
+  }
+
+  loadStatus(); loadScan(); loadSources(); loadCost(); loadLogs(); loadGate();
   setInterval(() => { refreshSynced(); loadUsage(); loadCost(); }, 60000); // heartbeat + usage/cost
-  setInterval(() => { loadStatus(); loadScan(); loadLogs(); }, 30000);     // live ops cards
+  setInterval(() => { loadStatus(); loadScan(); loadLogs(); loadGate(); }, 30000);     // live ops cards
   setInterval(loadSources, 60000);                                          // source probes (heavier)
   setInterval(tickCountdown, 1000);                                         // next-scan countdown
 
