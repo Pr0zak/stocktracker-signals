@@ -379,6 +379,7 @@ def prefer_vehicle(
     orders: list[dict], *, preferred: str, positions: list[dict],
     price_of: Callable[[str], float | None],
     family: frozenset[str] = BTC_ETFS, label: str = "bitcoin ETF",
+    exclude: set[str] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Redirect BUYs of one interchangeable vehicle onto the user's chosen one.
 
@@ -393,31 +394,59 @@ def prefer_vehicle(
 
     * **BUYS ONLY.** A sell is never redirected — you can only sell what you actually hold, and
       rewriting "sell IBIT" into "sell FBTC" would turn a valid exit into a "not held" skip.
-    * **Consolidate, don't fragment.** If the book already holds the ordered vehicle and NOT the
-      preferred one, leave it alone. Splitting one exposure across two funds to honour a preference
-      costs spread and leaves two positions where the cap logic expects one; the preference applies
-      to NEW exposure, and takes effect naturally once the old vehicle is closed.
+    * **Consolidate, don't fragment.** New money joins the vehicle the book ALREADY HOLDS, whichever
+      of the two the order happened to name. Splitting one exposure across two funds costs spread and
+      leaves two positions where the cap logic expects one; the preference governs NEW exposure only,
+      and takes effect naturally once the old vehicle is closed.
+
+      This rule used to run on one side only, and the hole is what it was written to prevent. The
+      early-out on `sym == pref` returned before the check, so with GLD held and GLDM preferred, an
+      order naming GLD consolidated onto GLD while an order naming GLDM opened a second gold position
+      — same book, same dollars, same preference, opposite outcome, decided by nothing but which
+      ticker the model wrote. On 2026-09-02 the baseline arm took that path: it bought $260 of GLDM
+      on a stated rationale of "replacing GLD (60bp fee savings)", never sold the GLD, and ended the
+      day holding both at a blended 0.347% — with gold up from 10.6% to 12.9% of equity rather than
+      flat. The model reached the outcome `intra_group_swaps` exists to refuse, by proposing one leg
+      instead of two.
+
+      A book that is ALREADY split across both vehicles keeps its existing behaviour: new money goes
+      to the PREFERRED one, so the split heals over time without anyone having to sell anything.
     * **Only to something fillable.** If the preferred ETF has no price this tick it cannot fill, so
       the order is left as-is rather than converted into a guaranteed skip.
     * **Say so.** Every substitution returns a note, which lands in the trade log — a silent symbol
       rewrite would make the log disagree with what the model actually proposed.
+    * **Never route onto an excluded ticker.** An exclusion is an explicit instruction and outranks
+      consolidation, which is only a default. "Stop adding to GLD" plus "prefer GLDM" is exactly how a
+      user asks to migrate off a fund without selling it, and without this the two settings would
+      combine into "no gold buys at all": the GLDM order would consolidate onto the held GLD and then
+      be skipped as an excluded ticker, under a symbol the model never named, until the GLD position
+      happened to close.
     """
     pref = (preferred or "").strip().upper()
-    if not pref or pref not in family:
-        return list(orders), []
+    if pref not in family:
+        pref = ""   # no usable preference; the consolidate rule below still applies
+    banned = {str(x).upper() for x in (exclude or set())}
+    if pref in banned:
+        pref = ""
     held = {str(p.get("symbol", "")).upper() for p in positions if (p.get("shares") or 0) > 0}
+    # An excluded incumbent is not a consolidation target. It is still HELD — nothing here sells it —
+    # but new money must not be routed into a fund the user has said to stop buying.
+    held_family = frozenset(f for f in family if f in held and f not in banned)
     out: list[dict] = []
     notes: list[str] = []
     for o in orders:
         sym = str(o.get("symbol") or "").strip().upper()
         side = str(o.get("side") or "").strip().lower()
-        if side != "buy" or sym not in family or sym == pref:
+        if side != "buy" or sym not in family:
             out.append(o)
             continue
-        if sym in held and pref not in held:
+        target = _vehicle_target(sym, held_family=held_family, pref=pref)
+        if target in banned:
+            target = sym   # nothing left to route onto; leave the order to the exclusion check
+        if not target or target == sym:
             out.append(o)
             continue
-        px = price_of(pref)
+        px = price_of(target)
         if not px or px <= 0:
             out.append(o)
             continue
@@ -441,27 +470,59 @@ def prefer_vehicle(
         # would gate the new symbol against a band that has nothing to do with it — and with
         # respect_entry_zones on, would block every substituted buy forever. Drop it.
         sub = {k: v for k, v in o.items() if k not in ("entry_low", "entry_high", "shares")}
-        sub["symbol"] = pref
+        sub["symbol"] = target
         sub["dollars"] = round(dollars, 2)
+        # Two different reasons to reroute, and the log must not call one the other: honouring the
+        # preference on new exposure, versus adding to the vehicle already held.
+        why = f"preferred {label}" if target == pref and not held_family else f"already holding {target}"
         reason = str(o.get("reason") or "").strip()
-        sub["reason"] = (reason + f" [routed {sym}→{pref}: preferred {label}]").strip()
+        sub["reason"] = (reason + f" [routed {sym}→{target}: {why}]").strip()
         out.append(sub)
-        notes.append(f"{sym}→{pref} (preferred {label})")
+        notes.append(f"{sym}→{target} ({why})")
     return out, notes
+
+
+def _vehicle_target(sym: str, *, held_family: frozenset[str], pref: str) -> str:
+    """Which member of an interchangeable family a BUY of `sym` should actually land on.
+
+    Consolidation outranks preference, because a preference costs basis points a year and a second
+    position in the same exposure costs a spread now and confuses every cap that counts positions.
+
+    * Holding the preferred vehicle: everything lands there. A book already split across two funds
+      heals toward the preference this way, with no sale and no realised gain.
+    * Holding one vehicle that is not the preferred one: new money joins it, whichever of the family
+      the order named. Ordering the incumbent already did this; ordering the OTHER one is the case the
+      `sym == pref` early-out used to skip, and is how a second position got opened.
+    * Holding several, none preferred: the tie-break is alphabetical — arbitrary but stable, so a book
+      fragmented three ways at least stops fragmenting further.
+    * Holding none of the family: the preference governs, which is the one place it was ever meant to.
+    """
+    if held_family:
+        # Already fragmented across both? Feed the PREFERENCE, so the split heals over time without
+        # anyone having to sell anything. This ordering is deliberate and predates the fix: it is why
+        # holding IBIT and FBTC routes a new IBIT order onto FBTC.
+        if pref in held_family:
+            return pref
+        if sym in held_family:
+            return sym
+        # Ordering a family member the book does not hold while holding another. This is the case the
+        # early-out used to skip whenever the ordered symbol happened to be the preferred one.
+        return sorted(held_family)[0]
+    return pref or sym
 
 
 def prefer_btc_etf(
     orders: list[dict], *, preferred: str, positions: list[dict],
-    price_of: Callable[[str], float | None],
+    price_of: Callable[[str], float | None], exclude: set[str] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Spot-bitcoin vehicles. See prefer_vehicle for the rules."""
     return prefer_vehicle(orders, preferred=preferred, positions=positions, price_of=price_of,
-                          family=BTC_ETFS, label="bitcoin ETF")
+                          family=BTC_ETFS, label="bitcoin ETF", exclude=exclude)
 
 
 def prefer_gold_etf(
     orders: list[dict], *, preferred: str, positions: list[dict],
-    price_of: Callable[[str], float | None],
+    price_of: Callable[[str], float | None], exclude: set[str] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Gold-bullion vehicles. See prefer_vehicle for the rules.
 
@@ -470,7 +531,7 @@ def prefer_gold_etf(
     the only place a fee comparison belongs -- selling GLD to buy GLDM would realise a gain to save
     0.30% a year, which is the 2026-08-06 SPY->VTI trade wearing a different ticker."""
     return prefer_vehicle(orders, preferred=preferred, positions=positions, price_of=price_of,
-                          family=GOLD_ETFS, label="gold ETF")
+                          family=GOLD_ETFS, label="gold ETF", exclude=exclude)
 
 
 def intra_group_swaps(orders: list[dict], *, group_of: Callable[[str], str]) -> set[int]:
@@ -1162,11 +1223,11 @@ def validate_and_fill(
     if not liquidation:
         orders, _routed = prefer_btc_etf(
             orders, preferred=str(s.get("preferred_btc_etf") or ""),
-            positions=positions, price_of=price_of,
+            positions=positions, price_of=price_of, exclude=exclude,
         )
         orders, _routed_gold = prefer_gold_etf(
             orders, preferred=str(s.get("preferred_gold_etf") or ""),
-            positions=positions, price_of=price_of,
+            positions=positions, price_of=price_of, exclude=exclude,
         )
 
     # A sell-and-rebuy inside one exposure group is a wash: same exposure afterwards, two spreads

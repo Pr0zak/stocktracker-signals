@@ -4193,8 +4193,15 @@ async def sandbox_fill_parked_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dic
         def price_of(sym: str):
             return prices.get(sym.upper())
 
+        # `exclude` is passed for the same reason the daily tick passes it, and its absence here was
+        # a real hole: validate_and_fill reads every OTHER live setting off the blob itself — a
+        # conviction floor, a trade cap or the gate changed after an order parked all still block the
+        # sweep — but the exclusion set is the one constraint the caller has to hand in. Without it a
+        # ticker added to `exclusions` at 14:38 was still bought by the 14:40 parked sweep, which
+        # contradicts what that setting says it does: tickers the AI must never buy.
         new_blob, filled, skipped = sandbox_job.validate_and_fill(
-            blob, fresh, price_of, group_of=_exposure_group, source="parked_fill")
+            blob, fresh, price_of, group_of=_exposure_group, source="parked_fill",
+            exclude={str(x).upper() for x in (blob.get("settings", {}).get("exclusions") or [])})
         # No extension_of here: parked orders are buys by construction, and the guard only gates sells.
         pv = sandbox_job.positions_value(new_blob["positions"], price_of)
         # No NAV row: this is an intraday execution, not a valuation point. Writing one would put a

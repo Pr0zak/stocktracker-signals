@@ -102,3 +102,26 @@ def test_an_order_refused_for_a_reason_other_than_price_is_not_parked():
     assert filled == []
     assert "conviction" in skipped[0]["skip_reason"]
     assert nb["parked_orders"] == []
+
+
+def test_a_ticker_excluded_after_parking_is_not_bought_by_the_sweep():
+    """The parked sweep at main.py's /sandbox/fill_parked omitted `exclude`, alone among the three
+    validate_and_fill call sites.
+
+    validate_and_fill reads every OTHER live setting off the blob itself — a raised conviction floor,
+    a zeroed trade cap or a closed gate all block a parked fill — so exclusions was the single
+    constraint that could be added between the 14:35 tick and the 14:40 sweep and still be ignored.
+    `exclusions` is documented as the tickers the AI must never buy.
+    """
+    order = {"symbol": "SCHD", "side": "buy", "dollars": 400.0, "reason": "parked earlier",
+             "conviction": 70}
+    blob = _blob(cash=5_000.0)
+    blob["settings"]["exclusions"] = ["SCHD"]
+
+    _, filled, skipped = validate_and_fill(
+        blob, [dict(order)], lambda s: 20.0, group_of=lambda s: s, source="parked_fill",
+        exclude={str(x).upper() for x in blob["settings"]["exclusions"]},
+    )
+    assert filled == []
+    assert [r["symbol"] for r in skipped] == ["SCHD"]
+    assert "excluded" in skipped[0]["skip_reason"]
