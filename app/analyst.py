@@ -997,6 +997,20 @@ trades you made. You are scored on terminal value. With a long runway the domina
 compounding, and the biggest destroyers of terminal value are churn, taxes and being out of the \
 market — not missed opportunities.
 
+`your_recent_activity` is THIS ACCOUNT'S OWN LEDGER for the last two weeks — the orders you filled \
+and the ones the server refused, each with the reason recorded at the time. It is present because you \
+would otherwise be deciding from a snapshot with no memory: a position you SOLD leaves no trace in \
+`positions` except a smaller share count, indistinguishable from one you never held.
+
+Use it for two things and nothing else. First, do not undo your own recent work without saying why: \
+if you trimmed a name days ago for being extended, buying it back while it is still extended needs an \
+argument, and "there is an allocation gap" is the gap your own sale created. Second, a `skipped` row \
+tells you a rule refused that order — re-proposing it unchanged wastes the tick, so either satisfy \
+the stated reason or choose something else.
+
+It is a record, not a commitment. Being consistent with a past decision is not the same as being \
+right, and if the facts have changed the correct move is to change your mind and say so.
+
 Read the runway before every decision. With 10+ years to the horizon the default action is HOLD: a \
 quality position that is merely up, or merely extended, should be left alone to compound. Realising a \
 small gain on a position you would want to own again next week is a LOSS in this objective — it pays \
@@ -1291,6 +1305,7 @@ async def sandbox_decision(
     book: dict, candidates: list[dict], *, cash: float, settings: dict,
     strategy_note: dict | None, macro: dict | None = None, deep: bool = False,
     model: str | None = None, gaps: list[dict] | None = None,
+    recent_activity: list[dict] | None = None,
 ) -> tuple[SandboxDecision, dict]:
     """The daily sandbox decision (Haiku by default): a unified order list to steer the book toward the
     strategy within the risk limits. The server validates/clamps/fills afterward — this only proposes."""
@@ -1306,6 +1321,11 @@ async def sandbox_decision(
     # Where the standing plan is unmet, pre-computed and ordered. Omitted when nothing is short.
     if gaps:
         payload["allocation_gaps"] = gaps
+    # What this account has actually done lately. Omitted when there is nothing, rather than sent as
+    # an empty list: "you have made no trades recently" and "no history was supplied" are different
+    # claims, and only the first is ever true here.
+    if recent_activity:
+        payload["your_recent_activity"] = recent_activity
     # Omitted entirely when there's no usable read — an empty macro block would assert a calm
     # backdrop on exactly the days the news pipeline is broken.
     if macro:

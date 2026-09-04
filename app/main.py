@@ -3282,7 +3282,11 @@ async def _run_extra_arm(
                 model=(str(settings.get("model")).strip() or None) if settings.get("model") else None,
                 gaps=sandbox_job.target_gaps(
                     blob["positions"], equity=book.get("total_value") or 0.0,
-                    plan=shared_plan, group_of=_exposure_group, price_of=price_of))
+                    plan=shared_plan, group_of=_exposure_group, price_of=price_of),
+                # This arm's own ledger. Read per-arm, never shared: an arm that is a control for
+                # another must not be told what that other one did.
+                recent_activity=sandbox_job.recent_activity(
+                    sandbox_store.read_trades(120, arm), today=sandbox_job.today_et_str()))
             usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
             _arm_orders = [o.model_dump() for o in decision.orders]
             # Review on the arm path too. This was implemented on main only, so review_enabled on an
@@ -3669,7 +3673,10 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                     gaps=sandbox_job.target_gaps(
                         blob["positions"], equity=book.get("total_value") or 0.0,
                         plan=blob.get("last_strategy_note"), group_of=_exposure_group,
-                        price_of=price_of))
+                        price_of=price_of),
+                    recent_activity=sandbox_job.recent_activity(
+                        sandbox_store.read_trades(120, sandbox_store.MAIN_ARM),
+                        today=sandbox_job.today_et_str()))
                 usage_store.record(usage, symbol="SANDBOX", kind="sandbox_tick")
                 orders = [o.model_dump() for o in decision.orders]
                 posture = decision.posture

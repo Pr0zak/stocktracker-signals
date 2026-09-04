@@ -375,6 +375,75 @@ BTC_ETFS = frozenset({"IBIT", "FBTC", "GBTC", "BITB", "ARKB", "BTCO", "HODL", "B
 GOLD_ETFS = frozenset({"GLD", "GLDM", "IAU", "IAUM", "SGOL", "OUNZ", "BAR", "AAAU"})
 
 
+
+# The number of days of its own ledger the analyst is shown. Long enough to hold a reversal — the
+# 2026-09-02/09-04 SCHD round trip was two days apart — and short enough that a stale opinion from
+# three weeks ago is not still arguing its case.
+_HISTORY_DAYS = 14
+_HISTORY_MAX = 24
+_REASON_CHARS = 110
+
+
+def recent_activity(trades: list[dict], *, today: str, days: int = _HISTORY_DAYS,
+                    limit: int = _HISTORY_MAX) -> list[dict]:
+    """The arm's own recent decisions, compacted for the tick prompt.
+
+    The tick was a COLD START. `sandbox_decision`'s payload is equity, cash, positions, candidates,
+    settings, the weekly strategy note and the allocation gaps — a snapshot of the book plus today's
+    names, and nothing about what this account has done. A sale leaves no trace in that payload
+    except a smaller share count, which is indistinguishable from never having held the shares.
+
+    On 2026-09-02 the analyst trimmed 8 SCHD for being extended at a weekly RSI of 76.5; on
+    2026-09-04 it bought 10 back, in a reason that itself called the name overbought at 73.4. Both
+    decisions were locally sound on the information given. The contradiction was only visible from
+    outside, because only from outside was there anything to contradict.
+
+    SKIPPED orders are included, and they may matter more than the fills. The GLD->GLDM swap was
+    proposed on three consecutive days and refused every time by the same guard; nothing told the
+    model its proposal had been rejected, so nothing stopped it proposing it again.
+
+    Two deliberate limits on what is handed back. Reasons are TRUNCATED, because the goal is to
+    remind the model what it did, not to hand it a persuasive paragraph it wrote about itself —
+    consistency with a past call is not the same as being right, and a model reading its own advocacy
+    tends to defend it. And CASH rows (deposits, interest) are dropped: they are not decisions.
+    """
+    cutoff = _iso_days_before(today, days)
+    out: list[dict] = []
+    for t in trades:                      # newest first, as read_trades returns them
+        if len(out) >= limit:
+            break
+        sym = str(t.get("symbol") or "").upper()
+        side = str(t.get("side") or "").lower()
+        if sym == "CASH" or side not in ("buy", "sell"):
+            continue
+        d = str(t.get("date") or "")
+        if not d or d < cutoff:
+            continue
+        row = {"date": d, "symbol": sym, "side": side, "status": t.get("status")}
+        if t.get("status") == "filled":
+            if t.get("shares"):
+                row["shares"] = t["shares"]
+            if t.get("price") is not None:
+                row["price"] = t["price"]
+        else:
+            # WHY it did not happen is the whole value of a skipped row.
+            row["skipped_because"] = str(t.get("skip_reason") or "")[:_REASON_CHARS]
+        r = str(t.get("reason") or "").strip()
+        if r:
+            row["your_reason"] = r[:_REASON_CHARS]
+        out.append(row)
+    return out
+
+
+def _iso_days_before(today: str, days: int) -> str:
+    """`today` (YYYY-MM-DD) minus `days`, as an ISO date. Returns "" if `today` is unparseable, which
+    makes the cutoff comparison admit everything rather than silently dropping the whole history."""
+    try:
+        return (dt.date.fromisoformat(str(today)[:10]) - dt.timedelta(days=days)).isoformat()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def prefer_vehicle(
     orders: list[dict], *, preferred: str, positions: list[dict],
     price_of: Callable[[str], float | None],
