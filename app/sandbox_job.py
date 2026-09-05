@@ -11,6 +11,7 @@ asserts cash conservation before the caller commits.
 """
 from __future__ import annotations
 
+import bisect
 import datetime as dt
 import math
 import time
@@ -442,6 +443,290 @@ def _iso_days_before(today: str, days: int) -> str:
         return (dt.date.fromisoformat(str(today)[:10]) - dt.timedelta(days=days)).isoformat()
     except Exception:  # noqa: BLE001
         return ""
+
+
+# ---- the account's own ledger, in dollars -------------------------------------------------------
+#
+# `recent_activity` above answers "what did I do lately". This answers "what did it cost", which is a
+# different question with a different horizon: a sale two months ago is outside the 14-day window
+# and still a fact about this account, because the shares it let go have a price today.
+#
+# COUNTS AND DOLLARS ONLY, never rates. The research panel of 2026-09-04 ruled on this and the
+# arithmetic is not close: an account making a handful of decisions a month cannot measure its own
+# skill (a 2%/yr edge at 5% tracking error needs ~49 years to reach significance), and the system
+# had made 8 sell fills in total on the day of the ruling. A "beat rate" over 8 samples is a number
+# that looks like knowledge. "The 3 SPY you sold on 2026-08-06 are worth $41 more than you got for
+# them" is not a rate; it is a fact, and the model can weigh it as one.
+_ROUND_TRIP_DAYS = 90          # a sale followed by a re-buy in the same exposure within this = a round trip
+_COST_MAX_SALES = 12           # newest sales carried in full; the totals still cover every sale
+
+
+def _bench_level_on(bench, iso_date: str) -> float | None:
+    """The benchmark's close on `iso_date` or the last session before it. None when the series does
+    not reach back that far — a sale older than the series gets no index comparison rather than one
+    against the wrong day. Crypto sells on a weekend land on Friday's close, which is the last level
+    the proceeds could actually have been put to work at."""
+    dates = getattr(bench, "dates", None) or []
+    closes = getattr(bench, "closes", None) or []
+    if not dates or len(dates) != len(closes):
+        return None
+    key = str(iso_date)[:10].replace("-", "")
+    i = bisect.bisect_right(dates, key) - 1
+    return float(closes[i]) if i >= 0 else None
+
+
+def _days_between(a: str, b: str) -> int | None:
+    try:
+        return (dt.date.fromisoformat(str(b)[:10]) - dt.date.fromisoformat(str(a)[:10])).days
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_SOLD_PRICE_MAX = 40           # distinct sold names priced per tick, newest sales first
+
+
+def sold_symbols(trade_lists: Iterable[list[dict]], *, limit: int = _SOLD_PRICE_MAX) -> list[str]:
+    """Distinct symbols any of these ledgers has SOLD, most recent sale first, capped.
+
+    The tick prices what it holds and what it might buy. A name it has sold is neither, so nothing
+    fetched a quote for it — and without one `ledger_cost` cannot say what the sold shares are worth
+    today, which is the whole point of that block. The cap keeps the batched quote from growing
+    without bound over years of a live ledger; a sale past it is reported unpriced, not dropped.
+    """
+    sells: list[tuple[str, str]] = []
+    for trades in trade_lists:
+        for t in trades or ():
+            if t.get("status") != "filled" or str(t.get("side") or "").lower() != "sell":
+                continue
+            sym = str(t.get("symbol") or "").upper()
+            if sym and sym != "CASH":
+                sells.append((str(t.get("date") or ""), sym))
+    sells.sort(reverse=True)
+    out: list[str] = []
+    for _, sym in sells:
+        if sym not in out:
+            out.append(sym)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def ledger_cost(trades: list[dict], positions: list[dict], *, price_of: Callable[[str], float | None],
+                bench, today: str) -> dict | None:
+    """What this account's own decisions have cost or earned, in dollars, against the two alternatives
+    it always had: holding the shares, and owning the index.
+
+    Built from the FILLED rows of the ledger, oldest first, with tax lots matched first-in-first-out
+    — the IRS default and the same order a broker statement would show. Every sale is then a
+    question with a numeric answer:
+
+      * `held_instead_usd`  — what the sold shares are worth today minus what the sale brought in.
+                              Positive means selling cost money against simply holding.
+      * `vs_index_usd`      — `held_instead_usd` minus what the proceeds would have earned in the
+                              S&P over the same window. Positive means the shares sold went on to
+                              BEAT the index; the sale was wrong even against the best alternative.
+      * `realized_pl_usd`, `holding_days`, `capital_gains` — the ledger's own P/L on the sale and
+                              whether it was a short- or long-term lot when it went.
+
+    Alongside: running realised short-term vs long-term dollars (the number the objective says to
+    minimise, and which nothing in the payload showed), round trips (a sale and a re-buy of the same
+    exposure within `_ROUND_TRIP_DAYS`, with what the re-buy paid over the sale), and for every OPEN
+    position its gain since purchase minus the index's gain on the same dollars over the same lots.
+
+    Absence is a reason string, never a zero. A sold name that cannot be priced today gets
+    `held_instead_usd: None` and a note, because "$0" would read as "the sale was exactly break-even".
+    Returns None when the ledger has no fills at all — the caller then omits the block, so "you have
+    sold nothing" (a true statement carried by `sales_count: 0`) and "no ledger was supplied" stay
+    distinguishable.
+    """
+    fills = [t for t in trades
+             if t.get("status") == "filled"
+             and str(t.get("side") or "").lower() in ("buy", "sell")
+             and str(t.get("symbol") or "").upper() != "CASH"
+             and t.get("date") and t.get("shares") and t.get("price") is not None]
+    if not fills:
+        return None
+    fills.sort(key=lambda t: (str(t["date"]), float(t.get("ts") or 0.0)))
+    notes: list[str] = []
+
+    bench_now = price_of("^GSPC") or None
+    if bench_now is None:
+        closes = getattr(bench, "closes", None) or []
+        bench_now = float(closes[-1]) if closes else None
+
+    # ---- FIFO lots ----
+    lots: dict[str, list[dict]] = {}
+    sales: list[dict] = []
+    st_usd = lt_usd = unclassified_usd = 0.0
+    for t in fills:
+        sym = str(t["symbol"]).upper()
+        side = str(t["side"]).lower()
+        shares = float(t["shares"])
+        price = float(t["price"])
+        if side == "buy":
+            lots.setdefault(sym, []).append(
+                {"date": str(t["date"]), "shares": shares, "price": price})
+            continue
+        # A sale: consume lots oldest-first.
+        remaining = shares
+        consumed: list[tuple[dict, float]] = []
+        queue = lots.get(sym) or []
+        while remaining > 1e-9 and queue:
+            lot = queue[0]
+            take = min(lot["shares"], remaining)
+            consumed.append((lot, take))
+            lot["shares"] -= take
+            remaining -= take
+            if lot["shares"] <= 1e-9:
+                queue.pop(0)
+        proceeds = float(t.get("gross") if t.get("gross") is not None else shares * price)
+        realized = t.get("realized_pl")
+        realized = float(realized) if realized is not None else None
+        matched = shares - remaining
+        row: dict = {"date": str(t["date"]), "symbol": sym, "shares": shares,
+                     "proceeds_usd": round(proceeds, 2)}
+        if t.get("exposure_group"):
+            row["exposure_group"] = t["exposure_group"]
+        if realized is not None:
+            row["realized_pl_usd"] = round(realized, 2)
+        # Holding period and the short/long split, from the lots that actually went.
+        if consumed:
+            ages = [_days_between(lot["date"], row["date"]) for lot, _ in consumed]
+            ages = [a for a in ages if a is not None]
+            if ages:
+                row["holding_days"] = max(ages)          # FIFO: the oldest lot leads
+            kinds = {"long_term" if (a is not None and a >= _LONG_TERM_DAYS) else "short_term"
+                     for a in ages}
+            row["capital_gains"] = kinds.pop() if len(kinds) == 1 else "mixed"
+            if realized is not None and matched > 0:
+                for lot, take in consumed:
+                    age = _days_between(lot["date"], row["date"])
+                    part = realized * take / shares
+                    if age is not None and age >= _LONG_TERM_DAYS:
+                        lt_usd += part
+                    else:
+                        st_usd += part
+        if remaining > 1e-9:
+            # Shares sold that no recorded buy explains: a ledger that starts mid-position, or a
+            # row this reader could not parse. Say so rather than classify by guess.
+            row["capital_gains"] = row.get("capital_gains", "unknown")
+            row["unmatched_shares"] = round(remaining, 6)
+            if realized is not None:
+                unclassified_usd += realized * remaining / shares
+        # What holding would have done, and what the index did with the same dollars.
+        px_now = price_of(sym)
+        if px_now:
+            row["held_instead_usd"] = round(shares * float(px_now) - proceeds, 2)
+        else:
+            row["held_instead_usd"] = None
+            row["note"] = f"no current price for {sym}; what holding would have earned is unknown"
+        b0 = _bench_level_on(bench, row["date"])
+        if b0 and bench_now and px_now:
+            index_instead = proceeds * (float(bench_now) / b0 - 1.0)
+            row["vs_index_usd"] = round(row["held_instead_usd"] - index_instead, 2)
+        else:
+            row["vs_index_usd"] = None
+            if px_now and not (b0 and bench_now):
+                row["note"] = "benchmark level unavailable for the sale window; no index comparison"
+        sales.append(row)
+
+    out: dict = {"as_of": str(today)[:10], "sales_count": len(sales)}
+
+    # ---- totals over EVERY sale, then the newest few in full ----
+    if sales:
+        priced = [s for s in sales if s.get("held_instead_usd") is not None]
+        indexed = [s for s in sales if s.get("vs_index_usd") is not None]
+        summary: dict = {"sales": len(sales)}
+        if priced:
+            summary["held_instead_total_usd"] = round(sum(s["held_instead_usd"] for s in priced), 2)
+            summary["priced"] = len(priced)
+        if indexed:
+            summary["vs_index_total_usd"] = round(sum(s["vs_index_usd"] for s in indexed), 2)
+            summary["with_index_comparison"] = len(indexed)
+        if len(priced) < len(sales):
+            missing = sorted({s["symbol"] for s in sales if s.get("held_instead_usd") is None})
+            notes.append(f"{len(sales) - len(priced)} of {len(sales)} sales could not be priced today "
+                         f"({', '.join(missing)}); the totals cover only the priced ones")
+        out["sales_summary"] = summary
+        sales.reverse()                                   # newest first, like the rest of the prompt
+        if len(sales) > _COST_MAX_SALES:
+            notes.append(f"showing the newest {_COST_MAX_SALES} of {len(sales)} sales; "
+                         f"sales_summary and realized cover all of them")
+        out["sales"] = sales[:_COST_MAX_SALES]
+        realized_block = {"short_term_usd": round(st_usd, 2), "long_term_usd": round(lt_usd, 2)}
+        if abs(unclassified_usd) > 0.005:
+            realized_block["unclassified_usd"] = round(unclassified_usd, 2)
+        out["realized"] = realized_block
+
+    # ---- round trips: sold an exposure, then bought it back within the window ----
+    trips: list[dict] = []
+    for i, t in enumerate(fills):
+        if str(t["side"]).lower() != "sell" or not t.get("exposure_group"):
+            continue
+        for u in fills[i + 1:]:
+            if str(u["side"]).lower() != "buy" or u.get("exposure_group") != t["exposure_group"]:
+                continue
+            gap = _days_between(str(t["date"]), str(u["date"]))
+            if gap is None or gap > _ROUND_TRIP_DAYS:
+                break
+            trip: dict = {
+                "exposure_group": t["exposure_group"], "days_between": gap,
+                "sold": {"date": str(t["date"]), "symbol": str(t["symbol"]).upper(),
+                         "shares": float(t["shares"]), "price": float(t["price"])},
+                "rebought": {"date": str(u["date"]), "symbol": str(u["symbol"]).upper(),
+                             "shares": float(u["shares"]), "price": float(u["price"])},
+            }
+            if str(t["symbol"]).upper() == str(u["symbol"]).upper():
+                n = min(float(t["shares"]), float(u["shares"]))
+                trip["paid_more_usd"] = round((float(u["price"]) - float(t["price"])) * n, 2)
+            else:
+                trip["paid_more_usd"] = None
+                trip["note"] = "different vehicle for the same exposure; prices are not comparable"
+            trips.append(trip)
+            break
+    out["round_trips_count"] = len(trips)
+    if trips:
+        out["round_trips"] = trips[-6:]
+
+    # ---- open positions: gain since purchase minus the index's gain on the same dollars ----
+    held: list[dict] = []
+    for p in positions:
+        sym = str(p.get("symbol") or "").upper()
+        open_lots = [l for l in lots.get(sym, []) if l["shares"] > 1e-9]
+        px_now = price_of(sym)
+        if not sym or not open_lots or not px_now:
+            continue
+        gain = 0.0
+        index_gain = 0.0
+        comparable = True
+        for lot in open_lots:
+            cost = lot["shares"] * lot["price"]
+            gain += lot["shares"] * float(px_now) - cost
+            b0 = _bench_level_on(bench, lot["date"])
+            if b0 and bench_now:
+                index_gain += cost * (float(bench_now) / b0 - 1.0)
+            else:
+                comparable = False
+        row = {"symbol": sym, "since": open_lots[0]["date"], "gain_usd": round(gain, 2)}
+        if comparable:
+            row["vs_index_usd"] = round(gain - index_gain, 2)
+        else:
+            row["vs_index_usd"] = None
+            row["note"] = "benchmark level unavailable for part of the holding; no index comparison"
+        ledger_shares = sum(l["shares"] for l in open_lots)
+        try:
+            book_shares = float(p.get("shares") or 0.0)
+        except (TypeError, ValueError):
+            book_shares = 0.0
+        if book_shares and abs(book_shares - ledger_shares) > 1e-6:
+            row["note"] = (f"ledger lots cover {ledger_shares:g} of {book_shares:g} shares held; "
+                           f"figures are for the covered lots")
+        held.append(row)
+    if held:
+        out["open_positions_vs_index"] = held
+    if notes:
+        out["notes"] = notes
+    return out
 
 
 def prefer_vehicle(

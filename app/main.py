@@ -2931,6 +2931,13 @@ _SANDBOX_CORE = [
 # across a long list, and nothing here measures that — so this is a deliberate bet on coverage over
 # an unmeasured concentration effect, and it is worth revisiting with the arms once they have data.
 _SANDBOX_MAX_SCREENED = 80
+# Ledger rows read for the cost block. The trade log is append-only and read whole regardless, so this
+# is a ceiling rather than a cost: ~20k rows is a couple of decades at the current fill rate, and a
+# ledger that outgrows it truncates the OLDEST sales, whose absence the block itself reports.
+_LEDGER_COST_ROWS = 20_000
+# Rows scanned per arm for names to price. Sales past this many rows back can still appear in the
+# cost block, unpriced, with a note saying so — see sandbox_job.sold_symbols.
+_SOLD_LOOKBACK_ROWS = 400
 
 
 async def _sandbox_candidate(sym: str, bench_closes, core_set: set[str]) -> dict | None:
@@ -3031,6 +3038,7 @@ def _exposure_vocabulary(symbols: Iterable[str]) -> dict[str, list[str]]:
 
 async def _maybe_weekly_review(
     blob: dict, book: dict, settings: dict, *, tradable: Iterable[str] = (),
+    ledger_cost: dict | None = None,
 ) -> bool:
     """Run the Opus weekly strategy review if it's due (>=7 days). Mutates blob's strategy note/date on
     success; on failure keeps the prior note and does NOT advance the cursor (retries next trading day)."""
@@ -3079,11 +3087,20 @@ async def _maybe_weekly_review(
         pass
     # The weekly review is the right altitude to react to "the way I've been picking isn't working" —
     # the daily tick is too close to the trade to reconsider its own method.
+    #
+    # `buy_calls` only. Until 2026-09-04 this also carried `sandbox_buys`, the paper account's own
+    # buys graded as a 20-day beat rate — a rate over a handful of decisions, handed to a prompt whose
+    # objective is terminal value at a 17-year horizon. The account cannot learn strategy from its own
+    # outcomes at that sample size (see sandbox_job.ledger_cost for the arithmetic); what it CAN be
+    # told is what its decisions cost in dollars, which is `own_ledger` below. The analyst's card
+    # stays because its cohort is thousands of graded setups, now marked at 63 and 252 sessions too.
     try:
         st = memory.stats()
-        card = {k: st[k] for k in ("buy_calls", "sandbox_buys") if k in st}
+        card = {k: st[k] for k in ("buy_calls",) if k in st}
         if card:
             context["track_record"] = card
+        if ledger_cost:
+            context["own_ledger"] = ledger_cost
         # Which rules actually bound. A cap firing constantly means the plan keeps asking for
         # something the account forbids — the strategy is the right level to resolve that, not the
         # daily tick, which can only keep getting refused.
@@ -3183,7 +3200,7 @@ async def _run_extra_arm(
     arm: str, *, now, price_of, spy_price: float | None, shared_plan: dict | None,
     candidates: list[dict], macro_block, force: bool, held_rows: list[dict] | None = None,
     rejected: dict[str, list[dict]] | None = None,
-    gate: dict | None = None,
+    gate: dict | None = None, bench=None,
 ) -> dict:
     """One decision cycle for a NON-main arm, against the market snapshot main already fetched.
 
@@ -3288,7 +3305,11 @@ async def _run_extra_arm(
                 # This arm's own ledger. Read per-arm, never shared: an arm that is a control for
                 # another must not be told what that other one did.
                 recent_activity=sandbox_job.recent_activity(
-                    sandbox_store.read_trades(120, arm), today=sandbox_job.today_et_str()))
+                    sandbox_store.read_trades(120, arm), today=sandbox_job.today_et_str()),
+                # Likewise this arm's own ledger in dollars, from its own trades and positions.
+                ledger_cost=sandbox_job.ledger_cost(
+                    sandbox_store.read_trades(_LEDGER_COST_ROWS, arm), blob["positions"],
+                    price_of=price_of, bench=bench, today=sandbox_job.today_et_str()))
             usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
             _arm_orders = [o.model_dump() for o in decision.orders]
             # Review on the arm path too. This was implemented on main only, so review_enabled on an
@@ -3570,6 +3591,14 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         for _s in plan_syms + arm_held:
             if _s not in price_syms and _s not in held:
                 price_syms.append(_s)
+        # Names any arm has SOLD need a price too, or the ledger-cost block cannot say what the sold
+        # shares are worth today (see sandbox_job.ledger_cost) — and a sale it cannot price is
+        # exactly the sale it would otherwise forget. Newest sales first, capped so the batched quote
+        # cannot grow without bound over years of a live ledger.
+        for _s in sandbox_job.sold_symbols(
+                [sandbox_store.read_trades(_SOLD_LOOKBACK_ROWS, _a) for _a in sandbox_store.list_arms()]):
+            if _s not in price_syms and _s not in held:
+                price_syms.append(_s)
 
         prices = await _sandbox_prices(held, price_syms)
         def price_of(sym: str):
@@ -3601,6 +3630,9 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         # every path, including the ones that skip the decision entirely.
         held_rows: list[dict] = []
         macro_block = None
+        # The S&P series the candidates are ranked against and the ledger-cost block is priced
+        # against. Bound here for the same reason as `candidates`: the arms read it on every path.
+        bench_series = None
         # Orders the review model refused, per arm, for this tick only. Consumed by any engine
         # "rejects" arm further down. Never persisted: a rejected order is a statement about today's
         # decision, and carrying it forward would execute a trade nobody re-proposed.
@@ -3643,12 +3675,25 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                             "positions": at_cost, "priced_at_cost": True}
             else:
                 book = {"total_value": blob["cash"], "cash_pct": 100.0, "positions": []}
-            weekly_ran = await _maybe_weekly_review(
-                blob, book, settings, tradable=candidate_syms)
             try:
-                bench_closes = (await fetch_series(_http, "^GSPC")).closes
+                bench_series = await fetch_series(_http, "^GSPC")
+                bench_closes = bench_series.closes
             except Exception:  # noqa: BLE001
                 bench_closes = None
+            # What this account's own sales and holdings have cost, in dollars, against holding and
+            # against the index. Built once here and handed to BOTH the weekly review and today's
+            # decision: the review sets the stance it should move, the tick applies the sell
+            # discipline it should temper. None when the ledger has no fills yet.
+            try:
+                ledger_cost = sandbox_job.ledger_cost(
+                    sandbox_store.read_trades(_LEDGER_COST_ROWS, sandbox_store.MAIN_ARM),
+                    blob["positions"], price_of=price_of, bench=bench_series,
+                    today=sandbox_job.today_et_str())
+            except Exception as e:  # noqa: BLE001 — enrichment, never a blocker
+                ledger_cost = None
+                warnings.append(f"ledger cost block unavailable: {e}")
+            weekly_ran = await _maybe_weekly_review(
+                blob, book, settings, tradable=candidate_syms, ledger_cost=ledger_cost)
             candidates = [c for c in await asyncio.gather(
                 *[_sandbox_candidate(s, bench_closes, core_set) for s in candidate_syms]) if c]
             # Rows for the names MAIN holds. `select_candidates` strips them from the pool above,
@@ -3678,7 +3723,8 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                         price_of=price_of),
                     recent_activity=sandbox_job.recent_activity(
                         sandbox_store.read_trades(120, sandbox_store.MAIN_ARM),
-                        today=sandbox_job.today_et_str()))
+                        today=sandbox_job.today_et_str()),
+                    ledger_cost=ledger_cost)
                 usage_store.record(usage, symbol="SANDBOX", kind="sandbox_tick")
                 orders = [o.model_dump() for o in decision.orders]
                 posture = decision.posture
@@ -3845,7 +3891,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                     shared_plan=new_blob.get("last_strategy_note"), candidates=candidates,
                     held_rows=held_rows,
                     macro_block=macro_block, force=force, rejected=rejected_by_arm,
-                    gate=gate_verdict))
+                    gate=gate_verdict, bench=bench_series))
             except Exception as e:  # noqa: BLE001 — a side arm must never break the real account
                 _log.exception("sandbox arm %s failed", _arm)
                 arms.append({"arm": _arm, "status": "error", "warnings": [str(e)]})

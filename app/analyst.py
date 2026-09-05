@@ -1016,6 +1016,23 @@ the stated reason or choose something else.
 It is a record, not a commitment. Being consistent with a past decision is not the same as being \
 right, and if the facts have changed the correct move is to change your mind and say so.
 
+`your_ledger_in_dollars`, when present, is what this account's own decisions have COST OR EARNED, \
+priced today, against the two alternatives it always had: holding the shares, and owning the index. \
+Every number is dollars or a count; none is a rate, because a handful of decisions cannot measure \
+skill and a beat-rate over eight sales would be a number that only looks like knowledge. Read it \
+this way. In `sales`, `held_instead_usd` is what the shares you sold are worth today minus what \
+the sale brought in — positive means selling cost money against simply holding — and `vs_index_usd` \
+is that figure minus what the proceeds would have earned in the S&P over the same window, so a \
+positive `vs_index_usd` means you sold something that went on to beat the index. `realized` splits \
+the gains you have booked into short-term and long-term dollars: the short-term figure is the one \
+the objective says to minimise. `round_trips` are sales you reversed inside 90 days, with what the \
+re-buy paid over the sale; each one is two legs of spread for nothing. `open_positions_vs_index` \
+is each holding's gain since its own purchase lots minus the index's gain on the same dollars. \
+A `null` with a `note` means the figure could not be computed, not that it was zero. Use this to \
+temper the sell discipline with your own evidence — if every sale you have made is worth more \
+today than it fetched, the bar for the next one is higher, and say so in `posture` — and never to \
+conclude the method works or fails: `sales_count` tells you how few decisions this rests on.
+
 Read the runway before every decision. With 10+ years to the horizon the default action is HOLD: a \
 quality position that is merely up, or merely extended, should be left alone to compound. Realising a \
 small gain on a position you would want to own again next week is a LOSS in this objective — it pays \
@@ -1316,7 +1333,7 @@ async def sandbox_decision(
     book: dict, candidates: list[dict], *, cash: float, settings: dict,
     strategy_note: dict | None, macro: dict | None = None, deep: bool = False,
     model: str | None = None, gaps: list[dict] | None = None,
-    recent_activity: list[dict] | None = None,
+    recent_activity: list[dict] | None = None, ledger_cost: dict | None = None,
 ) -> tuple[SandboxDecision, dict]:
     """The daily sandbox decision (Haiku by default): a unified order list to steer the book toward the
     strategy within the risk limits. The server validates/clamps/fills afterward — this only proposes."""
@@ -1337,6 +1354,10 @@ async def sandbox_decision(
     # claims, and only the first is ever true here.
     if recent_activity:
         payload["your_recent_activity"] = recent_activity
+    # What its decisions have cost, in dollars. Same rule: omitted when there is no ledger, never
+    # sent as an empty block, and never a rate — see sandbox_job.ledger_cost.
+    if ledger_cost:
+        payload["your_ledger_in_dollars"] = ledger_cost
     # Omitted entirely when there's no usable read — an empty macro block would assert a calm
     # backdrop on exactly the days the news pipeline is broken.
     if macro:
@@ -1411,18 +1432,33 @@ Bias by `risk_tolerance` and the GLIDEPATH toward `retirement_date`/`exit_date` 
 they near); if `goal_amount`/`goal_date` are set, set the stance's aggressiveness by the pace needed to \
 reach the goal in time. Ground everything in the numbers and the regime — no invented catalysts.
 
-If `track_record` is present it is the honest scorecard of this system's OWN decisions, graded on a \
-20-trading-day horizon: `buy_calls` / `sell_calls` are what the watchlist analyst called; `sandbox_buys` / \
-`sandbox_sells` are what this paper account actually did. All four report `correct_rate_20d`, where \
-HIGHER IS BETTER and 0.50 is coin-flip — the sell side is pre-inverted (a sell is correct when the \
-name underperformed the index, since owning the index was the alternative), so read the four side by \
-side without flipping anything. `avg_excess_20d_pct` (buys) and `avg_avoided_20d_pct` (sells) are the \
-size of the edge; a positive number is good on both. You are the only stage that should react to \
-this: if `correct_rate_20d` is persistently below ~0.50 across a meaningful `n`, the method is not \
-adding value, and the correct response is to say so plainly in `notes` and shift toward a simpler, \
-more index-like, lower-turnover stance — NOT to trade harder looking for a win. Note which SIDE is \
-weak: consistently poor sells with decent buys usually means exiting too early, not bad selection. Respect `n`: under ~20 decisions is far too early to conclude anything, and two \
-years of one market regime cannot prove skill. Never hide a bad number.
+If `track_record` is present it is the honest scorecard of the WATCHLIST ANALYST's buy calls — the \
+signals this system emits for setups, graded against the S&P over 20 sessions, and where the sample \
+is old enough also at 63 sessions (`at_63d`) and 252 sessions (`at_252d`). `correct_rate_20d` is the \
+share of calls that beat the index, where HIGHER IS BETTER and 0.50 is coin-flip; \
+`avg_excess_20d_pct` is the size of the edge, positive is good. The long-horizon blocks matter more \
+to you than the 20-day one, because this account's objective is decades out: a method whose calls \
+lag the index over a month and lead it over a year is a method to hold through the month. Respect \
+`n_symbols` above `n` — twenty graded bars on one ticker are one opinion, not twenty — and treat \
+anything under ~20 distinct names as too early to conclude. You are the only stage that should \
+react to this: if the analyst's calls are persistently below ~0.50 across a meaningful sample at \
+every horizon, the method is not adding value, and the correct response is to say so plainly in \
+`notes` and shift toward a simpler, more index-like, lower-turnover stance — NOT to trade harder \
+looking for a win. Never hide a bad number.
+
+If `own_ledger` is present it is what THIS ACCOUNT's own decisions have cost or earned, in dollars, \
+priced today — the same block the daily tick sees as `your_ledger_in_dollars`. It carries no rates, \
+deliberately: a paper account making a few decisions a month cannot measure its own skill, and a \
+beat-rate over eight sales is a number that only looks like knowledge. It can tell you facts. \
+`sales_summary.held_instead_total_usd` is what selling has cost against holding across every sale \
+(positive = the sold shares are worth more today than they fetched); `vs_index_total_usd` is the \
+same against putting the proceeds in the index. `realized.short_term_usd` is the churn the objective \
+says to avoid, in dollars. `round_trips` are sales reversed inside 90 days — each is two legs of \
+spread, and a plan that keeps producing them is asking the tick for something it then undoes. \
+`open_positions_vs_index` shows which holdings are ahead of or behind the index since purchase. \
+Move the STANCE on this, not the method: if the account's sales have consistently cost money against \
+holding, set a plan with fewer reasons to sell; if a group keeps round-tripping, stop naming it at \
+the edge of its cap. `sales_count` is how few decisions this rests on; say so when you cite it.
 
 If `blocked_trades` is present it counts which RISK RULES actually stopped trades recently, by \
 reason. A rule that fires occasionally is working as intended and needs no comment. A rule that \
