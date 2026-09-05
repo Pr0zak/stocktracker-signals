@@ -354,23 +354,45 @@ def _prev_state() -> dict[str, dict]:
         return {}
 
 
-async def score_memory() -> int:
-    """Grade every verdict old enough to have a 20-day outcome. Returns rows scored.
+def scoring_range(age_days: float) -> str:
+    """The Yahoo range whose bars reach back past a row `age_days` old, with room to spare.
 
-    Fetches 1y of bars per symbol with pending verdicts, plus the benchmark once, and hands both to
-    `memory.score_symbol`. Symbols are fetched with limited concurrency: this runs unattended
+    The margin is the point. Until 2026-09-04 every scoring fetch used `fetch_series`'s default 1y,
+    which holds ~252 bars: a row old enough to carry a 252-bar mark had its anchor at index 0 of
+    that series or just outside it, so the one-year column could never have been written from it —
+    the range was chosen for the horizon the schema had, and the fetch bound was silent.
+    """
+    if age_days < 300:
+        return "1y"
+    if age_days < 660:
+        return "2y"
+    if age_days < 1750:
+        return "5y"
+    return "10y"
+
+
+async def score_memory() -> int:
+    """Grade every verdict with a horizon old enough to have an outcome. Returns rows scored.
+
+    Fetches bars per symbol with pending verdicts, plus the benchmark once, and hands both to
+    `memory.score_symbol`. The range is chosen per symbol from its OLDEST pending row (the benchmark
+    at the widest of them) so a row waiting on its quarter or one-year mark is actually inside the
+    series it is graded from. Symbols are fetched with limited concurrency: this runs unattended
     alongside the scan and the point is never to hammer Yahoo hard enough to get rate-limited out of
     the data the user actually asked for.
     """
-    syms = memory.pending_symbols()
-    if not syms:
+    work = memory.pending_work()
+    if not work:
         return 0
+    syms = list(work)
+    now = time.time()
     total = 0
     async with httpx.AsyncClient() as client:
         bench_dates: list[str] | None = None
         bench_closes: list[float] | None = None
         try:
-            b = await fetch_series(client, "^GSPC")
+            b = await fetch_series(
+                client, "^GSPC", rng=scoring_range((now - min(work.values())) / 86_400))
             bench_dates, bench_closes = b.dates, b.closes
         except Exception:  # noqa: BLE001 — without it we still score raw return, just not excess
             pass
@@ -380,7 +402,8 @@ async def score_memory() -> int:
         async def one(sym: str) -> int:
             async with sem:
                 try:
-                    s = await fetch_series(client, sym)
+                    s = await fetch_series(
+                        client, sym, rng=scoring_range((now - work[sym]) / 86_400))
                 except Exception:  # noqa: BLE001 — a delisted/renamed ticker just stays unscored
                     return 0
                 # Crypto trades weekends, so aligning it to the S&P's calendar would drop most rows;

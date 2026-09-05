@@ -55,9 +55,29 @@ _FILE = _DATA_DIR / "memory.db"
 # Below this many comparable, already-scored setups we report nothing rather than a number that
 # reads as evidence but is noise.
 _MIN_SAMPLES = 5
-# Rows older than this are pruned; two years is plenty to characterise a setup and keeps the file
-# small enough to stay uninteresting on a 12 GB disk.
-_RETAIN_DAYS = 730
+
+# Forward-return horizons, in BARS of the symbol's own series (sessions for an equity, calendar days
+# for crypto). 5 and 20 are the original pair. 63 (a quarter) and 252 (one trading year — also the
+# short/long-term capital-gains boundary the sandbox is told to respect) were added 2026-09-04: the
+# sandbox's objective is measured in years and nothing here looked past a month, so the strategist
+# was being handed a 20-day scorecard in the same prompt that told it churn destroys terminal value.
+# A row is graded at 5+20 together first (`scored_at` marks that), and each long horizon fills in on
+# its own as the bars arrive. Readers derive their per-horizon keys from these tuples.
+HORIZONS: tuple[int, ...] = (5, 20, 63, 252)
+LONG_HORIZONS: tuple[int, ...] = (63, 252)
+# Calendar days a row must age before a horizon is worth fetching a series for. A floor, not a
+# promise — an equity needs ~365 calendar days for 252 sessions once holidays are counted — so a row
+# flagged early is simply not scorable yet and is revisited the next night at no cost but a fetch.
+_HORIZON_MIN_AGE_DAYS: dict[int, int] = {20: 5, 63: 85, 252: 355}
+
+# Rows older than this are pruned. It was two years until 2026-09-04, which would have started
+# deleting the oldest backfill rows on 2026-09-24 — the ONLY rows old enough to carry a one-year
+# mark, three weeks before the first of those marks could be written. A row is fully graded only
+# after a year and is most valuable after that, so it is kept for five: ~300 bytes each, so even
+# 100k rows is 30 MB on a 12 GB disk.
+_RETAIN_DAYS = 1826
+# Prose notes have no horizon to wait for; two years remains plenty.
+_NOTES_RETAIN_DAYS = 730
 
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
@@ -99,7 +119,12 @@ CREATE TABLE IF NOT EXISTS verdicts (
     -- than market drift dressed up as skill
     bench_fwd_5d  REAL,
     bench_fwd_20d REAL,
-    scored_at    REAL
+    -- set once fwd_5d/fwd_20d are written; the long horizons below fill in on their own later
+    scored_at    REAL,
+    fwd_63d        REAL,
+    fwd_252d       REAL,
+    bench_fwd_63d  REAL,
+    bench_fwd_252d REAL
 );
 CREATE INDEX IF NOT EXISTS ix_verdicts_symbol ON verdicts(symbol, ts DESC);
 CREATE INDEX IF NOT EXISTS ix_verdicts_unscored ON verdicts(scored_at) WHERE scored_at IS NULL;
@@ -189,6 +214,10 @@ def _migrate(db: sqlite3.Connection) -> None:
         ("bench_fwd_5d", "REAL"),
         ("bench_fwd_20d", "REAL"),
         ("origin", "TEXT NOT NULL DEFAULT 'model'"),
+        # 2026-09-04: the long horizons. NULL on every existing row; score_symbol fills them in
+        # as each row ages past the mark, so a database from before this change needs no re-seed.
+        *((f"fwd_{h}d", "REAL") for h in LONG_HORIZONS),
+        *((f"bench_fwd_{h}d", "REAL") for h in LONG_HORIZONS),
     ):
         if col not in have:
             db.execute(f"ALTER TABLE verdicts ADD COLUMN {col} {decl}")
@@ -350,7 +379,9 @@ def similar_setups(symbol: str, summary: dict, *, k: int = 40) -> dict | None:
       - `this_symbol`: prior verdicts on *this* name (does the model read this ticker well?)
       - `analogues`:   the nearest setups across every other name (does this *pattern* work?)
 
-    Either is omitted when it has fewer than `_MIN_SAMPLES` scored rows.
+    Either is omitted when it has fewer than `_MIN_SAMPLES` scored rows. Inside each, the 20-day
+    numbers are as they always were; `vs_benchmark_63d` and `vs_benchmark_252d` appear once at least
+    `_MIN_SAMPLES` neighbours carry that mark, each with its own `n` and `n_symbols`.
     """
     try:
         feats = features_from_summary(summary)
@@ -359,10 +390,17 @@ def similar_setups(symbol: str, summary: dict, *, k: int = 40) -> dict | None:
         sym = (symbol or "").upper()
         with _lock:
             db = _db()
-            # Only scored rows can teach anything; cap the scan so a large table stays cheap.
+            # Only scored rows can teach anything. The veto axes are applied IN SQL, not just in
+            # _distance: until 2026-09-04 the scan was capped at the 4,000 newest rows, which was
+            # fine while every horizon was 20 days but excludes precisely the rows old enough to
+            # carry a one-year mark. Pre-filtering on the same veto the Python check applies keeps
+            # the candidate set small however large the table grows (measured on the live 9k-row
+            # database: 75 ms for the capped scan, single-digit ms with the prefilter), so the cap
+            # can be a safety valve rather than a silent bias toward recent rows.
+            where, params = _veto_sql(feats)
             rows = db.execute(
-                "SELECT * FROM verdicts WHERE scored_at IS NOT NULL AND fwd_20d IS NOT NULL "
-                "ORDER BY ts DESC LIMIT 4000"
+                f"SELECT * FROM verdicts WHERE scored_at IS NOT NULL AND fwd_20d IS NOT NULL "
+                f"{where} ORDER BY ts DESC LIMIT 20000", params,
             ).fetchall()
 
         mine: list[tuple[float, sqlite3.Row]] = []
@@ -407,6 +445,11 @@ def _cohort(pairs: Sequence[tuple[float, sqlite3.Row]], *, k: int = 40) -> dict 
         return None
     out: dict[str, Any] = {
         "n": len(r20),
+        # Bars are not independent observations: backfill samples every third session, so two
+        # adjacent rows on one name share almost their whole forward window, and at a one-year
+        # horizon forty bars from two names is closer to two observations than forty. The reader
+        # gets both counts and the prompt tells it which one to respect at which horizon.
+        "n_symbols": _n_symbols(nearest),
         "median_fwd_20d_pct": round(_median(r20), 2),
         "positive_rate_20d": round(sum(1 for x in r20 if x > 0) / len(r20), 2),
     }
@@ -415,6 +458,13 @@ def _cohort(pairs: Sequence[tuple[float, sqlite3.Row]], *, k: int = 40) -> dict 
     ex = _excess(nearest)
     if ex:
         out["vs_benchmark"] = ex
+    # The long horizons pick THEIR OWN k nearest from the rows that carry the mark. Taking the same
+    # `nearest` window would report nothing for a year — the closest rows are usually the newest,
+    # and the newest are exactly the ones without a one-year outcome yet.
+    for h in LONG_HORIZONS:
+        ex_h = _excess(_having(pairs, h)[:k], horizon=h)
+        if ex_h:
+            out[f"vs_benchmark_{h}d"] = ex_h
     # Only REAL verdicts count here — a replayed setup has no opinion attached, and letting backfill
     # rows in would silently turn "how well does the model call this setup" into "how does this setup
     # drift", which is a different question wearing the same label.
@@ -425,6 +475,35 @@ def _cohort(pairs: Sequence[tuple[float, sqlite3.Row]], *, k: int = 40) -> dict 
     if said_sell:
         out["when_model_said_sell"] = said_sell
     return out
+
+
+def _having(pairs: Sequence[tuple[float, sqlite3.Row]], horizon: int) -> list[tuple[float, sqlite3.Row]]:
+    """The subset of `pairs` (already sorted by distance) that carries a mark at `horizon`."""
+    col = f"fwd_{horizon}d"
+    return [(d, r) for d, r in pairs if r[col] is not None]
+
+
+def _n_symbols(pairs: Sequence[tuple[float, sqlite3.Row]]) -> int:
+    return len({r["symbol"] for _, r in pairs})
+
+
+def _veto_sql(feats: dict[str, float | None]) -> tuple[str, list[float]]:
+    """The veto axes as a SQL prefilter, equivalent to the early return in `_distance`.
+
+    A row that is NULL on an axis is kept (the Python check skips missing dimensions too), and an
+    axis the QUERY lacks contributes no predicate. This is the same rule as `_distance`, so nothing
+    the prefilter removes could have been a neighbour — it only stops the Python loop from visiting
+    every row in the table to reject most of them.
+    """
+    clauses: list[str] = []
+    params: list[float] = []
+    for col, scale, _weight, veto in _FEATURES:
+        x = feats.get(col)
+        if not veto or x is None:
+            continue
+        clauses.append(f"AND ({col} IS NULL OR ABS({col} - ?) <= ?)")
+        params.extend((float(x), _VETO_DISTANCE * scale))
+    return " ".join(clauses), params
 
 
 # Signals that express a directional call. "hold" is deliberately in neither: it is the absence of a
@@ -446,53 +525,60 @@ def _directional(
     comparable at a glance. Scoring sells on raw forward return would have marked every sell in a
     bull market as wrong regardless of judgement.
     """
-    rows = [
+    called = [
         (d, r) for d, r in pairs
         if r["origin"] == "model" and (r["signal"] or "").lower() in signals
-    ][:k]
+    ]
+    rows = called[:k]
     if len(rows) < _MIN_SAMPLES:
         return None
     fwd = [float(r["fwd_20d"]) for _, r in rows if r["fwd_20d"] is not None]
     if len(fwd) < _MIN_SAMPLES:
         return None
-    out: dict[str, Any] = {"n": len(fwd), "median_fwd_20d_pct": round(_median(fwd), 2)}
-    diffs = [
-        float(r["fwd_20d"]) - float(r["bench_fwd_20d"])
-        for _, r in rows
-        if r["fwd_20d"] is not None and r["bench_fwd_20d"] is not None
-    ]
-    if len(diffs) >= _MIN_SAMPLES:
-        sign = 1.0 if bullish else -1.0
-        out["vs_benchmark"] = {
-            "n": len(diffs),
-            ("median_excess_20d_pct" if bullish else "median_avoided_20d_pct"):
-                round(sign * _median(diffs), 2),
-            "correct_rate_20d": round(
-                sum(1 for x in diffs if sign * x > 0) / len(diffs), 2
-            ),
-        }
+    out: dict[str, Any] = {
+        "n": len(fwd),
+        "n_symbols": _n_symbols(rows),
+        "median_fwd_20d_pct": round(_median(fwd), 2),
+    }
+    ex = _excess(rows, bullish=bullish)
+    if ex:
+        out["vs_benchmark"] = ex
+    for h in LONG_HORIZONS:
+        ex_h = _excess(_having(called, h)[:k], horizon=h, bullish=bullish)
+        if ex_h:
+            out[f"vs_benchmark_{h}d"] = ex_h
     return out
 
 
-def _excess(pairs: Sequence[tuple[float, sqlite3.Row]]) -> dict | None:
-    """Median 20-day return minus the benchmark's, over rows where both are known.
+def _excess(
+    pairs: Sequence[tuple[float, sqlite3.Row]], *, horizon: int = 20, bullish: bool | None = None,
+) -> dict | None:
+    """Median `horizon`-bar return minus the benchmark's, over rows where both are known.
 
-    Deliberately `beat_rate_20d` and not `correct_rate_20d`: this is the whole cohort, with no
-    directional call attached, so "did this setup beat the index" is literally the question. The
-    directional blocks report `correct_rate_20d` instead, because for a sell, beating the index is
-    the WRONG outcome.
+    With no direction attached (`bullish=None`) this is the whole cohort and the keys say so:
+    `beat_rate` — "did this setup beat the index" is literally the question. For a directional call
+    the keys are `correct_rate` and, on the sell side, `median_avoided`: a sell is *right* when the
+    name subsequently does WORSE than the benchmark, because the alternative to holding it was
+    owning the index, so the excess is negated and a positive number always means "this call was
+    good", on both sides — the only way the two are comparable at a glance. Scoring sells on raw
+    forward return would mark every sell in a bull market as wrong regardless of judgement.
     """
-    diffs = [
-        float(r["fwd_20d"]) - float(r["bench_fwd_20d"])
-        for _, r in pairs
-        if r["fwd_20d"] is not None and r["bench_fwd_20d"] is not None
-    ]
+    col, bcol = f"fwd_{horizon}d", f"bench_fwd_{horizon}d"
+    used = [(d, r) for d, r in pairs if r[col] is not None and r[bcol] is not None]
+    diffs = [float(r[col]) - float(r[bcol]) for _, r in used]
     if len(diffs) < _MIN_SAMPLES:
         return None
+    sign = -1.0 if bullish is False else 1.0
+    if bullish is None:
+        median_key, rate_key = f"median_excess_{horizon}d_pct", f"beat_rate_{horizon}d"
+    else:
+        median_key = f"median_excess_{horizon}d_pct" if bullish else f"median_avoided_{horizon}d_pct"
+        rate_key = f"correct_rate_{horizon}d"
     return {
         "n": len(diffs),
-        "median_excess_20d_pct": round(_median(diffs), 2),
-        "beat_rate_20d": round(sum(1 for x in diffs if x > 0) / len(diffs), 2),
+        "n_symbols": _n_symbols(used),
+        median_key: round(sign * _median(diffs), 2),
+        rate_key: round(sum(1 for x in diffs if sign * x > 0) / len(diffs), 2),
     }
 
 
@@ -574,18 +660,44 @@ def symbols_missing_baseline(candidates: Iterable[str], *, min_rows: int = 20) -
         return []
 
 
-def pending_symbols(*, min_age_days: int = 5) -> list[str]:
-    """Symbols with verdicts old enough to have a measurable outcome but not yet scored."""
+def _pending_where(now: float, min_age_days: int) -> tuple[str, tuple[float, ...]]:
+    """Rows with at least one horizon that is both unwritten and old enough to be measurable.
+
+    Each horizon has its own age gate, so a row graded at 20 days last month is not refetched every
+    night for a quarter's mark it cannot have yet — and a row nothing can ever grade (a delisted
+    name) stays pending exactly as it always did, which is the honest state for it.
+    """
+    now = float(now)
+    clauses = ["(scored_at IS NULL AND ts < ?)"]
+    params: list[float] = [now - min_age_days * 86_400]
+    for h in LONG_HORIZONS:
+        clauses.append(f"(fwd_{h}d IS NULL AND ts < ?)")
+        params.append(now - _HORIZON_MIN_AGE_DAYS[h] * 86_400)
+    return "(" + " OR ".join(clauses) + ")", tuple(params)
+
+
+def pending_work(*, min_age_days: int = 5) -> dict[str, float]:
+    """Symbols with something left to grade, each with the `ts` of its OLDEST such row.
+
+    The timestamp is what the caller needs to choose a fetch range: a row from fourteen months ago
+    cannot be graded from a one-year series because its anchor bar is not in it — which is exactly
+    why no 252-bar mark could have been written before this existed, whatever the schema said.
+    """
     try:
-        cutoff = time.time() - min_age_days * 86_400
+        where, params = _pending_where(time.time(), min_age_days)
         with _lock:
             rows = _db().execute(
-                "SELECT DISTINCT symbol FROM verdicts WHERE scored_at IS NULL AND ts < ?", (cutoff,)
+                f"SELECT symbol, MIN(ts) oldest FROM verdicts WHERE {where} GROUP BY symbol", params
             ).fetchall()
-        return [r["symbol"] for r in rows]
+        return {r["symbol"]: float(r["oldest"]) for r in rows}
     except Exception:  # noqa: BLE001
-        log.warning("memory: pending_symbols failed", exc_info=True)
-        return []
+        log.warning("memory: pending_work failed", exc_info=True)
+        return {}
+
+
+def pending_symbols(*, min_age_days: int = 5) -> list[str]:
+    """Symbols with verdicts old enough to have a measurable outcome at SOME horizon, not yet scored there."""
+    return list(pending_work(min_age_days=min_age_days))
 
 
 def score_symbol(
@@ -598,8 +710,11 @@ def score_symbol(
 ) -> int:
     """Fill in realized forward returns for one symbol from a fetched price series.
 
-    Returns how many rows were scored. A verdict is only scored once the FULL horizon exists, so a
-    20-day return is never computed from 11 bars and quietly treated as equivalent.
+    Returns how many rows gained at least one mark. A horizon is only written once the FULL window
+    exists, so a 20-day return is never computed from 11 bars and quietly treated as equivalent. The
+    5- and 20-bar marks are written together and set `scored_at`; each long horizon is written on
+    its own the first time the series reaches far enough, and a mark already present is never
+    rewritten — a row visited for its one-year mark keeps the 20-day number it was graded with.
 
     `bench_*` is the benchmark series (^GSPC) indexed on its own dates — the same calendar window is
     located by date, not by reusing the symbol's index, because a symbol can be missing bars the
@@ -608,10 +723,13 @@ def score_symbol(
     try:
         idx = {d: i for i, d in enumerate(dates)}
         bidx = {d: i for i, d in enumerate(bench_dates or ())}
+        long_cols = ", ".join(f"fwd_{h}d" for h in LONG_HORIZONS)
+        long_missing = " OR ".join(f"fwd_{h}d IS NULL" for h in LONG_HORIZONS)
         with _lock:
             db = _db()
             rows = db.execute(
-                "SELECT id, asof_date, price FROM verdicts WHERE symbol = ? AND scored_at IS NULL",
+                f"SELECT id, asof_date, price, scored_at, {long_cols} FROM verdicts "
+                f"WHERE symbol = ? AND (scored_at IS NULL OR {long_missing})",
                 ((symbol or "").upper(),),
             ).fetchall()
             updates: list[tuple] = []
@@ -628,26 +746,55 @@ def score_symbol(
                 base = float(closes[i]) if i < len(closes) and closes[i] else float(r["price"] or 0)
                 if not base:
                     continue
-                f5 = _fwd(closes, i, 5, base)
-                f20 = _fwd(closes, i, 20, base)
-                if f20 is None:
-                    continue  # not enough history yet — leave unscored and revisit next run
-                b5 = b20 = None
                 bj = bidx.get(r["asof_date"])
-                if bj is not None and bench_closes and bench_closes[bj]:
-                    bbase = float(bench_closes[bj])
-                    # BOTH ends located by date. Stepping 20 *benchmark* bars from the anchor was
+                bbase = float(bench_closes[bj]) if (
+                    bj is not None and bench_closes and bench_closes[bj]) else None
+
+                def _bench(h: int) -> float | None:
+                    # BOTH ends located by date. Stepping `h` *benchmark* bars from the anchor was
                     # only half the promise in the docstring: when the symbol is missing bars the
                     # benchmark has (halt, late listing, thin crypto calendar), the two windows end
-                    # on different days and the "excess" compares mismatched periods — precisely the
-                    # case the date-anchoring was introduced to avoid.
-                    b5 = _fwd_to_date(bench_closes, bidx, dates, i, 5, bbase)
-                    b20 = _fwd_to_date(bench_closes, bidx, dates, i, 20, bbase)
-                updates.append((f5, f20, b5, b20, now, r["id"]))
+                    # on different days and the "excess" compares mismatched periods — precisely
+                    # the case the date-anchoring was introduced to avoid.
+                    if bbase is None:
+                        return None
+                    return _fwd_to_date(bench_closes, bidx, dates, i, h, bbase)
+
+                fwd: dict[int, float | None] = {}
+                bench: dict[int, float | None] = {}
+                unscored = r["scored_at"] is None
+                if unscored:
+                    f20 = _fwd(closes, i, 20, base)
+                    if f20 is None:
+                        continue  # not enough history yet — leave unscored and revisit next run
+                    fwd[5], fwd[20] = _fwd(closes, i, 5, base), f20
+                    bench[5], bench[20] = _bench(5), _bench(20)
+                for h in LONG_HORIZONS:
+                    if r[f"fwd_{h}d"] is not None:
+                        continue
+                    f = _fwd(closes, i, h, base)
+                    if f is None:
+                        continue
+                    fwd[h], bench[h] = f, _bench(h)
+                if not fwd:
+                    continue
+                updates.append((
+                    *(fwd.get(h) for h in HORIZONS),
+                    *(bench.get(h) for h in HORIZONS),
+                    now if unscored else None,
+                    r["id"],
+                ))
             if updates:
+                # COALESCE: a horizon this visit did not compute is passed as NULL and keeps
+                # whatever the row already had — so the one statement serves both the first
+                # grading and every later fill-in without ever overwriting a written mark.
+                sets = ", ".join(
+                    f"{c}=COALESCE(?, {c})"
+                    for c in (*(f"fwd_{h}d" for h in HORIZONS), *(f"bench_fwd_{h}d" for h in HORIZONS))
+                )
                 db.executemany(
-                    "UPDATE verdicts SET fwd_5d=?, fwd_20d=?, bench_fwd_5d=?, bench_fwd_20d=?, "
-                    "scored_at=? WHERE id=?", updates
+                    f"UPDATE verdicts SET {sets}, scored_at=COALESCE(scored_at, ?) WHERE id=?",
+                    updates,
                 )
                 db.commit()
             return len(updates)
@@ -749,14 +896,14 @@ def retention_days() -> int:
     return _RETAIN_DAYS
 
 
-def prune(retain_days: int = _RETAIN_DAYS) -> int:
+def prune(retain_days: int = _RETAIN_DAYS, *, notes_retain_days: int = _NOTES_RETAIN_DAYS) -> int:
     """Drop rows past the retention window. Returns rows removed."""
     try:
-        cutoff = time.time() - retain_days * 86_400
+        now = time.time()
         with _lock:
             db = _db()
-            n = db.execute("DELETE FROM verdicts WHERE ts < ?", (cutoff,)).rowcount
-            n += db.execute("DELETE FROM notes WHERE ts < ?", (cutoff,)).rowcount
+            n = db.execute("DELETE FROM verdicts WHERE ts < ?", (now - retain_days * 86_400,)).rowcount
+            n += db.execute("DELETE FROM notes WHERE ts < ?", (now - notes_retain_days * 86_400,)).rowcount
             db.commit()
         return n
     except Exception:  # noqa: BLE001
@@ -780,27 +927,42 @@ def stats() -> dict:
             # Two scorecards, deliberately NOT merged: 'model' is what the analyst *said* on the
             # watchlist, 'sandbox' is what the paper trader actually *bought*. Different processes
             # answering different questions — averaging them would hide which one works.
-            def _card(origin: str, signals: Sequence[str], bullish: bool) -> sqlite3.Row:
+            def _card(origin: str, signals: Sequence[str], bullish: bool, h: int) -> sqlite3.Row:
                 # `beat` uses a comparison whose direction flips for sells: owning the index was the
                 # alternative to holding, so a sell is right when the name UNDERperforms it.
                 cmp_ = ">" if bullish else "<"
                 marks = ",".join("?" for _ in signals)
+                f, b = f"fwd_{h}d", f"bench_fwd_{h}d"
                 return db.execute(
-                    f"SELECT COUNT(*) n, AVG(fwd_20d > 0) rate, AVG(fwd_20d) avg, "
-                    f"AVG(CASE WHEN bench_fwd_20d IS NOT NULL THEN fwd_20d - bench_fwd_20d END) exc, "
-                    f"AVG(CASE WHEN bench_fwd_20d IS NOT NULL "
-                    f"         THEN fwd_20d {cmp_} bench_fwd_20d END) beat "
-                    f"FROM verdicts WHERE scored_at IS NOT NULL AND origin = ? "
+                    f"SELECT COUNT(*) n, COUNT(DISTINCT symbol) syms, AVG({f} > 0) rate, "
+                    f"AVG({f}) avg, "
+                    f"AVG(CASE WHEN {b} IS NOT NULL THEN {f} - {b} END) exc, "
+                    f"AVG(CASE WHEN {b} IS NOT NULL THEN {f} {cmp_} {b} END) beat "
+                    f"FROM verdicts WHERE {f} IS NOT NULL AND origin = ? "
                     f"AND LOWER(COALESCE(signal,'')) IN ({marks})",
                     (origin, *signals),
                 ).fetchone()
 
             cards = {
-                "buy_calls": (_card("model", BUY_SIGNALS, True), True),
-                "sell_calls": (_card("model", SELL_SIGNALS, False), False),
-                "sandbox_buys": (_card("sandbox", BUY_SIGNALS, True), True),
-                "sandbox_sells": (_card("sandbox", SELL_SIGNALS, False), False),
+                "buy_calls": ("model", BUY_SIGNALS, True),
+                "sell_calls": ("model", SELL_SIGNALS, False),
+                "sandbox_buys": ("sandbox", BUY_SIGNALS, True),
+                "sandbox_sells": ("sandbox", SELL_SIGNALS, False),
             }
+            rows_20 = {label: _card(*spec, 20) for label, spec in cards.items()}
+            # Long horizons on the ANALYST's cards only. The sandbox's own decisions are a handful
+            # of fills — the account can never learn a strategy lesson from its own outcomes at any
+            # horizon, so those are reported as dollars in the ledger cost block, never as a rate.
+            rows_long = {
+                label: {h: _card(*spec, h) for h in LONG_HORIZONS}
+                for label, spec in cards.items() if spec[0] == "model"
+            }
+            coverage = db.execute(
+                "SELECT " + ", ".join(
+                    f"SUM(fwd_{h}d IS NOT NULL) h{h}, MIN(CASE WHEN fwd_{h}d IS NULL THEN ts END) p{h}"
+                    for h in HORIZONS
+                ) + " FROM verdicts"
+            ).fetchone()
             by_origin = {
                 r["origin"]: r["c"]
                 for r in db.execute("SELECT origin, COUNT(*) c FROM verdicts GROUP BY origin")
@@ -810,6 +972,20 @@ def stats() -> dict:
             "scored": v["scored"] or 0,
             "symbols": v["syms"] or 0,
             "oldest_ts": v["oldest"],
+            "retention_days": _RETAIN_DAYS,
+            # Per horizon: rows carrying the mark, and the age of the oldest row still without it.
+            # An `oldest_pending_age_days` far past the horizon's own length is a row nothing can
+            # grade (delisted, re-dated bar), not a backlog — visible here so it is never mistaken
+            # for one.
+            "horizons": {
+                f"{h}d": {
+                    "scored": coverage[f"h{h}"] or 0,
+                    "oldest_pending_age_days": (
+                        round((time.time() - float(coverage[f"p{h}"])) / 86_400, 1)
+                        if coverage[f"p{h}"] is not None else None),
+                }
+                for h in HORIZONS
+            },
             "notes": n["c"] or 0,
             "notes_by_kind": {r["kind"]: r["c"] for r in by_kind},
             "by_origin": by_origin,
@@ -819,23 +995,36 @@ def stats() -> dict:
         # index? The number that says whether any of this works — surfaced even when unflattering.
         # `correct_rate_20d` means the same thing on both sides (higher is better), so buys and sells
         # can be read side by side without mentally inverting one of them.
-        for label, (row, bullish) in cards.items():
+        for label, (_origin, _signals, bullish) in cards.items():
+            row = rows_20[label]
             if (row["n"] or 0) < _MIN_SAMPLES:
                 continue
-            card = {
-                "n": row["n"],
-                "avg_fwd_20d_pct": round(float(row["avg"] or 0), 2),
-            }
-            if row["exc"] is not None:
-                sign = 1.0 if bullish else -1.0
-                key = "avg_excess_20d_pct" if bullish else "avg_avoided_20d_pct"
-                card[key] = round(sign * float(row["exc"]), 2)
-                card["correct_rate_20d"] = round(float(row["beat"] or 0), 3)
+            card = _card_block(row, bullish, 20)
+            card["n_symbols"] = row["syms"]
+            for h, hrow in rows_long.get(label, {}).items():
+                if (hrow["n"] or 0) >= _MIN_SAMPLES:
+                    block = _card_block(hrow, bullish, h)
+                    block["n_symbols"] = hrow["syms"]
+                    card[f"at_{h}d"] = block
             out[label] = card
         return out
     except Exception:  # noqa: BLE001
         log.warning("memory: stats failed", exc_info=True)
         return {"error": "unavailable"}
+
+
+def _card_block(row: sqlite3.Row, bullish: bool, h: int) -> dict[str, Any]:
+    """One scorecard at one horizon, from a `_card` aggregate row. Keys carry the horizon."""
+    card: dict[str, Any] = {
+        "n": row["n"],
+        f"avg_fwd_{h}d_pct": round(float(row["avg"] or 0), 2),
+    }
+    if row["exc"] is not None:
+        sign = 1.0 if bullish else -1.0
+        key = f"avg_excess_{h}d_pct" if bullish else f"avg_avoided_{h}d_pct"
+        card[key] = round(sign * float(row["exc"]), 2)
+        card[f"correct_rate_{h}d"] = round(float(row["beat"] or 0), 3)
+    return card
 
 
 # --------------------------------------------------------------------------------------- helpers

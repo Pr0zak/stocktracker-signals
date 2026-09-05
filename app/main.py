@@ -586,7 +586,9 @@ async def memory_backfill(every: int = 3, rng: str = "2y") -> dict:
     """
     # Ranges beyond the retention window record rows that `prune` deletes on the very next scan, so
     # the endpoint would cheerfully report writing thousands of rows that were already doomed.
-    allowed = {"6mo", "1y", "2y"}
+    # 5y joined the list with the five-year retention of 2026-09-04: it is the one range that
+    # seeds one-year marks four years deep instead of one.
+    allowed = {"6mo", "1y", "2y", "5y"}
     if rng not in allowed:
         raise HTTPException(
             status_code=422,

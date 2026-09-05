@@ -152,7 +152,9 @@ no block at all; infer nothing from its absence.
 anecdote-grade evidence. Never let cycle folklore override what current price and momentum are doing.
 - If the snapshot includes `track_record`, that is measured history for setups whose NUMBERS closely \
 match the one in front of you now, scored against what the price actually did over the following 20 \
-trading days. `this_symbol` is this same ticker; `analogues` is the same pattern across other names. \
+trading days — and, where enough of those setups are old enough, over 63 and 252 sessions as \
+`vs_benchmark_63d` / `vs_benchmark_252d`. `this_symbol` is this same ticker; `analogues` is the same \
+pattern across other names. \
 IMPORTANT: most of these rows are historical setups replayed from price data and carry NO call of \
 their own — so describe them as past SETUPS or OCCURRENCES, never as "past calls" or "predictions". \
 Only the `when_model_said_buy` block (present just when there are enough real verdicts) describes \
@@ -166,7 +168,10 @@ side is already inverted for you (a sell counts as correct when the name UNDERpe
 since owning the index was the alternative to holding), so never re-invert it yourself. A \
 correct_rate materially below 0.50 on the side you are leaning toward is a direct instruction to \
 LOWER conviction there, and you should say so plainly. (c) ALWAYS respect `n` — under ~20 is anecdote; treat \
-5-20 as a faint hint and say the sample is small if you cite it. (d) This is self-selected data \
+5-20 as a faint hint and say the sample is small if you cite it. Every block also carries `n_symbols`: \
+`n` counts BARS, and adjacent bars on one name share almost their whole forward window, so at the \
+longer horizons forty bars from two names is nearer two observations than forty — weight a block by \
+`n_symbols`, not `n`, whenever the two disagree. (d) This is self-selected data \
 (verdicts exist only for names the user tracks, in whatever regime happened to occur), so it is real \
 evidence about CALIBRATION, not a law. It refines conviction; it never manufactures a call that price \
 and momentum do not support. Mention it in at most ONE rationale bullet, and only when it genuinely \
@@ -1153,19 +1158,25 @@ discount as free. Small gaps (<2%) are noise — ignore them. Never assume a gap
 filled within 10 days only ~39% of the time. Buying general weakness (a name that merely closed down) \
 measured NEGATIVE, so only the gap itself matters.
 
-If a candidate carries a `track_record` block, that is what setups with THESE numbers actually did over \
-the next 20 trading days, measured on this app's own universe. Most rows are historical setups replayed \
-from price data and carry no call of their own — so treat them as OCCURRENCES, not past predictions. \
-The ONLY figure worth acting on is `vs_benchmark`: median EXCESS return and `beat_rate_20d` against the \
-S&P over the same window. Where a `when_model_said_buy` / `when_model_said_sell` block is present it \
-reports `correct_rate_20d`, on which HIGHER IS BETTER for both sides — the sell side is pre-inverted, \
+If a candidate carries a `track_record` block, that is what setups with THESE numbers actually did \
+afterwards, measured on this app's own universe. Most rows are historical setups replayed from price \
+data and carry no call of their own — so treat them as OCCURRENCES, not past predictions. The ONLY \
+figures worth acting on are the benchmark-relative ones: `vs_benchmark` (20 sessions), and where \
+present `vs_benchmark_63d` and `vs_benchmark_252d` (a quarter and a year), each a median EXCESS \
+return and a beat rate against the S&P over the identical window. This account's objective is \
+measured in years, so when the 252-session block exists it outranks the 20-day one: a setup that is \
+weak over a month and ahead of the index a year later is a setup to hold, not to avoid. Where a \
+`when_model_said_buy` / `when_model_said_sell` block is present it reports `correct_rate_20d` (and the \
+same at the longer horizons), on which HIGHER IS BETTER for both sides — the sell side is pre-inverted, \
 so do not flip it again. Ignore `positive_rate_20d` entirely — equities drift up, so ~55-60% of any \
 20-day window is positive and a raw win rate near that is evidence of nothing. Use it as a TIE-BREAKER \
 between candidates you already like on trend and momentum, and as a reason to SIZE DOWN or skip when a \
 setup's measured excess is negative. It must never manufacture a buy on its own. Hard limits: respect \
-`n` (under ~20 is anecdote), and remember the sample is roughly two years of ONE market regime on a \
-narrow universe — a strong-looking edge there can be regime luck, not skill, so it may adjust \
-conviction by a little and must never override the conviction floor, position caps, or the strategy note.
+`n` (under ~20 is anecdote) and, at the longer horizons, `n_symbols` above `n` — adjacent bars on one \
+name share almost their whole forward window, so forty bars from two names is nearer two observations \
+than forty; and remember the sample is a few years of a narrow universe — a strong-looking edge there \
+can be regime luck, not skill, so it may adjust conviction by a little and must never override the \
+conviction floor, position caps, or the strategy note.
 
 A position may carry `holding_days`, `capital_gains` ("short_term" / "long_term") and \
 `days_to_long_term`. This is a TAXABLE account: a gain realised inside one year is taxed as ordinary \
