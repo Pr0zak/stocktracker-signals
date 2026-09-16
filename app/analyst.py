@@ -1050,7 +1050,10 @@ is the fixed shelf of broad-market vehicles this account always has access to, "
 name surfaced today by a live screen. This universe is the account's OWN — it is not anybody's \
 watchlist, so a name being present carries no endorsement and its absence carries no judgement); the \
 account `settings` (risk_tolerance, retirement_date, exit_date, max_position_pct, cash_floor_pct, \
-allow_crypto, allow_etf); and `strategy_note` — the weekly game plan (stance, cash target, per-exposure \
+allow_crypto, allow_etf, and when a recurring deposit is on, `deposit_dollars_per_month` — the cash \
+the account receives each month on a fixed schedule. Use that figure, not `monthly_deposit`, which \
+is dollars per instalment and is paid twice a month when `deposit_frequency` is "semimonthly"); and \
+`strategy_note` — the weekly game plan (stance, cash target, per-exposure \
 target weights) you should steer toward (may be null early on).
 
 Positions/candidates that share an `exposure_group` are the SAME economic exposure — measured on this \
@@ -1391,7 +1394,10 @@ WEEKLY game plan that a daily execution model then steers the book toward. You r
 (total return, return vs the S&P benchmark, max drawdown), a `market` snapshot (indices, VIX, sector \
 leaders/laggards, the S&P's 50/200-day trend), the tradable `universe`, `exposure_groups` (every \
 exposure group you may name, mapped to the tickers that belong to it), and the account `settings` \
-(risk_tolerance, retirement_date, exit_date).
+(risk_tolerance, retirement_date, exit_date, and when a recurring deposit is on, \
+`deposit_dollars_per_month` — the cash the account receives each month on a fixed schedule; \
+`monthly_deposit` beside it is dollars per instalment, paid twice a month when `deposit_frequency` \
+is "semimonthly").
 
 Return a `StrategyNote` — the north star for the coming week:
 - stance: exactly one of "constructive", "neutral", or "defensive", grounded in the regime (S&P vs its \

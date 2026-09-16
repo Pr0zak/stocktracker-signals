@@ -164,7 +164,11 @@ DEFAULT_SETTINGS = {
     "goal_amount": None,               # target $ the AI should push toward (None = no explicit goal)
     "goal_date": None,                 # ISO date by which to hit the goal
     # Funds automation
-    "monthly_deposit": 0.0,            # auto-add this much fictional cash each new month (0 = off)
+    "monthly_deposit": 0.0,            # auto-add this much fictional cash per instalment (0 = off)
+    # How often that amount is paid in: "monthly" (first tick of each month, the historical
+    # behaviour) or "semimonthly" (first tick of the month AND the first tick on or after the 15th).
+    # The amount is PER INSTALMENT either way, so twice-monthly at $250 contributes $500 a month.
+    "deposit_frequency": "monthly",
     # Universe
     "exclusions": [],                  # tickers the AI must never buy (uppercase, e.g. ["TSLA"])
     # Realism: mimic a retail brokerage account's actual rules.
@@ -224,7 +228,11 @@ def _defaults(arm: str = MAIN_ARM, *, engine: str = "llm", label: str | None = N
         # has never run on this arm. Distinguishing "approved" from "never ran" is the point.
         "last_review": {},
         "last_decision_date": None,       # ET yyyy-mm-dd of the last DECISION (drives weekly cadence)
-        "last_deposit_month": None,       # "yyyy-mm" of the last recurring deposit
+        # Period key of the last recurring deposit: "yyyy-mm" when monthly, "yyyy-mm-H1"/"-H2" when
+        # twice-monthly. Ledgers written before the twice-monthly setting existed carry the same
+        # value under the old name `last_deposit_month`, which sandbox_job.due_deposit_periods still
+        # reads as a fallback and apply_recurring_deposit retires on the next deposit.
+        "last_deposit_period": None,
         "last_weekly_review_date": None,
         "last_strategy_note": None,
     }
@@ -432,7 +440,7 @@ def create_arm(arm: str, *, engine: str = "rules", label: str | None = None,
             "last_strategy_note": copy.deepcopy(src.get("last_strategy_note")),
             # Deliberately NOT copied: last_tick_date and last_decision_date. Inheriting today's
             # cursor would gate the new arm out of its own first tick.
-            "last_deposit_month": src.get("last_deposit_month"),
+            "last_deposit_period": src.get("last_deposit_period") or src.get("last_deposit_month"),
             # Unsettled proceeds belong to trades this arm never made.
             "unsettled": [],
             "recent_loss_sales": {},

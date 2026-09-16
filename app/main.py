@@ -3236,21 +3236,13 @@ async def _run_extra_arm(
             "reason": f"Interest on idle cash at {settings.get('cash_apy_pct')}% APY"}, arm)
 
     dep = float(settings.get("monthly_deposit") or 0.0)
-    month = now.strftime("%Y-%m")
-    if dep > 0 and blob.get("last_deposit_month") != month:
-        if not spy_price:
-            warnings.append("monthly deposit deferred — no benchmark quote; will retry next tick")
-        else:
-            blob["benchmark"]["shares"] = round(blob["benchmark"]["shares"] + dep / spy_price, 6)
-            blob["benchmark"]["cost_basis"] = round(blob["benchmark"]["cost_basis"] + dep, 2)
-            blob["cash"] = round(blob["cash"] + dep, 2)
-            blob["funded_total"] = round(blob["funded_total"] + dep, 2)
-            blob["last_deposit_month"] = month
-            sandbox_store.append_trade({
-                "ts": time.time(), "date": sandbox_job.today_et_str(now), "symbol": "CASH",
-                "side": "deposit", "status": "filled", "shares": 0.0, "price": None,
-                "gross": round(dep, 2), "cash_after": blob["cash"], "source": "recurring",
-                "reason": f"Recurring monthly deposit ${dep:,.0f}"}, arm)
+    due = sandbox_job.due_deposit_periods(blob, now=now)
+    if due and not spy_price:
+        warnings.append("recurring deposit deferred — no benchmark quote; will retry next tick")
+    else:
+        for period in due:
+            sandbox_store.append_trade(sandbox_job.apply_recurring_deposit(
+                blob, amount=dep, spy_price=spy_price, period=period, now=now), arm)
 
     # Bound before the engine fork: only the llm branch can populate it, but every branch reaches
     # the trade-log write below, and a name defined in one arm of a fork is not defined in the others.
@@ -3463,32 +3455,27 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 "reason": f"Interest on idle cash at {settings.get('cash_apy_pct')}% APY",
             })
 
-        # Recurring monthly deposit (DCA) — added once per ET calendar month, BEFORE the decision so the
-        # AI can deploy it; the benchmark shadow gets the same cash on the same day.
+        # Recurring deposit (DCA) — paid once per ET calendar month, or twice when the account is set
+        # to "semimonthly", BEFORE the decision so the AI can deploy it; the benchmark shadow gets
+        # the same cash on the same day. More than one period comes back only when a window was
+        # missed (a service outage spanning the 1st, say), and each is credited as its own row.
         dep = float(settings.get("monthly_deposit") or 0.0)
-        month = now.strftime("%Y-%m")
-        if dep > 0 and blob.get("last_deposit_month") != month:
+        due = sandbox_job.due_deposit_periods(blob, now=now)
+        if due:
             try:
                 dspy = (await market_now.fetch_quotes(_http, ["^GSPC"])).get("^GSPC", {}).get("price")
             except Exception:  # noqa: BLE001
                 dspy = None
             if not dspy:
                 # Skip the whole deposit rather than credit cash with no benchmark leg. Crucially the
-                # month cursor is NOT advanced, so it retries tomorrow instead of silently losing the
-                # month — the old code burned the cursor either way and left the shadow permanently
-                # short by one deposit, flattering every return figure measured against it.
-                warnings.append("monthly deposit deferred — no benchmark quote; will retry next tick")
+                # period cursor is NOT advanced, so it retries tomorrow instead of silently losing the
+                # instalment — the old code burned the cursor either way and left the shadow
+                # permanently short by one deposit, flattering every return figure measured against it.
+                warnings.append("recurring deposit deferred — no benchmark quote; will retry next tick")
             else:
-                blob["benchmark"]["shares"] = round(blob["benchmark"]["shares"] + dep / dspy, 6)
-                blob["benchmark"]["cost_basis"] = round(blob["benchmark"]["cost_basis"] + dep, 2)
-                blob["cash"] = round(blob["cash"] + dep, 2)
-                blob["funded_total"] = round(blob["funded_total"] + dep, 2)
-                blob["last_deposit_month"] = month
-                sandbox_store.append_trade({
-                    "ts": time.time(), "date": sandbox_job.today_et_str(now), "symbol": "CASH",
-                    "side": "deposit", "status": "filled", "shares": 0.0, "price": None,
-                    "gross": round(dep, 2), "cash_after": blob["cash"], "source": "recurring",
-                    "reason": f"Recurring monthly deposit ${dep:,.0f}"})
+                for period in due:
+                    sandbox_store.append_trade(sandbox_job.apply_recurring_deposit(
+                        blob, amount=dep, spy_price=dspy, period=period, now=now))
 
         # Cadence: "weekly" decides at most every 7 days (NAV still marks daily); "daily" always decides.
         from datetime import date as _date
@@ -3930,6 +3917,7 @@ class SandboxSettingsPatch(BaseModel):
     goal_amount: float | None = None
     goal_date: str | None = None
     monthly_deposit: float | None = None
+    deposit_frequency: str | None = None
     max_position_pct: float | None = None
     cash_floor_pct: float | None = None
     allow_crypto: bool | None = None
@@ -4383,6 +4371,9 @@ async def sandbox_set_settings_endpoint(
             s["goal_amount"] = v if v > 0 else None
         if "monthly_deposit" in d:
             s["monthly_deposit"] = max(0.0, float(d["monthly_deposit"]))
+        if "deposit_frequency" in d and \
+                str(d["deposit_frequency"]).lower() in sandbox_job.DEPOSIT_FREQUENCIES:
+            s["deposit_frequency"] = str(d["deposit_frequency"]).lower()
         if "cadence" in d and str(d["cadence"]).lower() in ("daily", "weekly"):
             s["cadence"] = str(d["cadence"]).lower()
         if "max_turnover_pct" in d:

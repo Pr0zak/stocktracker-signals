@@ -95,6 +95,42 @@ def test_an_unrelated_setting_survives_a_partial_patch(client):
     assert s["avoid_wash_sales"] is True and s["master_enabled"] is True
 
 
+def test_the_deposit_frequency_round_trips_both_ways(client):
+    assert client.get("/sandbox/settings").json()["deposit_frequency"] == "monthly"
+    client.post("/sandbox/settings", json={"deposit_frequency": "semimonthly"})
+    assert client.get("/sandbox/settings").json()["deposit_frequency"] == "semimonthly"
+    # Back OFF is the direction that silently failed before, and here it is worth twice the money:
+    # an account stuck on twice-monthly contributes double what its amount says.
+    client.post("/sandbox/settings", json={"deposit_frequency": "monthly"})
+    assert client.get("/sandbox/settings").json()["deposit_frequency"] == "monthly"
+
+
+def test_an_unknown_deposit_frequency_is_ignored_rather_than_stored(client):
+    """Same shape as `cadence` beside it: an unrecognised value leaves the setting alone instead of
+    landing a string the tick would then have to interpret."""
+    client.post("/sandbox/settings", json={"deposit_frequency": "semimonthly"})
+    client.post("/sandbox/settings", json={"deposit_frequency": "fortnightly"})
+    assert client.get("/sandbox/settings").json()["deposit_frequency"] == "semimonthly"
+
+
+def test_setting_the_frequency_does_not_disturb_the_amount(client):
+    client.post("/sandbox/settings", json={"monthly_deposit": 250.0})
+    client.post("/sandbox/settings", json={"deposit_frequency": "semimonthly"})
+    s = client.get("/sandbox/settings").json()
+    assert s["monthly_deposit"] == 250.0 and s["deposit_frequency"] == "semimonthly"
+
+
+def test_manual_funding_does_not_consume_the_scheduled_deposit(client):
+    """Topping the account up by hand must not stamp the recurring cursor — that would silently
+    swallow the period's automatic deposit, and the two are different kinds of money."""
+    client.post("/sandbox/settings", json={"monthly_deposit": 250.0})
+    client.post("/sandbox/fund", json={"amount": 1000.0})
+    import app.sandbox_store as ss
+    blob = ss.get("main")
+    assert blob.get("last_deposit_period") is None
+    assert blob.get("last_deposit_month") is None
+
+
 # ---------------------------------------------------------------- read routes the app decodes
 
 def test_health_reports_the_configured_models(client):

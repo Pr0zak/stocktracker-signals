@@ -82,6 +82,12 @@ def settings_for_prompt(settings: dict, today: dt.date | None = None) -> dict:
     age = effective_age(settings, today)
     if age is not None:
         out["current_age"] = age
+    # `monthly_deposit` is dollars per INSTALMENT, so a twice-monthly account contributes double it.
+    # Spell the per-month figure out rather than leaving the model to multiply: this is the dry
+    # powder it plans around, and a strategist that believes $250 a month is coming when $500 is
+    # will hold too much cash waiting for it.
+    if float(settings.get("monthly_deposit") or 0.0) > 0.0:
+        out["deposit_dollars_per_month"] = monthly_deposit_total(settings)
     return out
 
 
@@ -1007,6 +1013,127 @@ def accrue_cash_interest(blob: dict, *, now: dt.datetime | None = None) -> float
     return amount
 
 
+# Day of the month the second instalment of a twice-monthly deposit falls due. The 1st and the 15th
+# is how a semi-monthly paycheque actually lands, and it is the only split on offer: a free-form pair
+# of dates is a lot of configuration surface for a dial whose entire job is "twice, not once".
+SEMI_MONTHLY_SECOND_DAY = 15
+
+# How often `monthly_deposit` is paid in. The amount is PER INSTALMENT in both modes, so switching to
+# "semimonthly" without changing the amount doubles the monthly contribution — deliberately, because
+# the alternative (silently halving each instalment) changes how much money the account receives
+# without the user touching the number they set. The UI states the monthly total either way.
+DEPOSIT_FREQUENCIES = ("monthly", "semimonthly")
+
+
+def deposit_frequency(settings: dict) -> str:
+    """The normalised deposit frequency, defaulting to the historical monthly behaviour."""
+    v = str((settings or {}).get("deposit_frequency") or "monthly").strip().lower()
+    return v if v in DEPOSIT_FREQUENCIES else "monthly"
+
+
+def due_deposit_periods(blob: dict, *, now: dt.datetime | None = None) -> list[str]:
+    """Which recurring-deposit periods are unpaid as of `now`, oldest first. [] when nothing is due.
+
+    A period key is "yyyy-mm" when the deposit is monthly and "yyyy-mm-H1" / "yyyy-mm-H2" when it is
+    twice-monthly, H2 falling due on the SEMI_MONTHLY_SECOND_DAY. The monthly key is unchanged from
+    what `last_deposit_month` has always held, which is what lets an existing ledger keep its cursor
+    without a migration step.
+
+    Returning a LIST rather than a bool is what makes a missed window recoverable. The old cursor
+    fired on the first tick of the month whenever that tick happened, so a monthly deposit could
+    never be lost inside its own month; with two windows a service that was down from the 1st to the
+    16th would otherwise skip H1 silently and short the account a quarter of its yearly
+    contributions. Both unpaid halves come back on the next tick instead.
+
+    Catch-up stops at the current month, deliberately. An outage spanning whole months is not repaid:
+    the deposit's entire point is buying at the price on the day, and settling six months of arrears
+    at one afternoon's quote — with the benchmark shadow buying the same lump at the same quote —
+    would put a fiction in both legs of the comparison. That matches how the monthly deposit has
+    always behaved, which is to say a missed month stays missed.
+
+    Switching frequency mid-month is resolved conservatively in the direction that never invents
+    money: a "yyyy-mm" cursor counts as having paid that month's first half (so flipping to
+    semimonthly on the 20th tops the month up with H2 and nothing more), and an H1/H2 cursor counts
+    as having paid the whole month (so flipping back to monthly pays nothing further that month).
+    """
+    settings = blob.get("settings") or {}
+    if float(settings.get("monthly_deposit") or 0.0) <= 0.0:
+        return []
+    now = now or now_et()
+    month = now.strftime("%Y-%m")
+    # `last_deposit_month` is the pre-semimonthly name for the same cursor; it is still what a live
+    # ledger on disk carries until its first deposit under the new code rewrites it.
+    last = str(blob.get("last_deposit_period") or blob.get("last_deposit_month") or "")
+
+    if deposit_frequency(settings) != "semimonthly":
+        # Any cursor inside this month — "2026-09", "2026-09-H1" or "2026-09-H2" — means this month
+        # has already had a deposit, so the month is done.
+        return [] if last.startswith(month) else [month]
+
+    keys = [f"{month}-H1"]
+    if now.day >= SEMI_MONTHLY_SECOND_DAY:
+        keys.append(f"{month}-H2")
+    if not last.startswith(month):
+        return keys                       # new month (or first ever): everything due so far
+    if last == month:
+        return [k for k in keys if k != f"{month}-H1"]   # legacy monthly cursor covers H1 only
+    # "2026-09-H2" > "2026-09-H1" lexically, so a plain comparison says which halves are covered.
+    return [k for k in keys if k > last]
+
+
+def deposit_reason(amount: float, period: str) -> str:
+    """The human-readable ledger line for one recurring instalment.
+
+    The trade log is the only durable, human-readable history this account has, so a row has to say
+    WHICH of the month's deposits it was — two identical "$250 recurring deposit" lines a fortnight
+    apart are indistinguishable from one double-credited by a bug.
+    """
+    if period.endswith("-H1"):
+        return f"Recurring deposit ${amount:,.0f} — start of month (1 of 2)"
+    if period.endswith("-H2"):
+        return f"Recurring deposit ${amount:,.0f} — mid-month (2 of 2)"
+    return f"Recurring monthly deposit ${amount:,.0f}"
+
+
+def apply_recurring_deposit(
+    blob: dict, *, amount: float, spy_price: float, period: str,
+    now: dt.datetime | None = None, ts: float | None = None,
+) -> dict:
+    """Credit ONE instalment to `blob` and return the trade row the caller must append.
+
+    Mutates cash, funded_total, the shadow benchmark and the deposit cursor together, because they
+    are one transaction: cash that arrives without its benchmark leg leaves the shadow permanently
+    short and flatters every return figure measured against it. The caller is responsible for
+    refusing to call this at all when the benchmark cannot be priced — see the tick, which defers
+    the whole deposit and leaves the cursor alone so it retries on the next tick.
+
+    The deposit raises `funded_total` and so is NOT return: `total_return_pct` divides by it, which
+    is what keeps a contribution from reading as a rally.
+    """
+    blob["benchmark"]["shares"] = round(blob["benchmark"]["shares"] + amount / spy_price, 6)
+    blob["benchmark"]["cost_basis"] = round(blob["benchmark"]["cost_basis"] + amount, 2)
+    blob["cash"] = round(float(blob["cash"]) + amount, 2)
+    blob["funded_total"] = round(float(blob["funded_total"]) + amount, 2)
+    blob["last_deposit_period"] = period
+    # Keep the pre-semimonthly cursor written too, holding this deposit's MONTH. Nothing in this code
+    # reads it any more — `last_deposit_period` wins the `or` in due_deposit_periods — but deleting it
+    # would make a rollback to the previous release re-deposit the current month across every book,
+    # because that code knows only the old key and would find none. A stale twin is cheaper than that.
+    blob["last_deposit_month"] = period[:7]
+    return {
+        "ts": ts if ts is not None else time.time(),
+        "date": today_et_str(now), "symbol": "CASH", "side": "deposit", "status": "filled",
+        "shares": 0.0, "price": None, "gross": round(amount, 2), "cash_after": blob["cash"],
+        "source": "recurring", "reason": deposit_reason(amount, period),
+    }
+
+
+def monthly_deposit_total(settings: dict) -> float:
+    """What the recurring deposit adds per month, across however many instalments it is paid in."""
+    amount = float((settings or {}).get("monthly_deposit") or 0.0)
+    return amount * (2 if deposit_frequency(settings) == "semimonthly" else 1)
+
+
 # How far the weekly targets may fall short of (100 - cash_target) before it counts as a real hole
 # rather than rounding. A point or two is noise; ten is a policy decision nobody made.
 ALLOCATION_SLACK_PCT = 3.0
@@ -1903,8 +2030,9 @@ def validate_and_fill(
     # differ by exactly 0.01, and the strict `< 0.01` then aborted a perfectly correct tick.
     # Slippage manufactures that third decimal and real quotes are round numbers, so the boundary is
     # hit often — measured at 1.6% of ticks, each one a lost trading day, a hole in the equity curve,
-    # and once a month an orphaned deposit row already appended to the append-only log. `cash` and
-    # the notionals accumulate the same floats, so the true invariant is exact to float noise.
+    # and once or twice a month an orphaned deposit row already appended to the append-only log.
+    # `cash` and the notionals accumulate the same floats, so the true invariant is exact to float
+    # noise.
     drift = abs(cash - (cash0 + sell_notional - buy_notional))
     assert drift < 1e-6, (
         f"cash not conserved: cash={cash!r} vs cash0+sells-buys="
