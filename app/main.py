@@ -2,16 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import math
 import copy
+import os
 import time
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -57,11 +59,51 @@ _BRIEF_INCOMPLETE_TTL = 300
 _CALENDAR_MAX_EVENTS = 60
 _log = logging.getLogger(__name__)
 
+# SEC-2: the service has no authentication otherwise, and it binds 0.0.0.0:8000 — reachable from the
+# whole LAN and, via the CT 444 Tailscale subnet router, the tailnet. A shared secret from the
+# environment (the service is already started with EnvironmentFile=/opt/signals/.env) gates every
+# route that can mutate state or read back something sensitive (the watchlist, API keys, the paper
+# book). See require_api_token() and lifespan() below.
+_API_TOKEN_ENV = "SIGNALS_API_TOKEN"
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1"}
+
+
+def _is_loopback(request: Request) -> bool:
+    """True when the TCP peer is this host. The systemd timer units that drive scans/sandbox ticks
+    all call the API with local `curl http://127.0.0.1:8000/...` (see deploy/*.service) and have no
+    mechanism to be handed the shared secret, so they're exempted on the connection itself rather
+    than a header. Nothing outside this host can present a loopback peer address."""
+    client = request.client
+    return bool(client) and client.host in _LOOPBACK_HOSTS
+
+
+async def require_api_token(request: Request) -> None:
+    """SEC-2 gate, wired per-route via `dependencies=[Depends(require_api_token)]` on every non-GET
+    route plus the handful of GET routes (settings, sandbox/*) that disclose the watchlist or the
+    paper book. Loopback callers (see _is_loopback) are exempt. Compares with hmac.compare_digest —
+    never `==` — so a wrong guess can't be timed byte-by-byte."""
+    if _is_loopback(request):
+        return
+    expected = os.environ.get(_API_TOKEN_ENV, "")
+    scheme, _, presented = (request.headers.get("authorization") or "").partition(" ")
+    valid = bool(expected) and scheme.lower() == "bearer" and hmac.compare_digest(presented, expected)
+    if not valid:
+        raise HTTPException(status_code=401, detail="missing or invalid API token")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _http
-    # SEC-1, and it goes FIRST: every log line emitted from here on is scrubbed of secret-bearing
+    # SEC-2, and it goes before everything else: a control that silently no-ops when misconfigured
+    # is worse than no control, because it looks present. Refuse to start at all rather than come up
+    # unauthenticated.
+    if not os.environ.get(_API_TOKEN_ENV, "").strip():
+        raise RuntimeError(
+            f"{_API_TOKEN_ENV} is not set. This service binds 0.0.0.0:8000 with no other "
+            f"authentication — refusing to start rather than run open to the LAN/tailnet. Set "
+            f"{_API_TOKEN_ENV} in /opt/signals/.env (see .env.example) and restart."
+        )
+    # SEC-1, next: every log line emitted from here on is scrubbed of secret-bearing
     # query parameters. uvicorn has finished configuring logging by the time lifespan runs, so this
     # sees the handlers records will actually reach.
     redact.install_log_filter()
@@ -120,7 +162,7 @@ async def cli_auth_test() -> dict:
     return await llm_cli.auth_probe(settings_store.get().get("scan_model", "claude-haiku-4-5"))
 
 
-@app.get("/api/settings")
+@app.get("/api/settings", dependencies=[Depends(require_api_token)])
 async def get_settings() -> dict:
     cfg = settings_store.get()
     key = cfg["anthropic_api_key"]
@@ -160,7 +202,7 @@ class SettingsPatch(BaseModel):
     replace: bool = False
 
 
-@app.post("/api/settings")
+@app.post("/api/settings", dependencies=[Depends(require_api_token)])
 async def post_settings(patch: SettingsPatch) -> dict:
     body = patch.model_dump(exclude={"client_id", "replace"}, exclude_none=True)
     try:
@@ -181,9 +223,17 @@ async def api_version() -> dict:
     return await asyncio.to_thread(selfupdate.status)
 
 
-@app.post("/api/update")
-async def api_update() -> dict:
-    return await asyncio.to_thread(selfupdate.update)
+# OPS-6: POST /api/update used to live here (git fetch + `reset --hard origin/main` + restart), and
+# it was reachable with no authentication at all. It's gone rather than just gated, because it could
+# not have worked even with a token: deploy/README.md has documented since 2026-08-21 that this
+# container is deployed by rsync, not git, specifically BECAUSE calling this endpoint would roll the
+# working tree backwards past commits that were never pushed. As of this fix the container's git
+# checkout also fails "safe.directory" (dubious ownership), so /api/version already reports
+# `git: false` — status() (kept, see above) reflects that honestly; update() no longer exists to
+# contradict it. selfupdate.update() was deleted with it. The only caller was the dashboard's
+# "Update & restart" button (app/dashboard.py), which is gated on api_version().update_available and
+# so was already permanently hidden by the same git:false state — that UI was removed too rather than
+# left pointing at a 404.
 
 
 # --- ops + transparency dashboard API ---
@@ -218,7 +268,7 @@ async def api_cost() -> dict:
     return await asyncio.to_thread(observability.cost_breakdown)
 
 
-@app.post("/api/prune-cache")
+@app.post("/api/prune-cache", dependencies=[Depends(require_api_token)])
 async def api_prune_cache() -> dict:
     """Delete stale whole-market shvol_/ftd_ caches under data/shorts/ (older than ~90 days) and
     report bytes freed. Never touches settings/scan/usage/iv-history files."""
@@ -591,7 +641,7 @@ async def memory_stats() -> dict:
     return memory.stats()
 
 
-@app.post("/memory/backfill")
+@app.post("/memory/backfill", dependencies=[Depends(require_api_token)])
 async def memory_backfill(every: int = 3, rng: str = "2y") -> dict:
     """Seed memory from real price history so setup base rates exist immediately.
 
@@ -882,7 +932,7 @@ async def trend(symbol: str) -> dict:
     return {"symbol": series.symbol, "close": round(series.closes[-1], 4), **lt}
 
 
-@app.post("/universe/build")
+@app.post("/universe/build", dependencies=[Depends(require_api_token)])
 async def universe_build_endpoint() -> dict:
     """MB-19 — (re)build the curated ticker universe from the Nasdaq Trader symbol directory plus
     batched Yahoo market caps, and persist it. A few hundred HTTP calls, so this is deliberately an
@@ -2030,7 +2080,7 @@ class PortfolioReviewRequest(BaseModel):
     holdings: list[Holding] = []  # transient — reviewed, never persisted
 
 
-@app.post("/portfolio/review")
+@app.post("/portfolio/review", dependencies=[Depends(require_api_token)])
 async def portfolio_review_endpoint(req: PortfolioReviewRequest) -> dict:
     """AI review of the WHOLE portfolio: overall health, concentration/diversification flags, a per-
     holding action list (trim/hold/add/watch), and a cash-deployment note. One structured LLM call over
@@ -2083,7 +2133,7 @@ class RebalanceRequest(BaseModel):
     holdings: list[Holding] = []    # transient — never persisted
 
 
-@app.post("/portfolio/rebalance")
+@app.post("/portfolio/rebalance", dependencies=[Depends(require_api_token)])
 async def portfolio_rebalance_endpoint(req: RebalanceRequest) -> dict:
     """Theme C — a CONCRETE rebalance plan: sell N shares of the over-weights, redeploy proceeds + idle
     cash into the best-setup existing holdings, targeting `max_position_pct` as the largest single weight.
@@ -2141,7 +2191,7 @@ class RecommendRequest(BaseModel):
     scope: str = "watchlist"     # "watchlist" | "market" (adds live-screened candidates)
 
 
-@app.post("/recommendations")
+@app.post("/recommendations", dependencies=[Depends(require_api_token)])
 async def recommendations(req: RecommendRequest) -> dict:
     """Rank candidates for NEW money: the analyst sees every snapshot at once (cross-comparison),
     picks the top 2-4, and spreads the cash across them with share counts. scope="market" widens the
@@ -2255,7 +2305,7 @@ class ScanRequest(BaseModel):
     crypto_symbols: list[str] = []
 
 
-@app.post("/scan")
+@app.post("/scan", dependencies=[Depends(require_api_token)])
 async def scan(req: ScanRequest) -> dict:
     """Score a watchlist with the cheap scan model. MVP runs concurrently; the nightly job
     (task #6) should move this to the Anthropic Batch API + prompt caching for ~50% cost."""
@@ -2310,7 +2360,7 @@ async def scan_latest() -> dict:
     }
 
 
-@app.post("/scan/run")
+@app.post("/scan/run", dependencies=[Depends(require_api_token)])
 async def scan_run() -> dict:
     """Run the configured-watchlist scan now (also wired to a nightly systemd timer)."""
     return await run_scan()
@@ -2332,7 +2382,7 @@ async def macro_catalysts() -> dict:
     return macro.load_state()
 
 
-@app.post("/macro/run")
+@app.post("/macro/run", dependencies=[Depends(require_api_token)])
 async def macro_run(force: bool = False) -> dict:
     """Run the macro research pass now (also wired to a systemd timer a few times a day)."""
     return await run_macro(force=force)
@@ -2658,7 +2708,7 @@ async def market_scan_symbol_endpoint(symbol: str) -> dict:
     }
 
 
-@app.post("/market_scan/run")
+@app.post("/market_scan/run", dependencies=[Depends(require_api_token)])
 async def market_scan_run_endpoint(force: bool = False, limit: int | None = None) -> dict:
     """SWT-1 — run the market-wide scan now (also wired to a nightly systemd timer). No LLM.
 
@@ -2680,7 +2730,7 @@ async def market_scan_run_endpoint(force: bool = False, limit: int | None = None
     return out
 
 
-@app.post("/market_scan/percentiles")
+@app.post("/market_scan/percentiles", dependencies=[Depends(require_api_token)])
 async def market_scan_percentiles_endpoint(d: str | None = None) -> dict:
     """SWT-4 — rank an ALREADY-STORED night and write the percentiles onto it. No LLM, no fetches.
 
@@ -3966,7 +4016,7 @@ class SandboxSettingsPatch(BaseModel):
     engine: str | None = None
 
 
-@app.post("/sandbox/tick")
+@app.post("/sandbox/tick", dependencies=[Depends(require_api_token)])
 async def sandbox_tick_endpoint(req: SandboxTickRequest = SandboxTickRequest()) -> dict:
     """Run one paper-trading decision cycle (the systemd timer curls this near the close each trading
     day). `force` bypasses the once-a-day + intraday-phase gates for a manual "run now"."""
@@ -3982,7 +4032,7 @@ def _arm_or_400(arm: str) -> str:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
-@app.get("/sandbox/state")
+@app.get("/sandbox/state", dependencies=[Depends(require_api_token)])
 async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
     """Live-marked snapshot: cash, positions (with unrealized P/L), equity, return vs the S&P shadow,
     settings, cursors, and the latest strategy note.
@@ -4060,12 +4110,12 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
     }
 
 
-@app.get("/sandbox/nav")
+@app.get("/sandbox/nav", dependencies=[Depends(require_api_token)])
 async def sandbox_nav_endpoint(days: int = 120, arm: str = sandbox_store.MAIN_ARM) -> dict:
     return {"series": sandbox_store.read_nav(days, _arm_or_400(arm))}
 
 
-@app.get("/sandbox/trades")
+@app.get("/sandbox/trades", dependencies=[Depends(require_api_token)])
 async def sandbox_trades_endpoint(limit: int = 100, arm: str = sandbox_store.MAIN_ARM) -> dict:
     return {"trades": sandbox_store.read_trades(limit, _arm_or_400(arm))}
 
@@ -4082,7 +4132,7 @@ class SandboxArmCreate(BaseModel):
     clone_from: str | None = None
 
 
-@app.get("/sandbox/arms")
+@app.get("/sandbox/arms", dependencies=[Depends(require_api_token)])
 async def sandbox_arms_endpoint() -> dict:
     """Every arm with a comparable scoreboard: equity, return, and return vs its OWN benchmark shadow.
 
@@ -4121,7 +4171,7 @@ async def sandbox_arms_endpoint() -> dict:
     return {"arms": out}
 
 
-@app.get("/sandbox/arms/nav")
+@app.get("/sandbox/arms/nav", dependencies=[Depends(require_api_token)])
 async def sandbox_arms_nav_endpoint(days: int = 180) -> dict:
     """Every arm's equity curve on ONE shared date axis, for charting them against each other.
 
@@ -4156,7 +4206,7 @@ async def sandbox_arms_nav_endpoint(days: int = 180) -> dict:
             "common_start_index": common, "arms": out}
 
 
-@app.post("/sandbox/arms")
+@app.post("/sandbox/arms", dependencies=[Depends(require_api_token)])
 async def sandbox_create_arm_endpoint(req: SandboxArmCreate) -> dict:
     """Create a comparison arm, optionally funding and enabling it in the same call.
 
@@ -4191,7 +4241,7 @@ async def sandbox_create_arm_endpoint(req: SandboxArmCreate) -> dict:
         return sandbox_store.save(blob, arm)
 
 
-@app.delete("/sandbox/arms/{arm}")
+@app.delete("/sandbox/arms/{arm}", dependencies=[Depends(require_api_token)])
 async def sandbox_delete_arm_endpoint(arm: str) -> dict:
     async with _sandbox_lock:
         try:
@@ -4201,12 +4251,12 @@ async def sandbox_delete_arm_endpoint(arm: str) -> dict:
         return {"status": "deleted", "arm": arm}
 
 
-@app.get("/sandbox/settings")
+@app.get("/sandbox/settings", dependencies=[Depends(require_api_token)])
 async def sandbox_get_settings_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
     return sandbox_store.get(_arm_or_400(arm))["settings"]
 
 
-@app.post("/sandbox/fill_parked")
+@app.post("/sandbox/fill_parked", dependencies=[Depends(require_api_token)])
 async def sandbox_fill_parked_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
     """Re-check today's parked buys against the live price and fill any whose zone is now met.
 
@@ -4278,7 +4328,7 @@ async def sandbox_fill_parked_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dic
                 "dropped_stale": stale, "positions_value": round(pv, 2)}
 
 
-@app.get("/sandbox/inputs")
+@app.get("/sandbox/inputs", dependencies=[Depends(require_api_token)])
 async def sandbox_inputs_endpoint(limit: int = 3, arm: str = sandbox_store.MAIN_ARM) -> dict:
     """What the model was shown on recent ticks, newest first. Free — NO LLM.
 
@@ -4292,7 +4342,7 @@ async def sandbox_inputs_endpoint(limit: int = 3, arm: str = sandbox_store.MAIN_
     return {"arm": arm, "inputs": sandbox_store.read_inputs(limit=limit, arm=arm)}
 
 
-@app.get("/sandbox/changes")
+@app.get("/sandbox/changes", dependencies=[Depends(require_api_token)])
 async def sandbox_changes_endpoint(limit: int = 50, arm: str = sandbox_store.MAIN_ARM) -> dict:
     """Settings changes for an arm, newest first. Free — NO LLM.
 
@@ -4304,7 +4354,7 @@ async def sandbox_changes_endpoint(limit: int = 50, arm: str = sandbox_store.MAI
     return {"arm": arm, "changes": sandbox_store.read_changes(limit=limit, arm=arm)}
 
 
-@app.post("/sandbox/settings")
+@app.post("/sandbox/settings", dependencies=[Depends(require_api_token)])
 async def sandbox_set_settings_endpoint(
     patch: SandboxSettingsPatch, arm: str = sandbox_store.MAIN_ARM,
 ) -> dict:
@@ -4447,7 +4497,7 @@ async def sandbox_set_settings_endpoint(
         return {**s, "arm": arm, "label": blob.get("label"), "engine": blob.get("engine")}
 
 
-@app.post("/sandbox/fund")
+@app.post("/sandbox/fund", dependencies=[Depends(require_api_token)])
 async def sandbox_fund_endpoint(req: SandboxFundRequest) -> dict:
     """Add (or withdraw, negative) fictional cash. A positive deposit also buys shadow ^GSPC shares at
     today's price so the benchmark tracks the same money on the same schedule."""
@@ -4503,7 +4553,7 @@ async def sandbox_fund_endpoint(req: SandboxFundRequest) -> dict:
         return {"cash": blob["cash"], "funded_total": blob["funded_total"], "benchmark": blob["benchmark"]}
 
 
-@app.post("/sandbox/reset")
+@app.post("/sandbox/reset", dependencies=[Depends(require_api_token)])
 async def sandbox_reset_endpoint(req: SandboxResetRequest) -> dict:
     if not req.confirm:
         raise HTTPException(status_code=422, detail="reset requires confirm=true")
@@ -4558,7 +4608,7 @@ def _replay_range(plan_date: str, today: str) -> str:
     return "max"
 
 
-@app.post("/journal/replay")
+@app.post("/journal/replay", dependencies=[Depends(require_api_token)])
 async def journal_replay_endpoint(req: PlanReplayRequest) -> dict:
     """SWT-8 — replay one recorded plan against the daily bars that actually followed it. No LLM.
 

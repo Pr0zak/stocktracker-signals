@@ -135,7 +135,7 @@ PAGE = """<!doctype html>
   #usage-chart .bar.zero { fill: rgba(136,136,136,.28); }
   #usage-chart .axis { fill: var(--muted); font-size: 9px; }
   .save { margin-top: .9rem; }
-  #status, #upstatus { font-size: .85rem; min-height: 1.1rem; margin-top: .6rem; }
+  #status { font-size: .85rem; min-height: 1.1rem; margin-top: .6rem; }
   .ok-t { color: var(--ok); } .err-t { color: var(--err); }
   code { background: #8882; padding: .1rem .3rem; border-radius: .3rem; font-size: .85em; }
   .loading { color: var(--muted); font-size: .85rem; }
@@ -547,9 +547,7 @@ PAGE = """<!doctype html>
       <div id="version" class="hint">version …</div>
       <div class="row" style="margin-top:.8rem">
         <button type="button" class="secondary sm" id="check">Check for updates</button>
-        <button type="button" class="ok sm" id="update" style="display:none">Update &amp; restart</button>
       </div>
-      <div id="upstatus"></div>
     </div>
   </div>
 </section>
@@ -669,21 +667,18 @@ PAGE = """<!doctype html>
   };
 
   async function checkVersion() {
+    // OPS-6: this is read-only status now — POST /api/update (git fetch + reset --hard + restart)
+    // was removed. It could never have worked against an rsync deploy anyway, and it ran with no
+    // authentication at all. Deploy with the rsync skill/README instead of from this page.
     $("version").textContent = "checking…";
     const v = await (await fetch("/api/version")).json();
     let label = "version " + v.version;
-    if (!v.git) label += " · (not a git checkout — updates disabled)";
-    else if (v.update_available) label += " · " + v.behind + " update" + (v.behind > 1 ? "s" : "") + " available";
-    else label += " · up to date";
+    if (!v.git) label += " · (not a git checkout — deploys are by rsync, see deploy/README.md)";
+    else if (v.update_available) label += " · " + v.behind + " commit" + (v.behind > 1 ? "s" : "") + " behind origin/main (informational only)";
+    else label += " · up to date with origin/main";
     $("version").textContent = label;
-    $("update").style.display = v.update_available ? "inline-block" : "none";
   }
   $("check").onclick = checkVersion;
-  $("update").onclick = async () => {
-    $("upstatus").textContent = "Updating — the service will restart…"; $("upstatus").className = "";
-    try { await fetch("/api/update", { method: "POST" }); } catch (e) {}
-    setTimeout(() => { $("upstatus").textContent = "Restarted. Reloading…"; location.reload(); }, 6000);
-  };
 
   // ---- ops dashboard ----
   const pad2 = (n) => String(n).padStart(2, "0");
