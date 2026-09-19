@@ -3983,9 +3983,12 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
     positions = []
     pv = 0.0
     for p in blob["positions"]:
-        px = price_of(p["symbol"]) or p["avg_cost"]
-        val = p["shares"] * px
-        pv += val
+        px = sandbox_job.mark_price(p, price_of)
+        if px:
+            val = p["shares"] * px
+            pv += val
+        else:
+            val = 0.0
         positions.append({
             **p,
             # Recompute the group rather than echoing the label stored when the position was opened.
@@ -3996,8 +3999,8 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
             "exposure_group": _exposure_group(p["symbol"]),
             **({"expense_ratio_pct": _expense_ratio(p["symbol"])}
                if _expense_ratio(p["symbol"]) is not None else {}),
-            "price": round(px, 4), "value": round(val, 2),
-            "unrealized_pct": round((px / p["avg_cost"] - 1) * 100, 2) if p["avg_cost"] else None,
+            "price": round(px, 4) if px else None, "value": round(val, 2),
+            "unrealized_pct": round((px / p["avg_cost"] - 1) * 100, 2) if px and p["avg_cost"] else None,
         })
     cash = round(blob["cash"], 2)
     equity = round(cash + pv, 2)
@@ -4005,6 +4008,7 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
     bench = blob["benchmark"]
     bench_val = round(bench["shares"] * spy, 2) if spy and bench["shares"] else None
     funded = blob.get("funded_total") or 0.0
+    stale = sandbox_job.stale_marks(blob["positions"], price_of)
     return {
         "arm": arm, "label": blob.get("label") or arm, "engine": blob.get("engine", "llm"),
         "cash": cash, "equity": equity, "positions_value": round(pv, 2),
@@ -4015,6 +4019,7 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
         "benchmark_value": bench_val,
         "vs_benchmark_pct": round((equity - bench_val) / bench_val * 100, 2) if bench_val else None,
         "positions": sorted(positions, key=lambda x: -x["value"]),
+        "stale_marks": stale,
         # `current_age` is derived here so a client renders today's age rather than whatever was
         # stored — the stored key is None once a birth_date exists. birth_date itself is kept in the
         # response (unlike in the prompt) so a settings UI can show and edit the field it owns.
