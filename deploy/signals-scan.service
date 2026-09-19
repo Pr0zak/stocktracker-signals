@@ -2,6 +2,7 @@
 Description=StockTracker Signals — nightly watchlist scan
 After=network-online.target
 Wants=network-online.target
+OnFailure=signals-notify@%n.service
 
 [Service]
 Type=oneshot

@@ -1249,24 +1249,59 @@ def annotate_holding_period(
 ) -> None:
     """Add holding period + capital-gains status to the book rows the analyst sees, in place.
 
-    `_build_portfolio_snapshot` prices a `Holding(symbol, shares, avg_cost)`, which drops `opened_at`
-    — so the decision model could see a 19% gain on a position and had no way to know it was four days
-    old. Selling that is an ordinary-income short-term gain; the same sale a year later is taxed at
-    the long-term rate. That difference is large enough to be worth weighing, and it was simply not
-    in front of the model.
+    `_build_portfolio_snapshot` prices a `Holding(symbol, shares, avg_cost)`, which drops any notion
+    of WHEN the shares were bought — so the decision model could see a 19% gain on a position and had
+    no way to know it was four days old. Selling that is an ordinary-income short-term gain; the same
+    sale a year later is taxed at the long-term rate. That difference is large enough to be worth
+    weighing, and it was simply not in front of the model.
+
+    A `ledger_positions` row identifies its symbol's clock ONE of two ways:
+      * `last_add_at` / `opened_at` (epoch seconds) — the sandbox's own paper ledger, which tracks a
+        single open date and a single most-recent-addition date per symbol, no per-lot detail. Adding
+        to a position restarts the clock (see the comment below): using `opened_at` instead would
+        overstate how much of the position already qualifies for long-term treatment.
+      * `lot_dates` (MONEY-1) — the REAL per-lot acquisition dates behind a holding synced from the
+        app, as ISO `yyyy-mm-dd` strings, one entry per purchase lot, in the app's own lot order. An
+        entry of `None` is a lot the app never recorded a date for (a pre-MONEY-2 migrated position,
+        typically). If EVERY lot has a known date, they fold into one `capital_gains` for the position
+        — "mixed" when the lots span the long-term boundary, the single verdict otherwise, with
+        `holding_days`/`days_to_long_term` taken from the YOUNGEST lot (the one still standing between
+        the position and being cleanly long-term). If EVEN ONE lot's date is unknown, the position is
+        left unannotated entirely, same as one missing from the ledger: blending a known lot with an
+        unknown one would silently treat the unknown one as whatever the known one says, which is the
+        same confident-wrong-number [Asset.avgCost] already refuses to produce for cost, one layer up.
 
     Deliberately informational, not a gate: `sandbox_job` blocks things that endanger the ACCOUNT
     (cash conservation, caps, shares held). Tax efficiency is a preference to weigh against the
     reason for selling, so it belongs in the prompt, not in the validator.
     """
     now_ts = now_ts or time.time()
+    today_iso = dt.datetime.fromtimestamp(now_ts, ET).date().isoformat()
     by_sym = {str(p.get("symbol", "")).upper(): p for p in ledger_positions}
     for row in book_positions:
         led = by_sym.get(str(row.get("symbol", "")).upper())
+        if not led:
+            continue
+
+        if "lot_dates" in led:
+            lot_dates = led.get("lot_dates") or []
+            if not lot_dates or any(d is None for d in lot_dates):
+                continue  # no lots, or at least one of unknown age -- never guess, say nothing
+            ages = [_days_between(str(d)[:10], today_iso) for d in lot_dates]
+            if any(a is None for a in ages):
+                continue  # a date this reader could not parse is exactly as unknown as a missing one
+            youngest = min(ages)  # type: ignore[type-var]
+            kinds = {"long_term" if a >= _LONG_TERM_DAYS else "short_term" for a in ages}
+            row["holding_days"] = youngest
+            row["capital_gains"] = kinds.pop() if len(kinds) == 1 else "mixed"
+            if youngest < _LONG_TERM_DAYS:
+                row["days_to_long_term"] = _LONG_TERM_DAYS - youngest
+            continue
+
         # `last_add_at`, not `opened_at`: adding to a position starts a fresh holding period for the
         # NEW shares (each tax lot is clocked separately). Using the older date would overstate how
         # much of the position already qualifies for long-term treatment.
-        started = (led or {}).get("last_add_at") or (led or {}).get("opened_at")
+        started = led.get("last_add_at") or led.get("opened_at")
         if not isinstance(started, (int, float)):
             continue
         days = int((now_ts - float(started)) // 86_400)

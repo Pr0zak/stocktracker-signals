@@ -1,0 +1,102 @@
+{
+  "crossed_below_200wma": [],
+  "date_alerts": [],
+  "dip_alerts": [
+    {
+      "dip": "pullback_10",
+      "pct_off_52w_high": -14.0,
+      "pct_off_recent_high": -12.0,
+      "symbol": "AAPL"
+    }
+  ],
+  "dip_counts": {
+    "near_miss": 1,
+    "nowhere_near": 1,
+    "qualified": 1,
+    "scanned": 3,
+    "unmeasured": 0
+  },
+  "dip_rejects": {
+    "near_miss": [
+      {
+        "gap_pp": 0.8,
+        "pct_off_52w_high": -6.0,
+        "pct_off_recent_high": -4.2,
+        "reason": "4.2% off its 3-month high \u2014 needs 5%, 0.8 points short",
+        "symbol": "MSFT"
+      }
+    ],
+    "nowhere_near": [
+      {
+        "gap_pp": 5.0,
+        "pct_off_52w_high": 1.0,
+        "pct_off_recent_high": 0.0,
+        "reason": "at its 3-month high, at its 52-week high, not oversold on the 14-week RSI \u2014 no dip on any measure",
+        "symbol": "GOOGL"
+      }
+    ],
+    "unmeasured": []
+  },
+  "flips": [
+    "AAPL"
+  ],
+  "generated_at": 1800000000.0,
+  "results": [
+    {
+      "below_200wma": false,
+      "conviction": 78,
+      "crossed_below_200wma": false,
+      "dip": "pullback_10",
+      "dip_gap_pp": null,
+      "dip_measured": true,
+      "dip_near_miss": null,
+      "dip_reject_reason": null,
+      "flipped": true,
+      "pct_off_52w_high": -14.0,
+      "pct_off_recent_high": -12.0,
+      "prev_signal": "hold",
+      "signal": "buy",
+      "squeeze": "fuel",
+      "squeeze_changed": true,
+      "symbol": "AAPL"
+    },
+    {
+      "below_200wma": false,
+      "conviction": 52,
+      "crossed_below_200wma": false,
+      "dip": null,
+      "dip_gap_pp": 0.8,
+      "dip_measured": true,
+      "dip_near_miss": true,
+      "dip_reject_reason": "4.2% off its 3-month high \u2014 needs 5%, 0.8 points short",
+      "flipped": false,
+      "pct_off_52w_high": -6.0,
+      "pct_off_recent_high": -4.2,
+      "prev_signal": "hold",
+      "signal": "hold",
+      "squeeze": null,
+      "squeeze_changed": false,
+      "symbol": "MSFT"
+    },
+    {
+      "below_200wma": false,
+      "conviction": 50,
+      "crossed_below_200wma": false,
+      "dip": null,
+      "dip_gap_pp": 5.0,
+      "dip_measured": true,
+      "dip_near_miss": false,
+      "dip_reject_reason": "at its 3-month high, at its 52-week high, not oversold on the 14-week RSI \u2014 no dip on any measure",
+      "flipped": false,
+      "pct_off_52w_high": 1.0,
+      "pct_off_recent_high": 0.0,
+      "prev_signal": "hold",
+      "signal": "hold",
+      "squeeze": null,
+      "squeeze_changed": false,
+      "symbol": "GOOGL"
+    }
+  ],
+  "scan_available": true,
+  "total_cost_usd": 0.0142
+}

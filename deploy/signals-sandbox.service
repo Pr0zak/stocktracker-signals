@@ -2,6 +2,7 @@
 Description=StockTracker AI sandbox — daily paper-trading tick
 After=network-online.target signals.service
 Wants=network-online.target
+OnFailure=signals-notify@%n.service
 
 [Service]
 Type=oneshot

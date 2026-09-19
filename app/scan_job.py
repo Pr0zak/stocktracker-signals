@@ -12,7 +12,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import sys
+import threading
 import time
 import datetime as dt
 from datetime import date, timedelta
@@ -340,18 +343,173 @@ async def _score(client: httpx.AsyncClient, symbol: str, crypto: bool, bench_clo
     }
 
 
-def _prev_state() -> dict[str, dict]:
+def _load_previous_payload() -> dict:
+    """The full contents of the last published scan, or {} when there is none / it is unreadable.
+
+    Separated out from `_prev_state()` so `run_scan` can also consult it — for the `last_measured`
+    carry-forward (OPS-1) and for deciding whether a total-failure night has a baseline worth
+    protecting.
+    """
     if not LATEST.exists():
         return {}
     try:
-        return {
+        blob = json.loads(LATEST.read_text())
+    except Exception:  # noqa: BLE001 — a corrupt file is treated as absent, never as empty state
+        return {}
+    return blob if isinstance(blob, dict) else {}
+
+
+def _prev_state(payload: dict | None = None) -> dict[str, dict]:
+    """Per-symbol signal/squeeze/200wma/dip from the last run, for tonight's flip/dip diff.
+
+    Falls back to the persisted `last_measured` carry-forward map when the immediately-previous run
+    measured nothing at all (e.g. every analyst call failed that night). Without this, a single
+    all-error night collapses the baseline to {}, and `dip_new`'s diff then reads every symbol with
+    a STANDING dip as newly-entered the next time the scan actually measures something — the
+    2026-09-10 incident (OPS-1).
+    """
+    if payload is None:
+        payload = _load_previous_payload()
+    if not payload:
+        return {}
+    try:
+        state = {
             r["symbol"]: {"signal": r.get("signal"), "squeeze": r.get("squeeze"),
                           "below_200wma": r.get("below_200wma"), "dip": r.get("dip")}
-            for r in (json.loads(LATEST.read_text()).get("results") or [])
+            for r in (payload.get("results") or [])
             if "signal" in r
         }
     except Exception:  # noqa: BLE001
         return {}
+    return state or (payload.get("last_measured") or {})
+
+
+def _diff_vs_prev(r: dict, prev: dict[str, dict]) -> dict:
+    """Annotate one freshly-scored row with what changed since the last MEASURED reading of this
+    symbol.
+
+    `prev` is `_prev_state()`'s per-symbol map. Split out of `run_scan`'s inner loop so the diff
+    itself — computing `dip_new`, `flipped`, `squeeze_changed`, `crossed_below_200wma` — is
+    unit-testable on its own, without driving the whole scan pipeline (network fetches, the
+    analyst call, memory scoring, ...). This is exactly the logic the 2026-09-10 incident got
+    wrong: with `prev` wrongly emptied by an all-error night, every standing dip read as new.
+    """
+    p = prev.get(r["symbol"], {})
+    r["prev_signal"] = p.get("signal")
+    r["flipped"] = r["prev_signal"] is not None and r["prev_signal"] != r["signal"]
+    # Squeeze-state transitions (quiet→fuel→ignition) are notification-worthy events too.
+    r["prev_squeeze"] = p.get("squeeze")
+    r["squeeze_changed"] = (
+        r.get("squeeze") is not None
+        and r["prev_squeeze"] is not None
+        and r["squeeze"] != r["prev_squeeze"]
+    )
+    # Newly below the 200-week line this run — mungbeans' weekly signal, surfaced as a neutral
+    # "heads up" event (a mirror of the flipped diff; first scan has prev=None → no alert).
+    r["prev_below_200wma"] = p.get("below_200wma")
+    r["crossed_below_200wma"] = r.get("below_200wma") is True and p.get("below_200wma") is False
+    # Newly entered (or escalated to) a dip tier — the "good time to add" event.
+    r["prev_dip"] = p.get("dip")
+    r["dip_new"] = r.get("dip") is not None and p.get("dip") != r.get("dip")
+    return r
+
+
+def _finalize_payload(
+    *, results: list[dict], dip_rejects: dict, dip_counts: dict, date_alerts: list[str],
+    scored: int, seeded: dict, prior_payload: dict,
+) -> dict:
+    """Build tonight's scan payload, then apply the OPS-1 total-failure guard.
+
+    Split out of `run_scan` — which drives the real network/DB pipeline that produces these
+    arguments — so the guard itself is unit-testable against hand-built inputs.
+
+    Two things happen here that did not happen before OPS-1:
+
+      * `last_measured` carries the freshest per-symbol reading forward regardless of whether
+        tonight measured it (a delisted ticker, one bad fetch, or every fetch on a total-failure
+        night keeps its last known value instead of dropping out). `_prev_state()` falls back to
+        this map when the immediately-previous run measured nothing at all.
+      * When EVERY symbol failed to measure (`unmeasured == scanned`, and there was something to
+        scan), the previous payload is kept as-is and only stamped `last_run_failed`/`last_error` —
+        mirroring app/macro_job.py's degraded-flag pattern — rather than being overwritten by an
+        all-unmeasured cross-section. That overwrite plus `_prev_state()`'s old "only rows with a
+        signal key" filter is exactly what made every standing dip read as newly-entered on
+        2026-09-11, the night after 2026-09-10's all-error scan.
+    """
+    measured_now = {
+        r["symbol"]: {"signal": r.get("signal"), "squeeze": r.get("squeeze"),
+                      "below_200wma": r.get("below_200wma"), "dip": r.get("dip")}
+        for r in results if "signal" in r
+    }
+    last_measured = {**(prior_payload.get("last_measured") or {}), **measured_now}
+
+    # `scanned > 0` keeps a genuinely empty watchlist (a real, boring, successful run) from being
+    # misread as a failure — "0 of 0 measured" is not the same claim as "54 of 54 failed".
+    total_failure = dip_counts["scanned"] > 0 and dip_counts["unmeasured"] == dip_counts["scanned"]
+    last_error = None
+    if total_failure:
+        errors = sorted({_scrub(r["error"]) for r in results if r.get("error")})
+        last_error = (
+            f"every symbol failed to measure ({dip_counts['scanned']} scanned): "
+            + "; ".join(errors[:3])
+        )
+
+    payload = {
+        "generated_at": time.time(),
+        # Stamped by the producer so a scan that RAN says so in the payload itself, and stays
+        # distinguishable from GET /scan/latest's "there is no scan" answer even when both are empty.
+        "scan_available": True,
+        "results": results,
+        "flips": [r["symbol"] for r in results if r.get("flipped")],
+        "crossed_below_200wma": [r["symbol"] for r in results if r.get("crossed_below_200wma")],
+        "dip_alerts": [
+            {"symbol": r["symbol"], "dip": r["dip"],
+             "pct_off_recent_high": r.get("pct_off_recent_high"), "pct_off_52w_high": r.get("pct_off_52w_high")}
+            for r in results if r.get("dip_new")
+        ],
+        # NOT a list of dips — every symbol in here was rejected. Split three ways so a name that
+        # missed by a hair, a name nowhere near a dip, and a name we could not measure at all stay
+        # three different statements. Always real lists on a scan that ran, even an empty one.
+        "dip_rejects": dip_rejects,
+        # scanned == qualified + near_miss + nowhere_near + unmeasured, by construction.
+        "dip_counts": dip_counts,
+        "date_alerts": date_alerts,
+        "memory_scored": scored,
+        "memory_seeded": seeded or None,
+        "total_cost_usd": round(sum(r.get("cost_usd", 0.0) for r in results), 6),
+        "last_measured": last_measured,
+        # Mirrors app/macro_job.py's degraded-flag pattern (same three field names) so every
+        # consumer of a published payload can tell "we couldn't look" from "nothing is happening"
+        # the same way, whichever job produced it.
+        "last_run_failed": total_failure,
+        "last_error": last_error,
+        "last_run_at": time.time(),
+    }
+
+    if total_failure and prior_payload:
+        # Keep last night's payload untouched — only stamp it degraded — so tomorrow's diff
+        # baseline survives intact instead of being overwritten by tonight's empty cross-section.
+        payload = dict(prior_payload)
+        payload["last_run_failed"] = True
+        payload["last_error"] = last_error
+        payload["last_run_at"] = time.time()
+
+    return payload
+
+
+def _write_latest(payload: dict) -> None:
+    """Atomic publish: per-writer-unique temp + os.replace — the same pattern as
+    app/universe.py's `save()` and app/market_scan_job.py's `_write_summary()`.
+
+    NOT a plain `LATEST.write_text(...)`: a reader that opens the file mid-write gets a truncated
+    document, and a crash mid-write leaves one permanently. Unlike market_scan_job's writer, a
+    failure here is not swallowed — this file IS the scan data (not a status artifact sitting
+    beside a database that already has the real rows committed), so losing the write has to
+    surface rather than vanish silently.
+    """
+    tmp = LATEST.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, LATEST)
 
 
 def scoring_range(age_days: float) -> str:
@@ -509,7 +667,8 @@ async def run_scan() -> dict:
     cfg = settings_store.get()
     stocks = cfg.get("watchlist", [])
     cryptos = cfg.get("crypto_watchlist", [])
-    prev = _prev_state()
+    prior_payload = _load_previous_payload()
+    prev = _prev_state(prior_payload)
 
     async with httpx.AsyncClient() as client:
         # MB-19: the curated universe expires after a week and nothing else rebuilds it. Without
@@ -550,24 +709,7 @@ async def run_scan() -> dict:
                 r = await _score(client, sym, crypto, bench)
             except Exception as e:  # noqa: BLE001
                 return {"symbol": sym.upper(), "error": str(e)}
-            p = prev.get(r["symbol"], {})
-            r["prev_signal"] = p.get("signal")
-            r["flipped"] = r["prev_signal"] is not None and r["prev_signal"] != r["signal"]
-            # Squeeze-state transitions (quiet→fuel→ignition) are notification-worthy events too.
-            r["prev_squeeze"] = p.get("squeeze")
-            r["squeeze_changed"] = (
-                r.get("squeeze") is not None
-                and r["prev_squeeze"] is not None
-                and r["squeeze"] != r["prev_squeeze"]
-            )
-            # Newly below the 200-week line this run — mungbeans' weekly signal, surfaced as a
-            # neutral "heads up" event (a mirror of the flipped diff; first scan has prev=None → no alert).
-            r["prev_below_200wma"] = p.get("below_200wma")
-            r["crossed_below_200wma"] = r.get("below_200wma") is True and p.get("below_200wma") is False
-            # Newly entered (or escalated to) a dip tier — the "good time to add" event.
-            r["prev_dip"] = p.get("dip")
-            r["dip_new"] = r.get("dip") is not None and p.get("dip") != r.get("dip")
-            return r
+            return _diff_vs_prev(r, prev)
 
         results = list(await asyncio.gather(
             *[one(s, False) for s in stocks],
@@ -615,37 +757,30 @@ async def run_scan() -> dict:
     # winners, and "nothing qualified tonight" is indistinguishable from "the scan never looked".
     dip_rejects, dip_counts = dip_verdicts(results)
 
-    payload = {
-        "generated_at": time.time(),
-        # Stamped by the producer so a scan that RAN says so in the payload itself, and stays
-        # distinguishable from GET /scan/latest's "there is no scan" answer even when both are empty.
-        "scan_available": True,
-        "results": results,
-        "flips": [r["symbol"] for r in results if r.get("flipped")],
-        "crossed_below_200wma": [r["symbol"] for r in results if r.get("crossed_below_200wma")],
-        "dip_alerts": [
-            {"symbol": r["symbol"], "dip": r["dip"],
-             "pct_off_recent_high": r.get("pct_off_recent_high"), "pct_off_52w_high": r.get("pct_off_52w_high")}
-            for r in results if r.get("dip_new")
-        ],
-        # NOT a list of dips — every symbol in here was rejected. Split three ways so a name that
-        # missed by a hair, a name nowhere near a dip, and a name we could not measure at all stay
-        # three different statements. Always real lists on a scan that ran, even an empty one.
-        "dip_rejects": dip_rejects,
-        # scanned == qualified + near_miss + nowhere_near + unmeasured, by construction.
-        "dip_counts": dip_counts,
-        "date_alerts": date_alerts,
-        "memory_scored": scored,
-        "memory_seeded": seeded or None,
-        "total_cost_usd": round(sum(r.get("cost_usd", 0.0) for r in results), 6),
-    }
+    payload = _finalize_payload(
+        results=results, dip_rejects=dip_rejects, dip_counts=dip_counts, date_alerts=date_alerts,
+        scored=scored, seeded=seeded, prior_payload=prior_payload,
+    )
+
+    if payload["last_run_failed"] and not prior_payload:
+        # First run ever (or the file was otherwise absent) and it failed completely. There is no
+        # good baseline to protect, but publishing this all-unmeasured cross-section would CREATE a
+        # bad one — exactly the defect this guards against. Report the failure without publishing.
+        log.error("scan: total failure with no previous scan on disk — %s", payload["last_error"])
+        return payload
+
     LATEST.parent.mkdir(parents=True, exist_ok=True)
-    LATEST.write_text(json.dumps(payload, indent=2))
+    _write_latest(payload)
     return payload
 
 
 if __name__ == "__main__":
     out = asyncio.run(run_scan())
+    if out.get("last_run_failed"):
+        # Non-zero exit so systemd records THIS run as a failure — "Deactivated successfully" for a
+        # night that measured nothing is the other half of the 2026-09-10 incident.
+        print(f"SCAN FAILED — {out.get('last_error')}")
+        sys.exit(1)
     c = out["dip_counts"]
     print(f"scanned {c['scanned']} · flips {out['flips']} · ${out['total_cost_usd']}")
     print(f"dips {c['qualified']} · near miss {c['near_miss']} · no dip {c['nowhere_near']} "

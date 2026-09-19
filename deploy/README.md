@@ -13,8 +13,8 @@ and every `curl` in them targets loopback — keep it that way, since this repos
 
 ## Installing
 
-These files are **not** synced automatically. `POST /api/update` and the rsync deploy both touch
-`/opt/signals` only, so a change here has to be applied deliberately:
+These files are **not** synced automatically. The rsync deploy only touches `/opt/signals`, so a
+change here has to be applied deliberately:
 
 ```bash
 # NODE is whichever host currently runs the container — it moves, so discover it rather than
@@ -56,11 +56,12 @@ day old.
 
 ## Deploying the code itself
 
-**Use rsync into `/opt/signals`. Do not use `POST /api/update`.** That endpoint runs
-`git reset --hard origin/main`, and as of 2026-08-21 the laptop repo is 19 commits ahead of
-`origin/main` — so calling it would roll the container backwards past every one of them. The
-container's own git checkout has been stale since `7297e19` for exactly this reason: deploys have
-always been file syncs, and its working tree is current even though its `HEAD` is not.
+**Use rsync into `/opt/signals`.** `POST /api/update` used to exist and ran `git reset --hard
+origin/main` — it was removed (OPS-6, 2026-09-18) rather than fixed, because it could never have
+worked here: it also had no authentication at all, and it would have rolled the container backwards
+past every commit the laptop repo is ahead of `origin/main`. The container's own git checkout has
+been stale since `7297e19` for exactly this reason: deploys have always been file syncs, and its
+working tree is current even though its `HEAD` is not.
 
 Verify a deploy by hitting a route that only exists in the new code. `GET /api/version` reports the
 new SHA some 60–90 seconds before uvicorn is actually serving it, so it will tell you the deploy

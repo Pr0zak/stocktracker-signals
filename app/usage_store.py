@@ -36,6 +36,11 @@ def record(usage: dict, *, symbol: str, kind: str) -> None:
         # "api" (real per-token $) or "cli" (subscription — cost_usd is notional). Old rows lack this.
         "provider": (usage.get("provider") or "api"),
     }
+    # Present only when this call ran on the API path because the configured "cli" provider hit its
+    # subscription budget wall (see analyst._cli_fallback_eligible) — lets the cost card explain an
+    # "api" row that shows up while llm_provider is still "cli". Most rows lack this key entirely.
+    if usage.get("fallback_from"):
+        row["fallback_from"] = usage["fallback_from"]
     with _lock:
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
         with _FILE.open("a") as f:

@@ -152,3 +152,43 @@ def test_no_secret_reaches_the_settings_payload(client):
     body = client.get("/api/settings").text
     for leak in ("sk-ant", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
         assert leak not in body, f"{leak} appeared in /api/settings"
+
+
+def test_unpriceable_symbol_is_reported_in_stale_marks_not_hidden(client):
+    """When a quote lookup returns None, the symbol should appear in stale_marks so the client
+    can tell the price is stale, not presented as a fresh quote."""
+    import app.main as m
+    import app.sandbox_store as ss
+
+    # Fund the account and add a position via the store directly
+    client.post("/sandbox/fund", json={"amount": 10000.0})
+    blob = ss.get("main")
+    blob["positions"] = [{
+        "symbol": "UNPRICEABLE",
+        "shares": 10,
+        "avg_cost": 100.0,
+        "last_price": None,
+    }]
+    ss.save(blob, arm="main")
+
+    # Mock the quote fetcher to return None for UNPRICEABLE, so it falls back to cost basis
+    async def quotes_with_gap(http, syms):
+        return {s: {"price": 50.0} if s != "UNPRICEABLE" else None for s in syms}
+
+    import unittest.mock
+    with unittest.mock.patch.object(m.market_now, "fetch_quotes", quotes_with_gap):
+        st = client.get("/sandbox/state").json()
+
+    # The symbol should be in stale_marks so the client knows it's not a fresh quote
+    assert "UNPRICEABLE" in st["stale_marks"], f"Expected UNPRICEABLE in stale_marks, got {st['stale_marks']}"
+
+    # The position should still be present and priced using the fallback (cost basis)
+    positions = [p for p in st["positions"] if p["symbol"] == "UNPRICEABLE"]
+    assert len(positions) == 1
+    pos = positions[0]
+
+    # The price should use the fallback (avg_cost of 100.0), not a fresh quote
+    assert pos["price"] == 100.0, f"Expected price to be avg_cost (100.0), got {pos['price']}"
+
+    # The value should be calculated using the fallback price: 10 shares * 100.0 = 1000.0
+    assert pos["value"] == 1000.0, f"Expected value to be 1000.0, got {pos['value']}"

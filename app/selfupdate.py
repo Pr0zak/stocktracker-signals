@@ -1,7 +1,13 @@
 """
-Self-update for the CT deploy: check the git remote and pull + restart on demand (exposed as the
-"Check for updates / Update" buttons in the settings UI). Only works when the deploy directory is
-a git checkout of the public repo; otherwise it degrades to "not a git checkout".
+Version/update-availability status for the CT deploy, exposed read-only via GET /api/version and the
+settings UI's "Check for updates" button. Only reports something meaningful when the deploy directory
+is a git checkout of the public repo; otherwise it degrades to "not a git checkout" (`git: False`).
+
+OPS-6: this module used to also expose update() — fetch + `reset --hard origin/main` + restart the
+service, wired to POST /api/update with no authentication at all. It's gone: the container is
+deployed by rsync, not git (deploy/README.md has said so since 2026-08-21), so calling it would have
+rolled the working tree backwards past every un-pushed commit and discarded untracked local state.
+Deploy with the rsync skill/README instead.
 """
 from __future__ import annotations
 
@@ -39,20 +45,3 @@ def status() -> dict:
         "local": _git("rev-parse", "--short", "HEAD").stdout.strip(),
         "remote": _git("rev-parse", "--short", "origin/main").stdout.strip(),
     }
-
-
-def update() -> dict:
-    before = _git("rev-parse", "--short", "HEAD").stdout.strip()
-    _git("fetch", "origin", "main", timeout=60)
-    reset = _git("reset", "--hard", "origin/main", timeout=30)
-    after = _git("rev-parse", "--short", "HEAD").stdout.strip()
-    # Reinstall deps (idempotent), then schedule a restart 2s out so this HTTP response returns first.
-    subprocess.run(
-        [str(_ROOT / ".venv" / "bin" / "pip"), "install", "-q", "-r", str(_ROOT / "requirements.txt")],
-        capture_output=True, text=True, timeout=180,
-    )
-    subprocess.run(
-        ["systemd-run", "--quiet", "--on-active=2", "systemctl", "restart", "signals"],
-        capture_output=True, text=True, timeout=10,
-    )
-    return {"ok": reset.returncode == 0, "from": before, "to": after, "version": version(), "restarting": True}

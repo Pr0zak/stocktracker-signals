@@ -1,0 +1,55 @@
+{
+  "as_of": 1789847000.0277562,
+  "cached": false,
+  "model": "claude-haiku-4-5",
+  "portfolio": {
+    "cash": 1000.0,
+    "cash_pct": 33.3,
+    "equivalent_exposures": {},
+    "exposure_weights": {
+      "AAPL": 66.7
+    },
+    "positions": [
+      {
+        "avg_cost": 160.0,
+        "currency": "USD",
+        "exposure_group": "AAPL",
+        "price": 200.0,
+        "shares": 10.0,
+        "symbol": "AAPL",
+        "technicals": {
+          "pct_vs_sma50": 4.2,
+          "rsi14": 55.0
+        },
+        "unrealized_gain_pct": 25.0,
+        "value": 2000.0,
+        "weight_pct": 66.7
+      }
+    ],
+    "total_value": 3000.0
+  },
+  "review": {
+    "actions": [
+      {
+        "action": "hold",
+        "reason": "Up 25% with constructive momentum; no clear reason to trim yet.",
+        "symbol": "AAPL"
+      }
+    ],
+    "cash_note": "Deploy the idle cash gradually into the next high-conviction setup rather than all at once.",
+    "concentration": [
+      "AAPL is 66.7% of the book \u2014 a single-name concentration risk."
+    ],
+    "health": "Concentrated in one holding but healthy overall \u2014 no leverage, meaningful cash buffer."
+  },
+  "review_warnings": [],
+  "usage": {
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "cost_usd": 0.00284,
+    "input_tokens": 842,
+    "model": "claude-haiku-4-5",
+    "output_tokens": 96,
+    "provider": "api"
+  }
+}

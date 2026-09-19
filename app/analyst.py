@@ -306,8 +306,12 @@ _PRICING = {
 }
 
 
-def _usage(model: str, u) -> dict:
-    """Token counts + an estimated USD cost for one call (cache reads/writes priced in if present)."""
+def _usage(model: str, u, *, fallback_from: str | None = None) -> dict:
+    """Token counts + an estimated USD cost for one call (cache reads/writes priced in if present).
+
+    `fallback_from` tags a call that only ran here because the configured CLI provider hit its
+    subscription budget wall (see _cli_fallback_eligible / _parse) — the cost card needs this to
+    explain an "api" line item showing up while llm_provider is still "cli"."""
     in_rate, out_rate = _PRICING.get(model, (5.0, 25.0))
     cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
     cache_write = getattr(u, "cache_creation_input_tokens", 0) or 0
@@ -317,7 +321,7 @@ def _usage(model: str, u) -> dict:
         + cache_read * in_rate * 0.1
         + cache_write * in_rate * 1.25
     ) / 1_000_000
-    return {
+    usage = {
         "model": model,
         "input_tokens": u.input_tokens,
         "output_tokens": u.output_tokens,
@@ -326,6 +330,16 @@ def _usage(model: str, u) -> dict:
         "cost_usd": round(cost, 6),
         "provider": "api",
     }
+    if fallback_from:
+        usage["fallback_from"] = fallback_from
+    return usage
+
+
+def _cli_fallback_eligible(cfg: dict) -> bool:
+    """Whether a CLI budget-exhaustion failure (llm_cli.CliBudgetExhaustedError) should fall back to
+    the API path once for that call: the opt-in setting must be on AND an Anthropic API key must be
+    configured — no key means no fallback, just the original error."""
+    return bool(cfg.get("cli_fallback_to_api")) and bool(cfg.get("anthropic_api_key"))
 
 
 def _render(summary: dict) -> str:
@@ -366,9 +380,19 @@ async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tok
     thinking_model = _is_thinking_model(model)
     # Provider toggle: "cli" shells out to the headless claude CLI (subscription OAuth, no per-token
     # billing); the default "api" path below uses the Anthropic SDK's schema-constrained parse().
+    fallback_from: str | None = None
     if cfg.get("llm_provider") == "cli":
-        return await llm_cli.structured(system, prompt, output_format, model=model,
-                                        max_tokens=max_tokens, thinking=thinking_model)
+        try:
+            return await llm_cli.structured(system, prompt, output_format, model=model,
+                                            max_tokens=max_tokens, thinking=thinking_model)
+        except llm_cli.CliBudgetExhaustedError:
+            if not _cli_fallback_eligible(cfg):
+                raise
+            # The CLI's subscription session/budget is exhausted until a fixed reset — not a
+            # momentary rate limit — so retrying the CLI is pointless. Fall through to the API path
+            # below for this one call instead of taking down the scan/brief/verdict outright.
+            log.warning("analyst: cli session limit hit — falling back to the API for this call (model=%s)", model)
+            fallback_from = "cli"
     kwargs: dict = dict(
         model=model,
         max_tokens=max_tokens,
@@ -402,7 +426,7 @@ async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tok
     parsed = resp.parsed_output
     if parsed is None:
         raise RuntimeError(f"analyst returned no structured output (stop_reason={resp.stop_reason})")
-    return parsed, _usage(model, resp.usage)
+    return parsed, _usage(model, resp.usage, fallback_from=fallback_from)
 
 
 async def analyze(summary: dict, *, deep: bool = False) -> tuple[Verdict, dict]:
@@ -474,8 +498,15 @@ async def options_note(context: dict, *, deep: bool = True) -> tuple[str, dict]:
         + json.dumps(context, indent=2, default=str)
         + "\n\nReturn ONE short plain-language paragraph."
     )
+    fallback_from: str | None = None
     if cfg.get("llm_provider") == "cli":
-        return await llm_cli.text(OPTIONS_NOTE_SYSTEM, prompt, model=model, max_tokens=2048, thinking=thinking_model)
+        try:
+            return await llm_cli.text(OPTIONS_NOTE_SYSTEM, prompt, model=model, max_tokens=2048, thinking=thinking_model)
+        except llm_cli.CliBudgetExhaustedError:
+            if not _cli_fallback_eligible(cfg):
+                raise
+            log.warning("analyst: cli session limit hit — falling back to the API for options_note (model=%s)", model)
+            fallback_from = "cli"
     kwargs: dict = dict(
         model=model,
         max_tokens=2048,
@@ -496,7 +527,7 @@ async def options_note(context: dict, *, deep: bool = True) -> tuple[str, dict]:
     ).strip()
     if not text:
         raise RuntimeError(f"analyst returned no text (stop_reason={resp.stop_reason})")
-    return text, _usage(model, resp.usage)
+    return text, _usage(model, resp.usage, fallback_from=fallback_from)
 
 
 # ======================================================================================
@@ -931,6 +962,25 @@ It does not override the max-weight target — a cap breach still has to be cut 
 the ORDER and the SIZE of the cuts. If the block carries `proxy_for`, its cycle was measured on that \
 symbol (a spot-crypto ETF is too young for a 200-week read). No block means too little weekly history; \
 infer nothing from that.
+
+A position may carry `holding_days`, `capital_gains` ("short_term" / "long_term" / "mixed") and \
+`days_to_long_term`. This is a TAXABLE account: a gain realised inside one year is taxed as ordinary \
+income, while the same gain after a year gets the long-term rate, so trimming a young winner costs \
+materially more after tax than the headline gain suggests. WEIGH IT, do not obey it. Concretely: when \
+the case for trimming is comfort rather than necessity — a position is merely extended, not broken — \
+and `days_to_long_term` is small, prefer waiting, or trimming a different position toward the same \
+target instead, and say so in the reason. `capital_gains: "mixed"` means the position was bought in \
+more than one piece and some shares already qualify for long-term treatment while others do not — \
+`days_to_long_term` there counts down for the YOUNGEST piece only; the rest is already long-term and \
+waiting buys it nothing. When the thesis is actually breaking, when the max-weight cap forces the \
+sale, or when the position is a loss (no gain to be taxed, and possibly a useful realised loss), tax \
+is irrelevant and you should sell anyway. Never let tax turn into an excuse to hold a deteriorating \
+position — a 20% drawdown costs far more than the rate difference on a gain. If these three fields \
+are absent from a position, one of two things is true and you cannot tell which from here: the \
+account is tax-advantaged, where none of this applies, or the app could not determine the holding \
+period for that position — most often because one of its purchase lots has no recorded date. Either \
+way, treat it identically: say nothing about holding period for that position and NEVER assume \
+short-term or long-term from the silence.
 
 Produce a plan that ONLY trades the EXISTING holdings + deploys the idle cash (do NOT introduce new \
 tickers — that's a different tool):
