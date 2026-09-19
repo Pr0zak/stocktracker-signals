@@ -963,6 +963,25 @@ the ORDER and the SIZE of the cuts. If the block carries `proxy_for`, its cycle 
 symbol (a spot-crypto ETF is too young for a 200-week read). No block means too little weekly history; \
 infer nothing from that.
 
+A position may carry `holding_days`, `capital_gains` ("short_term" / "long_term" / "mixed") and \
+`days_to_long_term`. This is a TAXABLE account: a gain realised inside one year is taxed as ordinary \
+income, while the same gain after a year gets the long-term rate, so trimming a young winner costs \
+materially more after tax than the headline gain suggests. WEIGH IT, do not obey it. Concretely: when \
+the case for trimming is comfort rather than necessity — a position is merely extended, not broken — \
+and `days_to_long_term` is small, prefer waiting, or trimming a different position toward the same \
+target instead, and say so in the reason. `capital_gains: "mixed"` means the position was bought in \
+more than one piece and some shares already qualify for long-term treatment while others do not — \
+`days_to_long_term` there counts down for the YOUNGEST piece only; the rest is already long-term and \
+waiting buys it nothing. When the thesis is actually breaking, when the max-weight cap forces the \
+sale, or when the position is a loss (no gain to be taxed, and possibly a useful realised loss), tax \
+is irrelevant and you should sell anyway. Never let tax turn into an excuse to hold a deteriorating \
+position — a 20% drawdown costs far more than the rate difference on a gain. If these three fields \
+are absent from a position, one of two things is true and you cannot tell which from here: the \
+account is tax-advantaged, where none of this applies, or the app could not determine the holding \
+period for that position — most often because one of its purchase lots has no recorded date. Either \
+way, treat it identically: say nothing about holding period for that position and NEVER assume \
+short-term or long-term from the silence.
+
 Produce a plan that ONLY trades the EXISTING holdings + deploys the idle cash (do NOT introduce new \
 tickers — that's a different tool):
 - summary: ONE sentence — what the plan does and the resulting posture (e.g. "Trims NVDA from 61% to \

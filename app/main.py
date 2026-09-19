@@ -1822,6 +1822,13 @@ class Holding(BaseModel):
     symbol: str
     shares: float
     avg_cost: float
+    # MONEY-1: one entry per purchase lot behind this holding, ISO `yyyy-mm-dd`, in the app's own lot
+    # order — NOT flattened to a single date, because a position bought in several pieces has several
+    # holding periods and blending them would misreport which shares are still short-term. `None` is
+    # a lot the app never recorded a date for (most commonly a pre-MONEY-2 migrated position). See
+    # sandbox_job.annotate_holding_period: if even one lot's date is unknown, the whole position is
+    # left unannotated rather than guessing from the lots it can see.
+    opened_at: list[str | None] | None = None
 
 
 # Holdings that are the SAME economic exposure map to a shared group key, so the portfolio review +
@@ -2131,6 +2138,10 @@ class RebalanceRequest(BaseModel):
     refresh: bool = False           # bypass the cache — what the Refresh control must actually do
     max_position_pct: float = 25.0  # target largest single-position weight after rebalancing
     holdings: list[Holding] = []    # transient — never persisted
+    # MONEY-1: false for an IRA/401(k)/etc., where capital-gains treatment does not apply at all and
+    # the plan must not pretend it does. Defaults true so an app build that predates this field keeps
+    # getting the tax annotation it was always silently missing, rather than losing it on an upgrade.
+    taxable_account: bool = True
 
 
 @app.post("/portfolio/rebalance", dependencies=[Depends(require_api_token)])
@@ -2143,8 +2154,10 @@ async def portfolio_rebalance_endpoint(req: RebalanceRequest) -> dict:
         raise HTTPException(status_code=422, detail="no holdings to rebalance")
     cfg = settings_store.get()
     mpp = max(5.0, min(100.0, req.max_position_pct))
-    key = ("portfolio_rebalance", req.deep, round(req.cash, 2), round(mpp, 1),
-           tuple(sorted((h.symbol.upper(), round(h.shares, 6), round(h.avg_cost, 4)) for h in req.holdings)))
+    key = ("portfolio_rebalance", req.deep, round(req.cash, 2), round(mpp, 1), req.taxable_account,
+           tuple(sorted((h.symbol.upper(), round(h.shares, 6), round(h.avg_cost, 4),
+                        tuple(h.opened_at or ()))
+                       for h in req.holdings)))
     now = time.time()
     hit = _cache.get(key)
     if hit and not req.refresh and now - hit[0] < cfg["verdict_ttl_seconds"]:
@@ -2155,6 +2168,22 @@ async def portfolio_rebalance_endpoint(req: RebalanceRequest) -> dict:
     # Same multi-year value lens the sandbox gets — a whole-book review and a rebalance are
     # decisions about where a name sits in its cycle at least as much as its last three months.
     portfolio = await _build_portfolio_snapshot(req.holdings, req.cash, include_trend=True)
+    # MONEY-1: the same per-lot holding-period annotation the paper sandbox already gets, so a
+    # rebalance plan that goes straight into Fidelity can weigh short- vs long-term capital gains
+    # instead of being blind to them. Skipped entirely for a tax-advantaged account (a 401(k)/IRA),
+    # where none of this applies — see RebalanceRequest.taxable_account.
+    if req.taxable_account:
+        lot_dates_by_symbol: dict[str, list[str | None]] = {}
+        for h in req.holdings:
+            if h.opened_at is None:
+                continue
+            sym = h.symbol.upper().removesuffix("-USD")
+            lot_dates_by_symbol.setdefault(sym, []).extend(h.opened_at)
+        if lot_dates_by_symbol:
+            sandbox_job.annotate_holding_period(
+                portfolio.get("positions", []),
+                [{"symbol": sym, "lot_dates": dates} for sym, dates in lot_dates_by_symbol.items()],
+            )
     try:
         plan, usage = await rebalance_portfolio(portfolio, max_position_pct=mpp, deep=req.deep)
     except Exception as e:  # noqa: BLE001

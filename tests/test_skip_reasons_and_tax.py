@@ -5,6 +5,7 @@ strategist that the wrong thing is binding and it re-plans around a limit that w
 """
 from __future__ import annotations
 
+import datetime as dt
 import tempfile
 import time
 
@@ -374,6 +375,80 @@ def test_a_position_missing_from_the_ledger_is_left_untouched():
     book = [{"symbol": "GHOST"}]
     sandbox_job.annotate_holding_period(book, [], now_ts=time.time())
     assert "holding_days" not in book[0]
+
+
+# ------------------------------------------------------- MONEY-1: real per-lot dates (`lot_dates`)
+
+def _iso_days_ago(now_ts: float, days: int) -> str:
+    return dt.datetime.fromtimestamp(now_ts - days * 86_400, sandbox_job.ET).date().isoformat()
+
+
+def test_a_multi_lot_position_with_one_known_date_matches_the_single_date_path():
+    now = time.time()
+    book = [{"symbol": "AMZN"}]
+    sandbox_job.annotate_holding_period(
+        book, [{"symbol": "AMZN", "lot_dates": [_iso_days_ago(now, 4)]}], now_ts=now)
+    assert book[0]["capital_gains"] == "short_term"
+    assert book[0]["holding_days"] == 4
+    assert book[0]["days_to_long_term"] == sandbox_job._LONG_TERM_DAYS - 4
+
+
+def test_a_multi_lot_position_spanning_the_boundary_is_mixed():
+    """This is the whole point of per-lot dates: one old lot and one young one is not honestly
+    either 'short_term' or 'long_term' alone."""
+    now = time.time()
+    book = [{"symbol": "VTI"}]
+    sandbox_job.annotate_holding_period(book, [{
+        "symbol": "VTI", "lot_dates": [_iso_days_ago(now, 400), _iso_days_ago(now, 10)],
+    }], now_ts=now)
+    assert book[0]["capital_gains"] == "mixed"
+    # The days_to_long_term the model can act on is the YOUNGEST lot's — the old one is already long
+    # term and waiting does nothing for it.
+    assert book[0]["holding_days"] == 10
+    assert book[0]["days_to_long_term"] == sandbox_job._LONG_TERM_DAYS - 10
+
+
+def test_a_multi_lot_position_all_long_term_reports_long_term_with_no_countdown():
+    now = time.time()
+    book = [{"symbol": "SPY"}]
+    sandbox_job.annotate_holding_period(book, [{
+        "symbol": "SPY", "lot_dates": [_iso_days_ago(now, 400), _iso_days_ago(now, 500)],
+    }], now_ts=now)
+    assert book[0]["capital_gains"] == "long_term"
+    assert "days_to_long_term" not in book[0]
+
+
+def test_one_unknown_lot_date_leaves_the_whole_position_unannotated():
+    """Never assume short- or long-term from silence: a position that is mostly a decade-old
+    migrated lot (no date) plus one lot bought last week must not be reported as 'short_term' just
+    because that is all the code can see — that is a confident wrong number, not an unknown one."""
+    now = time.time()
+    book = [{"symbol": "MSFT"}]
+    sandbox_job.annotate_holding_period(book, [{
+        "symbol": "MSFT", "lot_dates": [None, _iso_days_ago(now, 4)],
+    }], now_ts=now)
+    assert "capital_gains" not in book[0]
+    assert "holding_days" not in book[0]
+
+
+def test_a_position_with_only_unknown_lot_dates_is_left_untouched():
+    now = time.time()
+    book = [{"symbol": "GOOGL"}]
+    sandbox_job.annotate_holding_period(
+        book, [{"symbol": "GOOGL", "lot_dates": [None]}], now_ts=now)
+    assert "capital_gains" not in book[0]
+
+
+def test_lot_dates_takes_priority_over_a_stray_last_add_at_on_the_same_row():
+    """A row should never carry both shapes in practice, but if it did, the real per-lot dates (the
+    more precise source) must win rather than the sandbox's single-clock fallback silently winning."""
+    now = time.time()
+    book = [{"symbol": "AAPL"}]
+    sandbox_job.annotate_holding_period(book, [{
+        "symbol": "AAPL", "last_add_at": now - 999 * 86_400,  # would say long_term if it won
+        "lot_dates": [None],                                  # but the real lots are unknown
+    }], now_ts=now)
+    assert "capital_gains" not in book[0]
 
 
 def test_annotation_never_gates_a_sell():
