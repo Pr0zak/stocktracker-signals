@@ -165,6 +165,17 @@ def test_invoke_error_envelope_raises(monkeypatch):
         asyncio.run(llm_cli._invoke("m", "sys", "user"))
 
 
+def test_invoke_error_envelope_surfaces_result_text(monkeypatch):
+    # The `result` field carries the human-readable reason (e.g. a session-limit message) — it must
+    # land in the raised error's text, or budget/rate/fatal classification has nothing to match on.
+    import json
+    _patch_exec(monkeypatch, _FakeProc(out=json.dumps(
+        _env("You've hit your session limit · resets 9:10am", is_error=True)
+    ).encode()))
+    with pytest.raises(llm_cli.CliError, match="session limit"):
+        asyncio.run(llm_cli._invoke("m", "sys", "user"))
+
+
 def test_invoke_truncated_raises(monkeypatch):
     import json
     _patch_exec(monkeypatch, _FakeProc(out=json.dumps(_env("x", stop_reason="max_tokens")).encode()))
@@ -278,6 +289,63 @@ def test_invoke_timeout_raises_and_kills(monkeypatch):
     assert proc.killed   # timed-out process is killed, not leaked
 
 
+# ============================ session-limit / budget-exhaustion classification ============================
+
+def test_is_budget_exhausted_recognizes_session_limit_phrase():
+    assert llm_cli._is_budget_exhausted(Exception("You've hit your session limit"))
+
+
+def test_is_budget_exhausted_recognizes_resets_at_phrasing():
+    assert llm_cli._is_budget_exhausted(Exception("Session limit reached — resets at 9:10am"))
+
+
+def test_is_budget_exhausted_recognizes_terse_resets_phrasing():
+    # The real OPS-2 incident message: no "at" between "resets" and the clock time.
+    assert llm_cli._is_budget_exhausted(Exception("You've hit your session limit · resets 9:10am"))
+
+
+def test_is_budget_exhausted_false_for_generic_rate_limit():
+    # A genuine transient rate limit must NOT be classified as budget exhaustion (it should still
+    # retry, unlike a session-limit wall).
+    assert not llm_cli._is_budget_exhausted(Exception("429 too many requests, rate limit exceeded"))
+
+
+def test_invoke_resilient_does_not_retry_session_limit(monkeypatch):
+    calls = {"n": 0}
+
+    async def fake_invoke(model, system, prompt, *, thinking=False):
+        calls["n"] += 1
+        raise llm_cli.CliError("You've hit your session limit · resets 9:10am")
+    monkeypatch.setattr(llm_cli, "_invoke", fake_invoke)
+
+    async def fail_if_slept(*a, **k):
+        raise AssertionError("must not sleep/retry against a session-limit wall")
+    monkeypatch.setattr(asyncio, "sleep", fail_if_slept)
+
+    with pytest.raises(llm_cli.CliBudgetExhaustedError):
+        asyncio.run(llm_cli._invoke_resilient("m", "sys", "user"))
+    assert calls["n"] == 1   # exactly one attempt — no retry into the same wall
+
+
+def test_invoke_resilient_still_retries_transient_rate_limit(monkeypatch):
+    # Contrast case: a genuine transient failure still gets its one retry (unchanged behavior).
+    calls = {"n": 0}
+
+    async def fake_invoke(model, system, prompt, *, thinking=False):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise llm_cli.CliError("429 too many requests")
+        return {"result": "ok"}
+    monkeypatch.setattr(llm_cli, "_invoke", fake_invoke)
+
+    async def fast_sleep(*a, **k):
+        return None
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    env = asyncio.run(llm_cli._invoke_resilient("m", "sys", "user"))
+    assert env == {"result": "ok"} and calls["n"] == 2
+
+
 # ============================ analyst provider routing ============================
 
 def _verdict():
@@ -312,3 +380,95 @@ def test_analyst_api_path_tags_provider_api():
         cache_creation_input_tokens = 0
     d = analyst._usage("claude-haiku-4-5", U())
     assert d["provider"] == "api"
+
+
+# ============================ OPS-2: cli -> api fallback on budget exhaustion ============================
+
+def test_cli_fallback_to_api_defaults_off(monkeypatch):
+    monkeypatch.delenv("CLI_FALLBACK_TO_API", raising=False)
+    assert settings_store._defaults()["cli_fallback_to_api"] is False
+
+
+def _fake_api_client(parsed):
+    """A stand-in for analyst._get_client() whose messages.parse() succeeds immediately — used to
+    prove the analyst._parse() cli->api fallback actually completes the call on the API path."""
+    class _FakeUsage:
+        input_tokens = 42
+        output_tokens = 7
+
+    class _FakeResp:
+        usage = _FakeUsage()
+        stop_reason = "end_turn"
+        parsed_output = parsed
+
+    class _FakeMessages:
+        async def parse(self, **kwargs):
+            return _FakeResp()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    return _FakeClient()
+
+
+def test_analyst_falls_back_to_api_when_cli_budget_exhausted_and_eligible(monkeypatch):
+    # Both conditions met: cli_fallback_to_api is on AND an API key is configured.
+    monkeypatch.setattr(settings_store, "get", lambda: {
+        "llm_provider": "cli", "deep_model": "d", "scan_model": "s",
+        "cli_fallback_to_api": True, "anthropic_api_key": "sk-ant-real",
+    })
+
+    async def fake_structured(system, prompt, output_model, *, model, max_tokens=4096, thinking=False):
+        raise llm_cli.CliBudgetExhaustedError("You've hit your session limit · resets 9:10am")
+    monkeypatch.setattr(llm_cli, "structured", fake_structured)
+    monkeypatch.setattr(analyst, "_get_client", lambda: _fake_api_client(_verdict()))
+
+    v, u = asyncio.run(analyst.analyze({"symbol": "AAPL"}, deep=False))
+    assert u["provider"] == "api"          # cost card must show this as an API-tier call
+    assert u["fallback_from"] == "cli"     # ...and that it was a fallback, not a configured API run
+
+
+def test_analyst_reraises_budget_exhaustion_when_fallback_setting_off(monkeypatch):
+    # Setting is off (default) — no fallback, even with a key configured.
+    monkeypatch.setattr(settings_store, "get", lambda: {
+        "llm_provider": "cli", "deep_model": "d", "scan_model": "s",
+        "cli_fallback_to_api": False, "anthropic_api_key": "sk-ant-real",
+    })
+
+    async def fake_structured(system, prompt, output_model, *, model, max_tokens=4096, thinking=False):
+        raise llm_cli.CliBudgetExhaustedError("You've hit your session limit · resets 9:10am")
+    monkeypatch.setattr(llm_cli, "structured", fake_structured)
+
+    with pytest.raises(llm_cli.CliBudgetExhaustedError):
+        asyncio.run(analyst.analyze({"symbol": "AAPL"}, deep=False))
+
+
+def test_analyst_reraises_budget_exhaustion_when_no_api_key(monkeypatch):
+    # Setting is on, but no key is configured — no fallback (nothing to fall back to).
+    monkeypatch.setattr(settings_store, "get", lambda: {
+        "llm_provider": "cli", "deep_model": "d", "scan_model": "s",
+        "cli_fallback_to_api": True, "anthropic_api_key": "",
+    })
+
+    async def fake_structured(system, prompt, output_model, *, model, max_tokens=4096, thinking=False):
+        raise llm_cli.CliBudgetExhaustedError("You've hit your session limit · resets 9:10am")
+    monkeypatch.setattr(llm_cli, "structured", fake_structured)
+
+    with pytest.raises(llm_cli.CliBudgetExhaustedError):
+        asyncio.run(analyst.analyze({"symbol": "AAPL"}, deep=False))
+
+
+def test_analyst_does_not_fall_back_on_non_budget_cli_error(monkeypatch):
+    # A non-budget CliError (e.g. auth failure) must propagate untouched even with fallback eligible —
+    # the fallback is scoped to CliBudgetExhaustedError, never a blanket safety net for any CLI error.
+    monkeypatch.setattr(settings_store, "get", lambda: {
+        "llm_provider": "cli", "deep_model": "d", "scan_model": "s",
+        "cli_fallback_to_api": True, "anthropic_api_key": "sk-ant-real",
+    })
+
+    async def fake_structured(system, prompt, output_model, *, model, max_tokens=4096, thinking=False):
+        raise llm_cli.CliError("not logged in — /login")
+    monkeypatch.setattr(llm_cli, "structured", fake_structured)
+
+    with pytest.raises(llm_cli.CliError):
+        asyncio.run(analyst.analyze({"symbol": "AAPL"}, deep=False))

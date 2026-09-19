@@ -85,6 +85,14 @@ class CliError(RuntimeError):
     """A headless claude call failed (spawn/timeout/non-zero exit, error envelope, or bad output)."""
 
 
+class CliBudgetExhaustedError(CliError):
+    """The CLI's subscription session/budget is exhausted until a fixed wall-clock reset — distinct
+    from a transient rate limit (see _BUDGET_HINTS). Non-retryable: sleeping a few seconds and trying
+    again just re-hits the same wall. Raised so callers (analyst._parse / analyst.options_note) can
+    catch it specifically and fall back to the Anthropic API for that one call when cli_fallback_to_api
+    is on and a key is configured — a generic `except CliError` still catches it too."""
+
+
 def _lean_argv(model: str, system: str) -> list[str]:
     # There is no CLI flag for max_tokens; single-turn completions rarely hit the model's default
     # output cap (32k), and _invoke guards on stop_reason=="max_tokens" for parity with the API path.
@@ -145,7 +153,12 @@ async def _invoke(model: str, system: str, user_prompt: str, *, thinking: bool =
     except Exception as e:  # noqa: BLE001
         raise CliError(f"claude CLI returned non-JSON: {out.decode(errors='replace')[:200]}") from e
     if env.get("is_error"):
-        raise CliError(f"claude CLI error envelope (api_error_status={env.get('api_error_status')})")
+        # The human-readable failure detail (e.g. "You've hit your session limit · resets 9:10am")
+        # lives in `result`, not the status code alone — surface it so the budget/rate/fatal
+        # classifiers below have text to match against instead of just an opaque status code.
+        msg = (env.get("result") or "").strip()
+        status = f"api_error_status={env.get('api_error_status')}"
+        raise CliError(f"{msg} ({status})" if msg else f"claude CLI error envelope ({status})")
     if env.get("stop_reason") == "max_tokens":
         raise CliError("claude CLI output was truncated at the model's max output — retry")
     if "result" not in env:
@@ -153,22 +166,44 @@ async def _invoke(model: str, system: str, user_prompt: str, *, thinking: bool =
     return env
 
 
-# A CLI failure is FATAL (retry is pointless — auth/config) or TRANSIENT (capacity/rate/network — worth
-# one retry). Unknown non-zero exits default to transient so a momentary rejection isn't fatal.
+# A CLI failure is FATAL (retry is pointless — auth/config), BUDGET-EXHAUSTED (retry is ALSO
+# pointless — the subscription session ran out and only recovers at a fixed wall-clock reset, not in
+# the next few seconds), or TRANSIENT (capacity/rate/network — worth one retry). Unknown non-zero exits
+# default to transient so a momentary rejection isn't fatal.
+#
+# Budget exhaustion is its own class, not folded into _FATAL_HINTS or _RATE_HINTS:
+#   • It must NOT retry like a rate limit — on 2026-09-10, 54 concurrent scan calls each failed fast
+#     with "You've hit your session limit … resets 9:10am", weren't recognized as fatal, and all
+#     retried after a 4s sleep straight into the same wall (three hours away).
+#   • It must be distinguishable from a genuine fatal (auth/config) error so analyst._parse /
+#     analyst.options_note can catch it specifically and fall back to the Anthropic API for that one
+#     call when cli_fallback_to_api is on and a key is configured.
 _FATAL_HINTS = ("not logged in", "/login", "claude cli not found", "invalid api key",
                 "authentication_error", "unauthorized", "401")
 _RATE_HINTS = ("rate limit", "rate-limit", "429", "overloaded", "usage limit", "capacity",
                "quota", "too many requests")
+# "resets " (with the trailing space) matches both observed phrasings — "resets at 9:10am" and the
+# terser "resets 9:10am" — without over-matching on the bare word "reset".
+_BUDGET_HINTS = ("session limit", "resets ")
 
 
 def _is_fatal(err: Exception) -> bool:
     return any(h in str(err).lower() for h in _FATAL_HINTS)
 
 
+def _is_budget_exhausted(err: Exception) -> bool:
+    """The shared Claude subscription's session/budget ran out — distinct from a transient rate limit.
+    Non-retryable: the wall clears only at a fixed reset time, not a few seconds later."""
+    return any(h in str(err).lower() for h in _BUDGET_HINTS)
+
+
 def _friendly(err: Exception) -> str:
     """Turn a raw CLI failure into something the app can show a human. Rate/capacity rejections (the
     common cause on the shared subscription budget, esp. for the heavy deep whole-market call) become a
-    clear 'try again' rather than the cryptic 'claude CLI exited 1'."""
+    clear 'try again' rather than the cryptic 'claude CLI exited 1'. Budget exhaustion keeps the CLI's
+    own detail (which names the reset time) instead of being rewritten to the generic rate-limit copy."""
+    if _is_budget_exhausted(err):
+        return f"the Claude subscription session limit has been reached: {err}"
     if any(h in str(err).lower() for h in _RATE_HINTS):
         return ("the AI is temporarily rate-limited on the Claude subscription — try again in a minute, "
                 "or use the scan (fast) model instead of deep")
@@ -178,12 +213,16 @@ def _friendly(err: Exception) -> str:
 async def _invoke_resilient(model: str, system: str, user_prompt: str, *, thinking: bool = False) -> dict:
     """_invoke with ONE retry on a transient failure — but only when the failed attempt returned quickly
     (a fast rejection, not a full-length generation), so a slow deep call that fails can't blow the
-    caller's HTTP timeout by re-running. Fatal (auth/config) errors re-raise immediately. The final error
-    is rewritten via _friendly() so the app shows a human-readable reason."""
+    caller's HTTP timeout by re-running. Fatal (auth/config) errors re-raise immediately — and so does
+    budget exhaustion (retrying a session-limit wall just re-hits it, see _BUDGET_HINTS), raised as
+    CliBudgetExhaustedError so a caller can choose to fall back to the API instead of failing outright.
+    The final error is rewritten via _friendly() so the app shows a human-readable reason."""
     t0 = time.monotonic()
     try:
         return await _invoke(model, system, user_prompt, thinking=thinking)
     except CliError as e:
+        if _is_budget_exhausted(e):
+            raise CliBudgetExhaustedError(_friendly(e)) from e
         elapsed = time.monotonic() - t0
         if _is_fatal(e) or elapsed > 45.0:
             raise CliError(_friendly(e)) from e
@@ -192,6 +231,8 @@ async def _invoke_resilient(model: str, system: str, user_prompt: str, *, thinki
         try:
             return await _invoke(model, system, user_prompt, thinking=thinking)
         except CliError as e2:
+            if _is_budget_exhausted(e2):
+                raise CliBudgetExhaustedError(_friendly(e2)) from e2
             raise CliError(_friendly(e2)) from e2
 
 

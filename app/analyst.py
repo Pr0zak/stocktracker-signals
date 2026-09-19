@@ -306,8 +306,12 @@ _PRICING = {
 }
 
 
-def _usage(model: str, u) -> dict:
-    """Token counts + an estimated USD cost for one call (cache reads/writes priced in if present)."""
+def _usage(model: str, u, *, fallback_from: str | None = None) -> dict:
+    """Token counts + an estimated USD cost for one call (cache reads/writes priced in if present).
+
+    `fallback_from` tags a call that only ran here because the configured CLI provider hit its
+    subscription budget wall (see _cli_fallback_eligible / _parse) — the cost card needs this to
+    explain an "api" line item showing up while llm_provider is still "cli"."""
     in_rate, out_rate = _PRICING.get(model, (5.0, 25.0))
     cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
     cache_write = getattr(u, "cache_creation_input_tokens", 0) or 0
@@ -317,7 +321,7 @@ def _usage(model: str, u) -> dict:
         + cache_read * in_rate * 0.1
         + cache_write * in_rate * 1.25
     ) / 1_000_000
-    return {
+    usage = {
         "model": model,
         "input_tokens": u.input_tokens,
         "output_tokens": u.output_tokens,
@@ -326,6 +330,16 @@ def _usage(model: str, u) -> dict:
         "cost_usd": round(cost, 6),
         "provider": "api",
     }
+    if fallback_from:
+        usage["fallback_from"] = fallback_from
+    return usage
+
+
+def _cli_fallback_eligible(cfg: dict) -> bool:
+    """Whether a CLI budget-exhaustion failure (llm_cli.CliBudgetExhaustedError) should fall back to
+    the API path once for that call: the opt-in setting must be on AND an Anthropic API key must be
+    configured — no key means no fallback, just the original error."""
+    return bool(cfg.get("cli_fallback_to_api")) and bool(cfg.get("anthropic_api_key"))
 
 
 def _render(summary: dict) -> str:
@@ -366,9 +380,19 @@ async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tok
     thinking_model = _is_thinking_model(model)
     # Provider toggle: "cli" shells out to the headless claude CLI (subscription OAuth, no per-token
     # billing); the default "api" path below uses the Anthropic SDK's schema-constrained parse().
+    fallback_from: str | None = None
     if cfg.get("llm_provider") == "cli":
-        return await llm_cli.structured(system, prompt, output_format, model=model,
-                                        max_tokens=max_tokens, thinking=thinking_model)
+        try:
+            return await llm_cli.structured(system, prompt, output_format, model=model,
+                                            max_tokens=max_tokens, thinking=thinking_model)
+        except llm_cli.CliBudgetExhaustedError:
+            if not _cli_fallback_eligible(cfg):
+                raise
+            # The CLI's subscription session/budget is exhausted until a fixed reset — not a
+            # momentary rate limit — so retrying the CLI is pointless. Fall through to the API path
+            # below for this one call instead of taking down the scan/brief/verdict outright.
+            log.warning("analyst: cli session limit hit — falling back to the API for this call (model=%s)", model)
+            fallback_from = "cli"
     kwargs: dict = dict(
         model=model,
         max_tokens=max_tokens,
@@ -402,7 +426,7 @@ async def _parse(system: str, prompt: str, output_format, *, deep: bool, max_tok
     parsed = resp.parsed_output
     if parsed is None:
         raise RuntimeError(f"analyst returned no structured output (stop_reason={resp.stop_reason})")
-    return parsed, _usage(model, resp.usage)
+    return parsed, _usage(model, resp.usage, fallback_from=fallback_from)
 
 
 async def analyze(summary: dict, *, deep: bool = False) -> tuple[Verdict, dict]:
@@ -474,8 +498,15 @@ async def options_note(context: dict, *, deep: bool = True) -> tuple[str, dict]:
         + json.dumps(context, indent=2, default=str)
         + "\n\nReturn ONE short plain-language paragraph."
     )
+    fallback_from: str | None = None
     if cfg.get("llm_provider") == "cli":
-        return await llm_cli.text(OPTIONS_NOTE_SYSTEM, prompt, model=model, max_tokens=2048, thinking=thinking_model)
+        try:
+            return await llm_cli.text(OPTIONS_NOTE_SYSTEM, prompt, model=model, max_tokens=2048, thinking=thinking_model)
+        except llm_cli.CliBudgetExhaustedError:
+            if not _cli_fallback_eligible(cfg):
+                raise
+            log.warning("analyst: cli session limit hit — falling back to the API for options_note (model=%s)", model)
+            fallback_from = "cli"
     kwargs: dict = dict(
         model=model,
         max_tokens=2048,
@@ -496,7 +527,7 @@ async def options_note(context: dict, *, deep: bool = True) -> tuple[str, dict]:
     ).strip()
     if not text:
         raise RuntimeError(f"analyst returned no text (stop_reason={resp.stop_reason})")
-    return text, _usage(model, resp.usage)
+    return text, _usage(model, resp.usage, fallback_from=fallback_from)
 
 
 # ======================================================================================

@@ -36,6 +36,14 @@ def _defaults() -> dict:
         # CLI subscription token (`claude setup-token`) for cli mode, editable in the UI. Empty here
         # means "fall back to the CLAUDE_CODE_OAUTH_TOKEN env var"; a UI-set value takes precedence.
         "cli_oauth_token": "",
+        # When llm_provider is "cli" and the headless CLI hits its subscription session/budget limit
+        # (see llm_cli.CliBudgetExhaustedError) — as opposed to a transient rate limit, which already
+        # retries — fall back to the Anthropic API for that one call if this is on AND an API key is
+        # configured (analyst._cli_fallback_eligible). Off by default: flipping it on can silently
+        # start spending real per-token $ against the API key instead of the $0 subscription, so it's
+        # worth an explicit opt-in rather than a surprise on someone else's session limit.
+        "cli_fallback_to_api": (os.environ.get("CLI_FALLBACK_TO_API", "false").strip().lower()
+                                 in ("1", "true", "yes")),
         "verdict_ttl_seconds": int(os.environ.get("VERDICT_TTL_SECONDS", "14400")),
         "watchlist": _split(os.environ.get("WATCHLIST", "")),
         "crypto_watchlist": _split(os.environ.get("CRYPTO_WATCHLIST", "")),
