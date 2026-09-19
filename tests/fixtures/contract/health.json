@@ -1,0 +1,7 @@
+{
+  "deep_model": "claude-opus-4-8",
+  "key_configured": true,
+  "ok": true,
+  "scan_model": "claude-haiku-4-5",
+  "settings_source": "env"
+}
