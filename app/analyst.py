@@ -596,17 +596,27 @@ false, `catalysts_today` is UNKNOWN rather than empty — say nothing about who 
 write that there are no catalysts; a `catalysts_note` explains why. When it is true, an empty \
 `catalysts_today` genuinely means nobody on the watchlist reports today.
 
+`holdings` is what the user actually OWNS — a plain list of tickers, DIFFERENT from the watchlist above \
+(which is everything tracked, held or not). It may be empty; that means the app didn't send a portfolio \
+this time, NOT that the user holds nothing, so never say "you have no holdings" — say nothing about the \
+book at all. `holdings_touched_today` is the EXACT, already-computed subset of `holdings` that shows up \
+among today's watchlist movers or (only when `catalysts_complete` is true) today's earnings reporters — \
+trust this list as-is rather than cross-referencing tickers yourself.
+
 Return a structured brief:
 - title: the notification TITLE — a punchy morning headline UNDER ~8 words, leading with the tape's tone \
 or the single most notable item (e.g. "Futures soft; NVDA reports today").
 - body: 2 to 3 SHORT sentences, UNDER ~55 words total, in this priority order: (1) the tape — indices + \
-VIX in one line; (2) the 1-2 most notable moves in the user's OWN watchlist, by name; (3) any \
-`catalysts_today` — name who reports today (this is the highest-value line when present), but ONLY if \
+VIX in one line; (2) if `holdings_touched_today` is non-empty, THIS is the highest-value line — name \
+those tickers by symbol and say how many of the user's `holdings` they represent (e.g. "2 of your 8 \
+positions — AAPL, NVDA — are among today's movers"), so the brief speaks to the user's own book, not just \
+the market; otherwise fall back to the 1-2 most notable moves in the broader watchlist; (3) any \
+`catalysts_today` not already covered by holdings — name who reports today, but ONLY if \
 `catalysts_complete` is true. Skip a bucket if there's nothing worth saying; never pad.
 - tone: exactly one of "risk-on", "risk-off", or "mixed", grounded in indices AND the VIX.
-Ground EVERY claim in the snapshot numbers — never invent news, price levels, or catalysts not in \
-`catalysts_today`. In PRE phase, treat moves as thin-volume futures/pre-market. Plain text, no markdown, \
-no disclaimer line (the app adds one)."""
+Ground EVERY claim in the snapshot numbers — never invent news, price levels, catalysts not in \
+`catalysts_today`, or holdings not in `holdings`. In PRE phase, treat moves as thin-volume \
+futures/pre-market. Plain text, no markdown, no disclaimer line (the app adds one)."""
 
 
 async def daily_brief(snapshot: dict, *, deep: bool = False) -> tuple[DailyBrief, dict]:

@@ -45,9 +45,35 @@ from fastapi.testclient import TestClient
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "contract"
 
 
+# Wall-clock values that a route stamps at response time. Frozen before writing, because a
+# fixture that changes on every run is not a fixture: it rewrites itself during an ordinary test
+# run, leaves the working tree dirty, and silently drifts away from the copy committed in the
+# Android repo — so the contract these files exist to pin would quietly stop being pinned.
+# Frozen to 2026-01-01T00:00:00Z. Add a field here only if a route genuinely stamps it with "now".
+_FROZEN_EPOCH_SECONDS = 1767225600.0
+# Only fields that genuinely vary run to run. `generated_at` is deliberately excluded: the route
+# under test already stamps it with a fixed value, and freezing it here would overwrite a
+# deterministic number with a different deterministic number for no reason.
+_NON_DETERMINISTIC_FIELDS = ("created_at", "as_of", "as_of_ts", "ts")
+
+
+def _freeze_timestamps(value):
+    """Replace stamped-at-response-time fields with a fixed value, recursively."""
+    if isinstance(value, dict):
+        return {
+            k: (_FROZEN_EPOCH_SECONDS if k in _NON_DETERMINISTIC_FIELDS and isinstance(v, (int, float))
+                else _freeze_timestamps(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_freeze_timestamps(v) for v in value]
+    return value
+
+
 def _write_fixture(name: str, payload: dict) -> None:
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
-    (FIXTURES_DIR / name).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    frozen = _freeze_timestamps(payload)
+    (FIXTURES_DIR / name).write_text(json.dumps(frozen, indent=2, sort_keys=True) + "\n")
 
 
 @pytest.fixture()

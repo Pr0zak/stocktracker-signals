@@ -738,15 +738,40 @@ async def regime_endpoint(deep: bool = False, count: int = 6) -> dict:
     return payload
 
 
+def _holdings_touched_today(watchlist_movers: dict, catalysts_today: list[str], holdings: list[str]) -> list[str]:
+    """MONEY-7: which of the user's actual HOLDINGS are touched by today's watchlist movers or earnings
+    catalysts — computed here as an exact, checkable fact rather than left for the analyst to eyeball
+    two JSON arrays for ticker overlap (this app's rule elsewhere: arithmetic — and matching — is not
+    the model's job when Python can just do it). Pure and holdings-empty-safe: an empty `holdings` (the
+    common case for a request that predates MONEY-7, or an app that hasn't synced a portfolio) returns
+    empty rather than a spurious "everything is touched" from an accidental empty-set intersection."""
+    if not holdings:
+        return []
+    held = {h.upper() for h in holdings}
+    movers = ({m["symbol"] for m in (watchlist_movers or {}).get("up", [])} |
+              {m["symbol"] for m in (watchlist_movers or {}).get("down", [])})
+    catalysts = {c.upper() for c in catalysts_today}
+    return sorted(held & (movers | catalysts))
+
+
 @app.get("/daily_brief")
-async def daily_brief_endpoint(deep: bool = False, count: int = 6) -> dict:
+async def daily_brief_endpoint(deep: bool = False, count: int = 6, holdings: str = "") -> dict:
     """AIE-3 — a once-a-morning push brief. Same live snapshot as /market_now (session, indices, VIX,
     sectors, market + watchlist movers) PLUS `catalysts_today` (watchlist names reporting earnings today,
     in ET), narrated by the analyst into a notification title + a couple of sentences. Cached ~30 min;
-    the app's worker fires it once per trading day, so this mostly just coalesces retries."""
+    the app's worker fires it once per trading day, so this mostly just coalesces retries.
+
+    MONEY-7: `holdings` is an optional comma-separated list of tickers the user actually OWNS (same
+    `,`-joined shape as /sectors' `symbols`) — NOT the scan watchlist, which is everything tracked
+    whether or not it's held. Deliberately just symbols: no shares, cost basis, per-lot acquisition
+    dates, or the taxable-account flag the app also carries for holdings (see `HoldingSync` on the app
+    side and `Holding` on /portfolio/review's) — this brief only ever says "your book was/wasn't
+    touched today", never anything about size, gain, or tax treatment, so it is handed nothing it
+    doesn't consume."""
     assert _http is not None
     cfg = settings_store.get()
-    key = ("daily_brief", deep)
+    held = sorted({s.strip().upper() for s in holdings.split(",") if s.strip()})
+    key = ("daily_brief", deep, tuple(held))
     now = time.time()
     hit = _cache.get(key)
     if hit and now - hit[0] < _DAILY_BRIEF_TTL:
@@ -793,6 +818,12 @@ async def daily_brief_endpoint(deep: bool = False, count: int = 6) -> dict:
         snap["catalysts_note"] = ("the earnings calendar could not be read this morning, so it is "
                                   "unknown whether any watchlist name reports today")
 
+    # MONEY-7: what the user actually OWNS, and the exact (precomputed) overlap with today's tape —
+    # see _holdings_touched_today and the route docstring for why this is symbols-only.
+    snap["holdings"] = held
+    snap["holdings_touched_today"] = _holdings_touched_today(
+        snap.get("watchlist_movers") or {}, snap.get("catalysts_today") or [], held)
+
     try:
         brief, usage = await daily_brief(snap, deep=deep)
     except Exception as e:  # noqa: BLE001
@@ -806,6 +837,8 @@ async def daily_brief_endpoint(deep: bool = False, count: int = 6) -> dict:
         "catalysts_today": snap.get("catalysts_today", []),
         # False = the calendar could not be read; an empty catalysts_today is then UNKNOWN, not "none".
         "catalysts_complete": snap.get("catalysts_complete", False),
+        # MONEY-7: empty whenever `holdings` wasn't sent — not to be read as "nothing touched the book".
+        "holdings_touched_today": snap.get("holdings_touched_today", []),
         "session": snap["session"],
         "model": usage["model"],
         "as_of": now,
