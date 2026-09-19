@@ -138,6 +138,8 @@ async def get_settings() -> dict:
         "watchlist": cfg.get("watchlist", []),
         "crypto_watchlist": cfg.get("crypto_watchlist", []),
         "watchlist_synced_at": cfg.get("watchlist_synced_at"),
+        "watchlist_synced_by": cfg.get("watchlist_synced_by"),
+        "watchlist_removal_guard": cfg.get("watchlist_removal_guard"),
     }
 
 
@@ -151,11 +153,20 @@ class SettingsPatch(BaseModel):
     verdict_ttl_seconds: int | None = None
     watchlist: str | list[str] | None = None
     crypto_watchlist: str | list[str] | None = None
+    watchlist_removal_guard: int | None = None
+    # OPS-3: the syncing client's install id, and an explicit override for the removal guard below.
+    # Both optional and omitted by the settings UI's own saves, which never touch the watchlist.
+    client_id: str | None = None
+    replace: bool = False
 
 
 @app.post("/api/settings")
 async def post_settings(patch: SettingsPatch) -> dict:
-    settings_store.update(patch.model_dump(exclude_none=True))
+    body = patch.model_dump(exclude={"client_id", "replace"}, exclude_none=True)
+    try:
+        settings_store.update(body, client_id=patch.client_id, replace=patch.replace)
+    except settings_store.WatchlistSyncRefused as e:
+        raise HTTPException(status_code=409, detail=e.detail()) from e
     return await get_settings()
 
 
@@ -222,6 +233,10 @@ async def health() -> dict:
         "key_configured": bool(cfg["anthropic_api_key"]),
         "deep_model": cfg["deep_model"],
         "scan_model": cfg["scan_model"],
+        # OPS-5: which of settings.json / settings.json.bak / environment defaults is actually behind
+        # the settings above — "env" or "backup" means the on-disk file was missing or corrupt, and
+        # anything saved via the UI (keys, watchlist, model choice) may not be in effect.
+        "settings_source": settings_store.source(),
     }
 
 
