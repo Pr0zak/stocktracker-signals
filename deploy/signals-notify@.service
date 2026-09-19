@@ -1,0 +1,12 @@
+[Unit]
+# Templated notification unit triggered by OnFailure= from scheduled job units.
+# Sends a failure alert to Home Assistant webhook for visibility into silent failures.
+Description=StockTracker Signals — notify Home Assistant of job failure (%i)
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/opt/signals/.env
+ExecStart=/usr/bin/curl -fsS -m 30 -X POST "${HA_WEBHOOK_URL}" \
+  -H "Content-Type: application/json" \
+  -d '{"failed_unit":"%i","event":"scheduled_job_failure"}'

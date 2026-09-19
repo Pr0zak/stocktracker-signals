@@ -15,6 +15,7 @@
 Description=StockTracker Signals — nightly full-market mechanical scan (SWT-1)
 After=network-online.target
 Wants=network-online.target
+OnFailure=signals-notify@%n.service
 
 [Service]
 Type=oneshot

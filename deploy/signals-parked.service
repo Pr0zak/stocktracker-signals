@@ -2,6 +2,7 @@
 Description=StockTracker AI sandbox — fill parked entry-zone buys
 After=network-online.target signals.service
 Wants=network-online.target
+OnFailure=signals-notify@%n.service
 
 [Service]
 Type=oneshot
