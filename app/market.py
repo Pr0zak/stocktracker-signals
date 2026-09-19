@@ -23,7 +23,10 @@ _HOSTS = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]
 class Series:
     symbol: str
     closes: list[float]
-    opens: list[float | None]   # session opens — needed for overnight-gap detection (see gaps.py)
+    # Session opens, needed for overnight-gap detection (see gaps.py). SCALED ONTO THE ADJUSTED
+    # BASIS same as highs/lows below (see the rescaling comment in fetch_series) — the webull path
+    # is the one exception, where opens/closes/highs/lows are all raw together instead.
+    opens: list[float | None]
     volumes: list[float | None]
     dates: list[str]  # YYYYMMDD per bar — lets shorts.py align SEC/FINRA data to prices
     fifty_two_high: float | None
@@ -140,12 +143,6 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str, rng: str = "1y", 
         if c is None:  # Yahoo pads gaps with null
             continue
         closes.append(float(c))
-        o = raw_opens[i] if i < len(raw_opens) else None
-        # `opens` is knowingly left RAW while highs/lows below are rescaled. gaps.py measures
-        # opens[-1] against the ADJUSTED closes[-2], so the split bar of a 10:1 reads as a ~90%
-        # overnight gap. That is a real latent bug, but correcting it changes the output of a
-        # shipped feature, so it gets its own commit rather than riding along with this one.
-        opens.append(float(o) if o is not None else None)
         v = raw_vols[i] if i < len(raw_vols) else None
         vols.append(float(v) if v is not None else None)
         # Yahoo's quote arrays (open/high/low/close) are RAW prices, but `closes` above are the
@@ -159,6 +156,12 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str, rng: str = "1y", 
         # (Yahoo nulls a bar it has adjclose for) leaves the bar unscaled rather than dropping it.
         rc = raw_closes[i] if i < len(raw_closes) else None
         f = (float(c) / float(rc)) if rc else 1.0
+        # `opens` used to be left RAW while highs/lows were rescaled. gaps.py measures opens[-1]
+        # against the ADJUSTED closes[-2], so a bare raw open on a split bar (e.g. NVDA's 10:1) read
+        # as a ~90% overnight gap that never happened. Apply the same per-bar factor here so opens
+        # share the adjusted basis with closes/highs/lows — every series is internally consistent.
+        o = raw_opens[i] if i < len(raw_opens) else None
+        opens.append(float(o) * f if o is not None else None)
         h = raw_highs[i] if i < len(raw_highs) else None
         highs.append(float(h) * f if h is not None else None)
         lo = raw_lows[i] if i < len(raw_lows) else None
