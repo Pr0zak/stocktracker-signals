@@ -555,6 +555,38 @@ PAGE = """<!doctype html>
 </div>
 <script>
 
+
+  // SEC-2. This page is served unauthenticated, but the routes it reads are not: /api/settings and
+  // the sandbox routes disclose the watchlist, the paper book and whether a key is configured. The
+  // dashboard's JS runs in YOUR browser, so it has no access to the container's .env and has to be
+  // told the token once, the same way the phone is.
+  //
+  // Kept in localStorage rather than a cookie: a cookie would be sent automatically on every
+  // request including cross-site ones, and this page has no CSRF protection to go with it.
+  function apiToken() { try { return localStorage.getItem("signals_token") || ""; } catch (e) { return ""; } }
+  function setApiToken(t) { try { localStorage.setItem("signals_token", (t || "").trim()); } catch (e) {} }
+  async function afetch(url, opts) {
+    const o = Object.assign({}, opts || {});
+    const t = apiToken();
+    if (t) { o.headers = Object.assign({}, o.headers || {}, { "Authorization": "Bearer " + t }); }
+    const r = await fetch(url, o);
+    if (r.status === 401) { showTokenPrompt(); }
+    return r;
+  }
+  function showTokenPrompt() {
+    if (document.getElementById("tokbar")) return;
+    const bar = document.createElement("div");
+    bar.id = "tokbar";
+    bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#B0872B;color:#0D1116;padding:10px 14px;font:14px system-ui;display:flex;gap:8px;align-items:center";
+    bar.innerHTML = '<span>This dashboard needs the access token (SIGNALS_API_TOKEN on the container).</span>'
+      + '<input id="tokin" type="password" placeholder="paste token" style="flex:0 1 320px;padding:4px 8px">'
+      + '<button id="toksave" style="padding:4px 10px">Save</button>';
+    document.body.appendChild(bar);
+    document.getElementById("toksave").onclick = function () {
+      setApiToken(document.getElementById("tokin").value);
+      location.reload();
+    };
+  }
   const $ = (id) => document.getElementById(id);
 
   // Read-only chips — the watchlist is owned by the app and synced up via POST /api/settings.
@@ -589,7 +621,7 @@ PAGE = """<!doctype html>
   }
   // Refresh just the heartbeat line (never the form inputs — the user may be mid-edit).
   async function refreshSynced() {
-    try { renderSynced((await (await fetch("/api/settings")).json()).watchlist_synced_at); } catch (e) {}
+    try { renderSynced((await (await afetch("/api/settings")).json()).watchlist_synced_at); } catch (e) {}
   }
 
   // Counts, with absence preserved. `Number(n).toLocaleString()` renders null as "0" and undefined
@@ -621,7 +653,7 @@ PAGE = """<!doctype html>
   }
   async function loadUsage() {
     try {
-      const u = await (await fetch("/api/usage?days=30")).json();
+      const u = await (await afetch("/api/usage?days=30")).json();
       const bp = u.by_provider || {};
       const billed = (bp.api && bp.api.cost_usd) || 0;
       const notional = (bp.cli && bp.cli.cost_usd) || 0;
@@ -638,7 +670,7 @@ PAGE = """<!doctype html>
   }
 
   async function load() {
-    const s = await (await fetch("/api/settings")).json();
+    const s = await (await afetch("/api/settings")).json();
     $("deep").value = s.deep_model; $("scan").value = s.scan_model; $("ttl").value = s.verdict_ttl_seconds;
     $("provider").value = s.llm_provider || "api";
     $("cli-auth").innerHTML = s.cli_token_set
@@ -659,7 +691,7 @@ PAGE = """<!doctype html>
     if ($("key").value) body.anthropic_api_key = $("key").value;
     if ($("fkey").value) body.finnhub_api_key = $("fkey").value;
     if ($("clitoken").value) body.cli_oauth_token = $("clitoken").value;
-    const r = await fetch("/api/settings", { method: "POST",
+    const r = await afetch("/api/settings", { method: "POST",
       headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const st = $("status");
     st.textContent = r.ok ? "Saved ✓" : "Save failed"; st.className = r.ok ? "ok-t" : "err-t";
@@ -671,7 +703,7 @@ PAGE = """<!doctype html>
     // was removed. It could never have worked against an rsync deploy anyway, and it ran with no
     // authentication at all. Deploy with the rsync skill/README instead of from this page.
     $("version").textContent = "checking…";
-    const v = await (await fetch("/api/version")).json();
+    const v = await (await afetch("/api/version")).json();
     let label = "version " + v.version;
     if (!v.git) label += " · (not a git checkout — deploys are by rsync, see deploy/README.md)";
     else if (v.update_available) label += " · " + v.behind + " commit" + (v.behind > 1 ? "s" : "") + " behind origin/main (informational only)";
@@ -821,7 +853,7 @@ PAGE = """<!doctype html>
 
   async function loadStatus() {
     try {
-      const s = await (await fetch("/api/status")).json();
+      const s = await (await afetch("/api/status")).json();
       renderStatus(s);
       renderMarketScan(s.market_scan);
     }
@@ -837,7 +869,7 @@ PAGE = """<!doctype html>
     return b;
   }
   async function loadScan() {
-    let data; try { data = await (await fetch("/scan/latest")).json(); } catch (e) { $("scan-body").innerHTML = '<tr><td colspan="7" class="empty">scan unavailable</td></tr>'; return; }
+    let data; try { data = await (await afetch("/scan/latest")).json(); } catch (e) { $("scan-body").innerHTML = '<tr><td colspan="7" class="empty">scan unavailable</td></tr>'; return; }
     const rows = (data.results || []).filter((r) => !r.error);
     const errs = (data.results || []).filter((r) => r.error);
     $("scan-count").textContent = data.generated_at
@@ -860,7 +892,7 @@ PAGE = """<!doctype html>
 
   async function loadSources() {
     let data;
-    try { data = await (await fetch("/api/sources")).json(); }
+    try { data = await (await afetch("/api/sources")).json(); }
     catch (e) { $("sources").innerHTML = '<div class="empty">sources unavailable</div>'; return; }
     $("src-as-of").textContent = "· checked " + agoText(data.as_of);
     $("sources").innerHTML = (data.sources || []).map((s) =>
@@ -872,7 +904,7 @@ PAGE = """<!doctype html>
   }
 
   async function loadCost() {
-    let c; try { c = await (await fetch("/api/cost")).json(); } catch (e) { $("cost-head").textContent = "cost unavailable"; return; }
+    let c; try { c = await (await afetch("/api/cost")).json(); } catch (e) { $("cost-head").textContent = "cost unavailable"; return; }
     let head = "Billed (API) — MTD <b>" + money(c.month_to_date_usd) + "</b> · projected <b>" +
       money(c.projected_month_usd) + "</b> · all-time <b>" + money(c.all_time_usd) + "</b>";
     if (c.cli_notional_usd > 0)
@@ -891,7 +923,7 @@ PAGE = """<!doctype html>
   }
 
   async function loadLogs() {
-    let data; try { data = await (await fetch("/api/logs?limit=30")).json(); } catch (e) { $("logs").innerHTML = '<div class="empty">logs unavailable</div>'; return; }
+    let data; try { data = await (await afetch("/api/logs?limit=30")).json(); } catch (e) { $("logs").innerHTML = '<div class="empty">logs unavailable</div>'; return; }
     const reqs = data.requests || [];
     $("logs").innerHTML = reqs.length ? reqs.map((r) => {
       const bad = r.status >= 400 || r.error;
@@ -909,7 +941,7 @@ PAGE = """<!doctype html>
   $("prune").onclick = async () => {
     const ps = $("prune-status"); ps.textContent = "pruning…";
     try {
-      const r = await (await fetch("/api/prune-cache", { method: "POST" })).json();
+      const r = await (await afetch("/api/prune-cache", { method: "POST" })).json();
       ps.textContent = "freed " + fmtBytes(r.bytes_freed) + " (" + r.deleted_files + " file" + (r.deleted_files === 1 ? "" : "s") + ")";
     } catch (e) { ps.textContent = "prune failed"; }
     loadStatus();
@@ -918,7 +950,7 @@ PAGE = """<!doctype html>
   $("cli-test").onclick = async () => {
     const st = $("cli-test-status"); st.textContent = "testing…"; st.className = "hint";
     try {
-      const r = await (await fetch("/api/cli-auth-test")).json();
+      const r = await (await afetch("/api/cli-auth-test")).json();
       st.textContent = r.ok ? "✓ authenticated" : "✗ " + (r.detail || "failed");
       st.className = r.ok ? "ok-t" : "err-t";
     } catch (e) { st.textContent = "✗ request failed"; st.className = "err-t"; }
@@ -1062,7 +1094,7 @@ PAGE = """<!doctype html>
 
   async function loadArms() {
     try {
-      const r = await (await fetch("/sandbox/arms")).json();
+      const r = await (await afetch("/sandbox/arms")).json();
       ARMS = r.arms || [];
     } catch (e) {
       $("arms-body").innerHTML = '<tr><td colspan="9" class="err-t">couldn’t load arms</td></tr>';
@@ -1072,7 +1104,7 @@ PAGE = """<!doctype html>
     // arm keeps the column honest rather than showing "default" for an arm that has pinned one.
     await Promise.all(ARMS.map(async a => {
       try {
-        const s = await (await fetch("/sandbox/settings?arm=" + encodeURIComponent(a.arm))).json();
+        const s = await (await afetch("/sandbox/settings?arm=" + encodeURIComponent(a.arm))).json();
         a._settings = s; a.model = s.model || null;
       } catch (e) { a._settings = null; }
     }));
@@ -1150,7 +1182,7 @@ PAGE = """<!doctype html>
     };
     if (!$("a-engine").disabled) patch.engine = $("a-engine").value;
     try {
-      const r = await fetch("/sandbox/settings?arm=" + encodeURIComponent(selArm),
+      const r = await afetch("/sandbox/settings?arm=" + encodeURIComponent(selArm),
         {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch)});
       if (!r.ok) throw new Error(((await r.json().catch(() => ({}))).detail) || r.status);
       st.textContent = "✓ saved"; st.className = "ok-t";
@@ -1163,7 +1195,7 @@ PAGE = """<!doctype html>
     const a = ARMS.find(x => x.arm === selArm); if (!a) return;
     const st = $("a-status"); st.textContent = "…"; st.className = "hint";
     try {
-      const r = await fetch("/sandbox/settings?arm=" + encodeURIComponent(selArm),
+      const r = await afetch("/sandbox/settings?arm=" + encodeURIComponent(selArm),
         {method: "POST", headers: {"Content-Type": "application/json"},
          body: JSON.stringify({master_enabled: !a.enabled})});
       if (!r.ok) throw new Error(r.status);
@@ -1182,7 +1214,7 @@ PAGE = """<!doctype html>
       return;
     const st = $("a-status"); st.textContent = "deleting…"; st.className = "hint";
     try {
-      const r = await fetch("/sandbox/arms/" + encodeURIComponent(selArm), {method: "DELETE"});
+      const r = await afetch("/sandbox/arms/" + encodeURIComponent(selArm), {method: "DELETE"});
       if (!r.ok) throw new Error(((await r.json().catch(() => ({}))).detail) || r.status);
       closeArmEditor();
     } catch (e) { st.textContent = "✗ " + e.message; st.className = "err-t"; }
@@ -1206,11 +1238,11 @@ PAGE = """<!doctype html>
     };
     const model = $("n-model").value.trim();
     try {
-      const r = await fetch("/sandbox/arms",
+      const r = await afetch("/sandbox/arms",
         {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
       if (!r.ok) throw new Error(((await r.json().catch(() => ({}))).detail) || r.status);
       if (model) {
-        await fetch("/sandbox/settings?arm=" + encodeURIComponent(id),
+        await afetch("/sandbox/settings?arm=" + encodeURIComponent(id),
           {method: "POST", headers: {"Content-Type": "application/json"},
            body: JSON.stringify({model: model})});
       }
