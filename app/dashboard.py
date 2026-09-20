@@ -546,7 +546,7 @@ PAGE = """<!doctype html>
       <h2>Service</h2>
       <div id="version" class="hint">version …</div>
       <div class="row" style="margin-top:.8rem">
-        <button type="button" class="secondary sm" id="check">Check for updates</button>
+        <button type="button" class="secondary sm" id="check">Refresh</button>
       </div>
     </div>
   </div>
@@ -702,6 +702,11 @@ PAGE = """<!doctype html>
     // OPS-6: this is read-only status now — POST /api/update (git fetch + reset --hard + restart)
     // was removed. It could never have worked against an rsync deploy anyway, and it ran with no
     // authentication at all. Deploy with the rsync skill/README instead of from this page.
+    //
+    // The button says "Refresh", not "Check for updates". On this container git status is always
+    // unavailable, so an update check can only ever return the same sentence — a control that
+    // cannot do the thing its label promises is the exact defect the 2026-09-17 review was about.
+    // What it genuinely does is re-read the version, which is worth a button after a deploy.
     $("version").textContent = "checking…";
     const v = await (await afetch("/api/version")).json();
     let label = "version " + v.version;
