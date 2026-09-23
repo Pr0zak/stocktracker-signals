@@ -76,6 +76,11 @@ _HORIZON_MIN_AGE_DAYS: dict[int, int] = {20: 5, 63: 85, 252: 355}
 # after a year and is most valuable after that, so it is kept for five: ~300 bytes each, so even
 # 100k rows is 30 MB on a 12 GB disk.
 _RETAIN_DAYS = 1826
+
+# DP-4: the Daily Pick records its choice and its mechanical baseline under their own origins.
+ORIGIN_DAILY_PICK = "daily_pick"
+ORIGIN_DAILY_PICK_RULE = "daily_pick_rule"
+PICK_ORIGINS = (ORIGIN_DAILY_PICK, ORIGIN_DAILY_PICK_RULE)
 # Prose notes have no horizon to wait for; two years remains plenty.
 _NOTES_RETAIN_DAYS = 730
 
@@ -398,9 +403,13 @@ def similar_setups(symbol: str, summary: dict, *, k: int = 40) -> dict | None:
             # database: 75 ms for the capped scan, single-digit ms with the prefilter), so the cap
             # can be a safety valve rather than a silent bias toward recent rows.
             where, params = _veto_sql(feats)
+            # Daily-pick rows (DP-4) re-record a setup the model or the scan has usually already
+            # recorded under its own origin, on the same bar. Counting them here would enter one
+            # setup into the base rate twice, so they are graded but never used as neighbours.
             rows = db.execute(
                 f"SELECT * FROM verdicts WHERE scored_at IS NOT NULL AND fwd_20d IS NOT NULL "
-                f"{where} ORDER BY ts DESC LIMIT 20000", params,
+                f"AND origin NOT IN ({','.join('?' for _ in PICK_ORIGINS)}) "
+                f"{where} ORDER BY ts DESC LIMIT 20000", (*PICK_ORIGINS, *params),
             ).fetchall()
 
         mine: list[tuple[float, sqlite3.Row]] = []
@@ -580,6 +589,32 @@ def _excess(
         median_key: round(sign * _median(diffs), 2),
         rate_key: round(sum(1 for x in diffs if sign * x > 0) / len(diffs), 2),
     }
+
+
+def outcomes(origin: str, keys: Iterable[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+    """Forward marks for specific (SYMBOL, asof_date) rows of one origin, keyed the same way.
+
+    A key with no row is absent from the result; a row whose mark is not written yet carries None for
+    that horizon. Neither is ever reported as a 0% return.
+    """
+    want = {(str(s).upper(), str(d)) for s, d in keys if s and d}
+    if not want:
+        return {}
+    cols = ", ".join(f"fwd_{h}d, bench_fwd_{h}d" for h in HORIZONS)
+    out: dict[tuple[str, str], dict] = {}
+    try:
+        with _lock:
+            db = _db()
+            for sym, d in want:
+                r = db.execute(
+                    f"SELECT symbol, asof_date, price, {cols} FROM verdicts "
+                    f"WHERE symbol = ? AND asof_date = ? AND origin = ?", (sym, d, origin),
+                ).fetchone()
+                if r is not None:
+                    out[(sym, d)] = dict(r)
+    except Exception:  # noqa: BLE001 — a history panel, never a blocker
+        log.warning("memory: outcomes failed", exc_info=True)
+    return out
 
 
 def recent_notes(*, kind: str | None = None, limit: int = 10) -> list[dict]:
@@ -948,6 +983,10 @@ def stats() -> dict:
                 "sell_calls": ("model", SELL_SIGNALS, False),
                 "sandbox_buys": ("sandbox", BUY_SIGNALS, True),
                 "sandbox_sells": ("sandbox", SELL_SIGNALS, False),
+                # DP-4 / DP-11: the Daily Pick's own choice and the mechanical rule it is measured
+                # against, kept apart from buy_calls so the three questions never blur.
+                "daily_picks": (ORIGIN_DAILY_PICK, BUY_SIGNALS, True),
+                "daily_pick_rule": (ORIGIN_DAILY_PICK_RULE, BUY_SIGNALS, True),
             }
             rows_20 = {label: _card(*spec, 20) for label, spec in cards.items()}
             # Long horizons on the ANALYST's cards only. The sandbox's own decisions are a handful
@@ -955,7 +994,7 @@ def stats() -> dict:
             # horizon, so those are reported as dollars in the ledger cost block, never as a rate.
             rows_long = {
                 label: {h: _card(*spec, h) for h in LONG_HORIZONS}
-                for label, spec in cards.items() if spec[0] == "model"
+                for label, spec in cards.items() if spec[0] in ("model", *PICK_ORIGINS)
             }
             coverage = db.execute(
                 "SELECT " + ", ".join(

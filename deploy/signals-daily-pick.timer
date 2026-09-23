@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Daily Pick pre-market on weekdays (07:05 CT = 08:05 ET), retrying at 07:40 if it failed
+
+[Timer]
+# After the market scan (05:45), macro (06:15) and watchlist scan (06:30, done ~06:35), and before the
+# app's 08:30 ET morning-notification window opens. The 07:40 slot is a no-op when 07:05 succeeded.
+OnCalendar=Mon-Fri 07:05:00
+OnCalendar=Mon-Fri 07:40:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

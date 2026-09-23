@@ -4743,3 +4743,470 @@ async def journal_replay_endpoint(req: PlanReplayRequest) -> dict:
         "note": ("What the plan as written would have done — the MECHANICAL leg. It is not what you "
                  "did, and an ambiguous bar resolves against the trade."),
     }
+
+
+# ================================================================================================
+# DP — the Daily Pick. One buy candidate a trading day, chosen pre-market from the prior close.
+# daily_pick.py holds every rule (pure); this section fetches, calls the analyst once, records.
+# ================================================================================================
+
+from . import daily_pick, daily_pick_store  # noqa: E402 — grouped with the feature it serves
+from .analyst import daily_pick as analyst_daily_pick  # noqa: E402
+from .news import earnings_between  # noqa: E402
+
+_daily_pick_lock = asyncio.Lock()
+_DP_PRICE_TTL = 60.0
+_DP_EARNINGS_WINDOW_DAYS = 7
+_DP_MAX_SCAN_LAG_SESSIONS = 1
+
+
+def _et_now():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York"))
+
+
+def _last_completed_session(now_et) -> "dt_date":
+    """The most recent session whose regular close has passed, in ET."""
+    import datetime as _dt
+    d = now_et.date()
+    if market_calendar.is_trading_day(d):
+        close_s = market_calendar.session_end_seconds(d)[0]
+        if now_et.hour * 3600 + now_et.minute * 60 >= close_s:
+            return d
+    d -= _dt.timedelta(days=1)
+    while not market_calendar.is_trading_day(d):
+        d -= _dt.timedelta(days=1)
+    return d
+
+
+def _sessions_between(older_yyyymmdd: str, newer) -> int | None:
+    """Trading sessions after `older` up to and including `newer` — how many nights the scan is behind."""
+    import datetime as _dt
+    try:
+        o = _dt.date(int(older_yyyymmdd[:4]), int(older_yyyymmdd[4:6]), int(older_yyyymmdd[6:8]))
+    except (TypeError, ValueError):
+        return None
+    n = 0
+    d = o
+    while d < newer:
+        d += _dt.timedelta(days=1)
+        if market_calendar.is_trading_day(d):
+            n += 1
+    return n
+
+
+def _clean_name(name: str | None) -> str | None:
+    """'Berkshire Hathaway Inc. New Common Stock' -> 'Berkshire Hathaway Inc.' for a card header."""
+    if not name:
+        return None
+    n = str(name).split(" - ")[0]
+    for tail in (" New Common Stock", " Common Stock", " Class A", " Class B", " Ordinary Shares",
+                 " American Depositary Shares"):
+        if n.endswith(tail):
+            n = n[: -len(tail)]
+    return n.strip() or None
+
+
+def _universe_names() -> dict[str, str]:
+    blob = universe.load() or {}
+    return {str(d.get("symbol") or "").upper(): d.get("name") for d in blob.get("detail") or []}
+
+
+def _gate_brief(g: dict | None) -> dict:
+    g = g or {}
+    return {
+        "available": bool(g.get("available")),
+        "passed": g.get("passed"),
+        "failing": g.get("failing") or [],
+        "unmeasured": g.get("unmeasured") or [],
+        "market_score": g.get("market_score"),
+        "note": g.get("note"),
+    }
+
+
+async def _daily_pick_compute(today: str, now_et) -> dict:
+    """One Daily Pick run. Always returns a record to persist, whatever happened — a failure is a
+    record with status "failed" and the reason, never an absent row that reads as a quiet morning."""
+    import datetime as _dt
+    assert _http is not None
+    cfg = settings_store.get()
+    dps = daily_pick_store.get_settings()
+    rec: dict = {
+        "date": today, "ts": time.time(), "status": daily_pick.STATUS_FAILED, "error": None,
+        "universe": dps["universe"], "scan_night": None, "scan_lag_sessions": None,
+        "model": cfg["deep_model"], "gate": None, "macro_available": False, "screen": None,
+        "rule_pick": None, "pick": None, "candidates": [], "none_reason": None,
+    }
+
+    rows = await asyncio.to_thread(scan_store.cross_section)
+    if not rows:
+        rec["error"] = "no market scan is stored, so there is nothing to choose from"
+        return rec
+    scan_d = str(rows[0].get("d") or "")
+    rec["scan_night"] = scan_d
+    lag = _sessions_between(scan_d, _last_completed_session(now_et))
+    rec["scan_lag_sessions"] = lag
+    if lag is None or lag > _DP_MAX_SCAN_LAG_SESSIONS:
+        rec["error"] = (f"the latest market scan measured the {scan_d} close, {lag} sessions behind — "
+                        f"too old to pick from")
+        return rec
+
+    only = None
+    if dps["universe"] == "watchlist":
+        only = {s.upper() for s in (cfg.get("watchlist") or []) if not str(s).upper().endswith("-USD")}
+    sl = daily_pick.shortlist(rows, only=only, limit=daily_pick.PREFETCH_N)
+    screen = {"scanned": sl["scanned"], "eligible": sl["eligible"], "rejects": sl["rejects"],
+              "earnings_excluded": [], "earnings_calendar_ok": None}
+    rec["screen"] = screen
+
+    g = await gate_endpoint()
+    rec["gate"] = _gate_brief(g)
+    mac = None
+    try:
+        mac = macro.compact(macro.load_state(), limit=3)
+    except Exception:  # noqa: BLE001 — absent macro is reported as absent, never as calm
+        pass
+    rec["macro_available"] = bool(mac)
+
+    ranked = sl["ranked"]
+    if not ranked:
+        rec["status"] = daily_pick.STATUS_NONE
+        rec["none_reason"] = "no name passed the screen's filters"
+        return rec
+
+    end = (_dt.date.fromisoformat(today) + _dt.timedelta(days=_DP_EARNINGS_WINDOW_DAYS)).isoformat()
+    edates, e_ok = await earnings_between(_http, today, end, [c["symbol"] for c in ranked], wait=30.0)
+    screen["earnings_calendar_ok"] = e_ok
+    finalists = []
+    for c in ranked:
+        d = edates.get(c["symbol"])
+        n = daily_pick.sessions_until(today, d, market_calendar.is_trading_day)
+        if e_ok and n is not None and n <= daily_pick.EARNINGS_BLACKOUT_SESSIONS:
+            screen["earnings_excluded"].append({"symbol": c["symbol"], "date": d})
+            continue
+        c["earnings"] = ({"ok": True, "date": d, "sessions": n, "window_days": _DP_EARNINGS_WINDOW_DAYS}
+                         if e_ok else {"ok": False, "date": None, "sessions": None})
+        finalists.append(c)
+        if len(finalists) >= daily_pick.SHORTLIST_N:
+            break
+    if not finalists:
+        rec["status"] = daily_pick.STATUS_NONE
+        rec["none_reason"] = "every name that passed the screen reports earnings within 3 sessions"
+        return rec
+
+    try:
+        bench = (await fetch_series(_http, "^GSPC")).closes
+    except Exception:  # noqa: BLE001 — each snapshot fetches its own on a None
+        bench = None
+    names = _universe_names()
+    for c in finalists:
+        try:
+            summary = await _snapshot(c["symbol"], crypto=False, bench_closes=bench)
+        except HTTPException as e:
+            c["snapshot_error"] = str(e.detail)
+            continue
+        try:
+            track = await asyncio.to_thread(memory.similar_setups, c["symbol"], summary)
+            if track:
+                summary["track_record"] = track
+        except Exception:  # noqa: BLE001 — enrichment
+            pass
+        e = c["earnings"]
+        if summary.get("next_earnings"):
+            e = {"ok": True, "date": summary["next_earnings"],
+                 "sessions": daily_pick.sessions_until(today, summary["next_earnings"],
+                                                       market_calendar.is_trading_day)}
+        c["earnings"] = e
+        c["summary"] = summary
+        c["price"] = summary.get("price")
+        c["name"] = _clean_name(names.get(c["symbol"]))
+        c["factors"] = daily_pick.factors_for(c["row"], summary, gate=g, earnings=e)
+
+    candidates = {c["symbol"]: c for c in finalists if "summary" in c}
+    rec["candidates"] = [
+        {"symbol": c["symbol"], "name": c.get("name"), "screen_score": c["score"],
+         "penalty_reasons": c["penalty_reasons"], "partial": c["partial"],
+         "snapshot_error": c.get("snapshot_error")}
+        for c in finalists
+    ]
+
+    # DP-11: the mechanical baseline is the screen's top name that could be priced, recorded every run.
+    rule = next((c for c in finalists if c["symbol"] in candidates), None)
+    if rule is not None:
+        rec["rule_pick"] = {"symbol": rule["symbol"], "name": rule.get("name"), "screen_score": rule["score"],
+                            "price": rule.get("price"), "as_of_date": rule["summary"].get("as_of_date")}
+        memory.record_verdict(
+            symbol=rule["symbol"], summary=rule["summary"],
+            verdict={"signal": "buy", "conviction": None,
+                     "thesis": "mechanical top of the daily-pick screen (no model)"},
+            model=None, deep=False, origin=memory.ORIGIN_DAILY_PICK_RULE)
+    if not candidates:
+        rec["error"] = "no shortlisted name could be priced this morning"
+        return rec
+
+    history = daily_pick_store.runs(limit=daily_pick.REPEAT_WINDOW_SESSIONS + 1)
+    history = [h for h in history if h.get("date") != today]
+    context = {
+        "date": today,
+        "scan_night": scan_d,
+        "market_gate": rec["gate"],
+        "macro": mac or "no macro read is available — that means UNKNOWN, not calm",
+        "recent_picks": [h.get("pick", {}).get("symbol") for h in history
+                         if h.get("status") == daily_pick.STATUS_PICK and h.get("pick")],
+        "shortlist": [
+            {"symbol": c["symbol"], "name": c.get("name"), "screen_rank": i + 1,
+             "screen_score": c["score"], "screen_penalties": c["penalty_reasons"],
+             "factors": {k: f["display"] for k, f in c["factors"].items()},
+             "snapshot": c["summary"]}
+            for i, c in enumerate(candidates.values())
+        ],
+    }
+    try:
+        choice, usage = await analyst_daily_pick(context, deep=True)
+    except Exception as e:  # noqa: BLE001
+        rec["error"] = f"the analyst call failed: {redact.redact(e)}"
+        return rec
+    usage_store.record(usage, symbol="", kind="daily_pick")
+    rec["model"] = usage.get("model") or rec["model"]
+
+    result = daily_pick.reconcile(choice.model_dump(mode="json"), candidates=candidates, gate=g)
+    for r in result.get("runners_up") or []:
+        c = candidates.get(r["symbol"]) or {}
+        r["name"] = c.get("name")
+        r["price"] = c.get("price")
+    if result["status"] == daily_pick.STATUS_NONE:
+        rec["status"] = daily_pick.STATUS_NONE
+        rec["none_reason"] = result["none_reason"]
+        rec["pick"] = {"runners_up": result["runners_up"], "conviction_floor": result["conviction_floor"],
+                       "rejected_symbol": result.get("rejected_symbol"),
+                       "rejected_conviction": result.get("rejected_conviction")}
+        closest = result.get("rejected_symbol") or (result["runners_up"][0]["symbol"] if result["runners_up"] else None)
+        if closest and closest in candidates:
+            cc = candidates[closest]
+            rec["pick"]["closest"] = {"symbol": closest, "name": cc.get("name"), "price": cc.get("price")}
+        return rec
+
+    c = candidates[result["symbol"]]
+    summ = c["summary"]
+    rec["status"] = daily_pick.STATUS_PICK
+    rec["pick"] = {
+        **result,
+        "name": c.get("name"),
+        "price_at_pick": c.get("price"),
+        "as_of_date": summ.get("as_of_date"),
+        "screen_score": c["score"],
+        "earnings": c["earnings"],
+        "factors": [c["factors"][k] for k in daily_pick.FACTOR_KEYS if k in c["factors"]],
+        "rsi14": summ.get("rsi14"),
+        "atr14": summ.get("atr14"),
+        "fifty_two_week_high": summ.get("fifty_two_week_high"),
+        "fifty_two_week_low": summ.get("fifty_two_week_low"),
+        "sma_200w": (summ.get("long_term_trend") or {}).get("sma_200w"),
+        "track_record": ((summ.get("track_record") or {}).get("analogues") or {}).get("vs_benchmark"),
+    }
+    memory.record_verdict(
+        symbol=result["symbol"], summary=summ,
+        verdict={"signal": "buy", "conviction": result["conviction"], "thesis": result["thesis"]},
+        model=rec["model"], deep=True, origin=memory.ORIGIN_DAILY_PICK)
+    return rec
+
+
+async def run_daily_pick(*, force: bool = False) -> dict:
+    """Once per ET trading day. A completed run (pick or none) is not repeated without `force`; a
+    FAILED run is, so the 07:40 retry timer can recover a morning the 07:05 run lost."""
+    async with _daily_pick_lock:
+        now_et = _et_now()
+        today = now_et.date().isoformat()
+        if not force:
+            if not market_calendar.is_trading_day(now_et.date()):
+                return {"status": "skipped", "date": today, "reason": "not a trading day"}
+            prior = daily_pick_store.run_for(today)
+            if prior and prior.get("status") in (daily_pick.STATUS_PICK, daily_pick.STATUS_NONE):
+                return {"status": "already_ran", "date": today, "result": prior.get("status")}
+        try:
+            rec = await _daily_pick_compute(today, now_et)
+        except Exception as e:  # noqa: BLE001 — a crash is recorded as a failure, never as silence
+            _log.warning("daily_pick: run crashed", exc_info=True)
+            rec = {"date": today, "ts": time.time(), "status": daily_pick.STATUS_FAILED,
+                   "error": f"the run crashed: {redact.redact(e)}"}
+        daily_pick_store.append_run(rec)
+        _log.info("daily_pick %s: %s %s", today, rec.get("status"),
+                  (rec.get("pick") or {}).get("symbol") or rec.get("none_reason") or rec.get("error") or "")
+        return rec
+
+
+class DailyPickRunRequest(BaseModel):
+    force: bool = False
+
+
+@app.post("/daily_pick/run", dependencies=[Depends(require_api_token)])
+async def daily_pick_run_endpoint(req: DailyPickRunRequest = DailyPickRunRequest()) -> dict:
+    """DP-3 — run today's pick (the systemd timer curls this pre-market). `force` re-runs a day that
+    already completed; the new run is appended and becomes the one served."""
+    return await run_daily_pick(force=req.force)
+
+
+async def _dp_live_quote(symbol: str) -> dict:
+    """The pick's live price, cached briefly. Every key is None when the quote could not be read."""
+    assert _http is not None
+    key = ("dp_quote", symbol)
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < _DP_PRICE_TTL:
+        return hit[1]
+    out = {"price": None, "regular_price": None, "change_pct": None, "market_state": None,
+           "quote_ts": None}
+    try:
+        q = (await market_now.fetch_quotes(_http, [symbol])).get(symbol.upper()) or {}
+        out = {"price": market_now.session_price(q), "regular_price": q.get("price"),
+               "change_pct": q.get("pct"), "market_state": q.get("state"), "quote_ts": now}
+    except Exception:  # noqa: BLE001 — a missing quote is shown as missing
+        _log.warning("daily_pick: live quote failed for %s", symbol)
+    _cache[key] = (now if out["price"] is not None else now - _DP_PRICE_TTL + 10, out)
+    return out
+
+
+@app.get("/daily_pick")
+async def daily_pick_endpoint() -> dict:
+    """DP-3 — the card. The pick is fixed for the day; the live price and where it sits against the
+    plan are refreshed on read (~60s cache).
+
+    Read `available`, then `stale`, then `status`:
+      * available false — no run has ever been recorded.
+      * stale true — the newest run is from an earlier date than today (ET). It is served with its own
+        `date` and must be labelled as such; it is never today's pick.
+      * status "pick" | "none" | "failed". A failed run carries `error` and no pick; it is NOT a quiet
+        "no pick today".
+    """
+    today = _et_now().date().isoformat()
+    runs = daily_pick_store.runs(limit=daily_pick.REPEAT_WINDOW_SESSIONS + 1)
+    if not runs:
+        return {"available": False, "stale": None, "today": today,
+                "reason": "the daily pick has not run yet — it runs at 08:05 ET on trading days"}
+    latest = runs[0]
+    out = {**latest, "available": True, "stale": latest["date"] != today, "today": today,
+           "live": None, "chase": None, "repeats": None}
+    pick = latest.get("pick") or {}
+    if latest.get("status") == daily_pick.STATUS_PICK and pick.get("symbol"):
+        sym = pick["symbol"]
+        live = await _dp_live_quote(sym)
+        out["live"] = live
+        lv = pick.get("levels") or {}
+        r = chase.read(live.get("price"), lv.get("entry_low"), lv.get("entry_high"))
+        out["chase"] = {"pct": r.pct, "status": r.status, "warning": r.warning, "price": live.get("price")}
+        out["repeats"] = daily_pick.repeat_counts(
+            [{"status": h.get("status"), "symbol": (h.get("pick") or {}).get("symbol")}
+             for h in runs[1:]],
+            sym, group_of=_exposure_group)
+    return out
+
+
+def _dp_marks(row: dict | None) -> dict:
+    """{"5d": {...}, "20d": {...}, ...} for one memory row. A horizon without its mark is None."""
+    out: dict = {}
+    for h in memory.HORIZONS:
+        f = (row or {}).get(f"fwd_{h}d")
+        b = (row or {}).get(f"bench_fwd_{h}d")
+        out[f"{h}d"] = (None if f is None else
+                        {"fwd_pct": round(f, 2), "bench_pct": None if b is None else round(b, 2),
+                         "excess_pp": None if b is None else round(f - b, 2)})
+    return out
+
+
+@app.get("/daily_pick/history")
+async def daily_pick_history_endpoint(limit: int = 20) -> dict:
+    """DP-4/11/14 — past runs with their graded outcomes, and the AI-vs-rule comparison.
+
+    Outcomes come from memory's nightly grading; a mark not written yet is None, never 0%. `report_cards`
+    lists every written 5-day and 20-day mark on an AI pick so the app can notify once per mark.
+    """
+    limit = max(1, min(int(limit), 250))
+    runs = daily_pick_store.runs(limit=limit)
+    ai_keys = [((r.get("pick") or {}).get("symbol"), (r.get("pick") or {}).get("as_of_date"))
+               for r in runs if r.get("status") == daily_pick.STATUS_PICK]
+    rule_keys = [((r.get("rule_pick") or {}).get("symbol"), (r.get("rule_pick") or {}).get("as_of_date"))
+                 for r in runs if r.get("rule_pick")]
+    ai = await asyncio.to_thread(memory.outcomes, memory.ORIGIN_DAILY_PICK, ai_keys)
+    rule = await asyncio.to_thread(memory.outcomes, memory.ORIGIN_DAILY_PICK_RULE, rule_keys)
+    items = []
+    paired = {h: [] for h in (5, 20)}
+    cards = []
+    for r in runs:
+        p = r.get("pick") or {}
+        rp = r.get("rule_pick") or {}
+        ai_row = ai.get((str(p.get("symbol") or "").upper(), str(p.get("as_of_date") or "")))
+        rule_row = rule.get((str(rp.get("symbol") or "").upper(), str(rp.get("as_of_date") or "")))
+        am, rm = _dp_marks(ai_row), _dp_marks(rule_row)
+        items.append({
+            "date": r["date"], "status": r.get("status"),
+            "symbol": p.get("symbol") if r.get("status") == daily_pick.STATUS_PICK else None,
+            "conviction": p.get("conviction"), "price_at_pick": p.get("price_at_pick"),
+            "none_reason": r.get("none_reason"), "error": r.get("error"),
+            "rule_symbol": rp.get("symbol"), "marks": am, "rule_marks": rm,
+        })
+        for h in (5, 20):
+            a, b = am[f"{h}d"], rm[f"{h}d"]
+            paired[h].append({
+                "ai_status": r.get("status"),
+                "ai_excess": (a or {}).get("excess_pp") if r.get("status") == daily_pick.STATUS_PICK else None,
+                "rule_excess": (b or {}).get("excess_pp"),
+                "same": bool(p.get("symbol")) and p.get("symbol") == rp.get("symbol"),
+            })
+            if r.get("status") == daily_pick.STATUS_PICK and a and a.get("excess_pp") is not None:
+                cards.append({"date": r["date"], "symbol": p.get("symbol"), "horizon_sessions": h, **a})
+    return {
+        "items": items,
+        "comparison": {f"{h}d": daily_pick.paired_comparison(paired[h], h) for h in (5, 20)},
+        "report_cards": cards,
+        "min_days_for_comparison": 20,
+    }
+
+
+class DailyPickHolding(BaseModel):
+    symbol: str
+    value: float | None = None
+
+
+class DailyPickFitRequest(BaseModel):
+    holdings: list[DailyPickHolding] = []
+    symbol: str | None = None
+
+
+@app.post("/daily_pick/fit", dependencies=[Depends(require_api_token)])
+async def daily_pick_fit_endpoint(req: DailyPickFitRequest) -> dict:
+    """DP-12 — what today's pick would do to the user's book. POST, and token-gated, because the body
+    carries position values. Never returns a share count or an order size."""
+    assert _http is not None
+    sym = (req.symbol or "").strip().upper()
+    if not sym:
+        latest = (daily_pick_store.runs(limit=1) or [{}])[0]
+        if latest.get("status") != daily_pick.STATUS_PICK:
+            raise HTTPException(status_code=404, detail="there is no pick to fit")
+        sym = latest["pick"]["symbol"]
+    held = [{"symbol": h.symbol, "value": h.value} for h in req.holdings]
+    syms = [sym] + [h["symbol"].upper() for h in held if h["symbol"]]
+    sec = await sectors.lookup(_http, syms)
+    fit = daily_pick.portfolio_fit(sym, None, held, group_of=_exposure_group,
+                                   sectors={k: v.get("sector") for k, v in sec.items()})
+    fit["sentence"] = daily_pick.fit_sentence(fit)
+    return fit
+
+
+@app.get("/daily_pick/settings")
+async def daily_pick_settings_get() -> dict:
+    return daily_pick_store.get_settings()
+
+
+class DailyPickSettingsRequest(BaseModel):
+    universe: str | None = None
+
+
+@app.post("/daily_pick/settings", dependencies=[Depends(require_api_token)])
+async def daily_pick_settings_post(req: DailyPickSettingsRequest) -> dict:
+    """The universe the next run picks from: "market" (default) or "watchlist". Takes effect at the
+    next run; today's pick is not recomputed."""
+    try:
+        return daily_pick_store.save_settings(req.model_dump(exclude_none=True))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e

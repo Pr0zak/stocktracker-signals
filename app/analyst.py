@@ -1576,3 +1576,105 @@ async def strategy_review(context: dict, *, settings: dict, deep: bool = True) -
         + "\n\nReturn the StrategyNote (stance, cash target, per-exposure targets, themes, avoid, notes)."
     )
     return await _parse(STRATEGY_SYSTEM, prompt, StrategyNote, deep=deep, max_tokens=1536)
+
+
+# ======================================================================================
+# DP-2 — the Daily Pick. One buy candidate out of a mechanically ranked shortlist, or none.
+# The model only CHOOSES and EXPLAINS: every reason points at a factor key, and the server
+# (daily_pick.reconcile) fills in the numbers and drops any reason about an unmeasured factor.
+# ======================================================================================
+
+class PickFactor(str, Enum):
+    trend = "trend"
+    rel_strength = "rel_strength"
+    momentum = "momentum"
+    rsi = "rsi"
+    extension = "extension"
+    range_52w = "range_52w"
+    long_cycle = "long_cycle"
+    volume = "volume"
+    volatility = "volatility"
+    track_record = "track_record"
+    insider = "insider"
+    quality = "quality"
+    short_interest = "short_interest"
+    seasonality = "seasonality"
+    macro = "macro"
+    earnings = "earnings"
+    regime = "regime"
+
+
+class PickStance(str, Enum):
+    supports = "supports"
+    against = "against"
+
+
+class PickReason(BaseModel):
+    factor: PickFactor
+    stance: PickStance
+    text: str                        # one plain sentence a non-expert can read, <= 25 words
+
+
+class PickRunnerUp(BaseModel):
+    symbol: str
+    why_not: str                     # one short sentence: why it lost to the pick
+
+
+class DailyPickChoice(BaseModel):
+    symbol: str | None               # null = no pick today
+    conviction: int                  # 0-100
+    thesis: str                      # one sentence, plain English
+    reasons: list[PickReason]        # 3-6, at least one "against"
+    invalidation: str                # the condition that makes the pick wrong, in words
+    entry_low: float | None = None
+    entry_high: float | None = None
+    stop: float | None = None
+    target: float | None = None
+    runners_up: list[PickRunnerUp] = []
+    none_reason: str | None = None   # required when symbol is null
+
+
+DAILY_PICK_SYSTEM = """You choose AT MOST ONE stock or ETF for one retail investor to consider buying \
+today, and explain the choice so someone who does not know technical analysis can follow it. You \
+receive a shortlist of up to eight candidates that a mechanical screen ranked from last night's \
+full-market scan, each with its daily technical snapshot, its `factors` (the measured values the \
+investor's card will show), its multi-year trend, and — where available — insider, quality, \
+seasonality, short-interest and track-record blocks. You also receive the market regime gate and \
+the macro backdrop.
+
+Rules:
+- Returning NO pick is a valid and often correct answer. Set symbol to null and explain in \
+none_reason when no candidate has a setup you would genuinely act on. Never force a pick.
+- Choose ONLY from the shortlist. A symbol not on it will be discarded.
+- Every reason must name a `factor` that appears in the chosen candidate's `factors` block — a \
+reason about anything else is deleted before the investor sees it. Write each reason's `text` as one \
+plain sentence (at most 25 words) that says what the number means, e.g. "It has beaten the S&P by 9 \
+points over three months, stronger than 88% of stocks." Use only numbers present in the data.
+- Give 3-6 reasons and AT LEAST ONE with stance "against". An analysis that finds nothing against a \
+buy has not looked. If the market gate is shut, that belongs among the reasons against.
+- Weight relative strength and momentum most (the best-evidenced factors). Treat a stretched move \
+(far above the 50-day, very high RSI) as a reason for caution, not for chasing. A `track_record` \
+block's vs_benchmark numbers are the measured history of similar setups — respect its n, and ignore \
+raw positive rates, which mostly reflect market drift.
+- conviction 0-100, calibrated: 70+ only for genuine confluence; a mixed picture is 40-55. The \
+investor's app hides any pick under 60 (70 when the market gate is shut).
+- Price levels: entry_low/entry_high is the zone worth paying TODAY around the current price — not a \
+hoped-for dip (waiting for dips has measured worse than buying here). stop is the level where the \
+thesis has failed; size it against the candidate's atr14 (at least one atr14 below the zone). target \
+is the first realistic upside level. Return null for any level you cannot justify from the data.
+- invalidation: the concrete condition, in words, that makes the pick wrong.
+- runners_up: the two or three candidates that came closest, each with one short why_not.
+- thesis: one plain sentence, no jargon.
+- Plain text, no markdown, no disclaimer (the app adds one). Decision support, not advice."""
+
+
+async def daily_pick(context: dict, *, deep: bool = True) -> tuple[DailyPickChoice, dict]:
+    """DP-2: pick at most one name from the shortlist in `context`. Deep model by default — it runs
+    once a trading day, and on the cli provider it costs nothing per token."""
+    prompt = (
+        "Today's shortlist and context. Return your structured daily pick (or no pick):\n"
+        + json.dumps(context, indent=2, default=str)
+    )
+    choice, usage = await _parse(DAILY_PICK_SYSTEM, prompt, DailyPickChoice, deep=deep, max_tokens=4096)
+    choice.conviction = max(0, min(100, choice.conviction))
+    return choice, usage

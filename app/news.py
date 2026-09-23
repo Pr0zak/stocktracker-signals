@@ -245,6 +245,50 @@ async def earnings_on(
     return {s for s in want if _match_keys(s) & reported}, True
 
 
+async def earnings_between(
+    client: httpx.AsyncClient, start: str, end: str, symbols: list[str] | set[str], *,
+    wait: float = _DEFAULT_WAIT,
+) -> tuple[dict[str, str], bool]:
+    """{SYMBOL: first report date} for those of `symbols` reporting between `start` and `end` (ET
+    YYYY-MM-DD, inclusive), in ONE market-wide request. Returns (dates, ok).
+
+    For the Daily Pick's earnings blackout: a week of the calendar is a few hundred rows, well under
+    `_CALENDAR_ROW_CAP`, so one call answers the whole shortlist instead of one call per name. A result
+    AT the cap is treated as unknown (ok False), exactly as earnings_on does — the cap truncates to
+    the tail, so a capped week would silently drop its first days.
+    """
+    want = [str(s).strip().upper() for s in symbols if str(s).strip()]
+    if not want:
+        return {}, True
+    body = await _get(client, "/calendar/earnings", {"from": start, "to": end},
+                      what=f"earnings calendar {start}..{end}", wait=wait)
+    if not isinstance(body, dict):
+        return {}, False
+    cal = body.get("earningsCalendar")
+    if not isinstance(cal, list):
+        return {}, False
+    if len(cal) >= _CALENDAR_ROW_CAP:
+        log.warning("news: earnings calendar %s..%s returned %d rows — at the truncation cap, so "
+                    "the window is unknown rather than read", start, end, len(cal))
+        return {}, False
+    first: dict[str, str] = {}
+    for r in cal:
+        if not isinstance(r, dict):
+            continue
+        d = str(r.get("date") or "")
+        if not d:
+            continue
+        for k in _match_keys(r.get("symbol")):
+            if k not in first or d < first[k]:
+                first[k] = d
+    out: dict[str, str] = {}
+    for s in want:
+        hits = [first[k] for k in _match_keys(s) if k in first]
+        if hits:
+            out[s] = min(hits)
+    return out, True
+
+
 async def fetch_next_earnings(
     client: httpx.AsyncClient, symbol: str, *, wait: float = _DEFAULT_WAIT,
 ) -> EarningsLookup:

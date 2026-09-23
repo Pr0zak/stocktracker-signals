@@ -1,0 +1,11 @@
+[Unit]
+Description=StockTracker Signals — Daily Pick (DP-3), one buy candidate chosen pre-market
+After=network-online.target signals.service
+Wants=network-online.target
+OnFailure=signals-notify@%n.service
+
+[Service]
+Type=oneshot
+# Idempotent per ET trading day: a completed pick (or "no pick") is not repeated, a FAILED run is,
+# which is what the second timer slot relies on. 600s covers the snapshots plus one deep-model call.
+ExecStart=/usr/bin/curl -fsS -m 600 -X POST http://127.0.0.1:8000/daily_pick/run -H "Content-Type: application/json" -d "{}"

@@ -44,6 +44,7 @@ The container runs on `America/Chicago`, so every `OnCalendar` below is Central 
 | 05:45 | `signals-market-scan` | LLM-free mechanical scan of the whole tradeable universe (SWT-1) |
 | 06:15 | `signals-macro` | macro / geopolitical catalyst read |
 | 06:30 | `signals-scan` | nightly watchlist scan — the only nightly job that spends model tokens |
+| 07:05, 07:40 | `signals-daily-pick` | Daily Pick (DP-3) — one deep-model call; 07:40 retries only a failed run |
 | 10:00, 14:20 | `signals-macro` | intraday refreshes |
 | 14:35 | `signals-sandbox` | paper-trading tick |
 | 14:40 | `signals-parked` | sweep parked orders |

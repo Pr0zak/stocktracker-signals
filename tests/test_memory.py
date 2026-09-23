@@ -433,3 +433,30 @@ def test_a_failed_open_does_not_poison_later_calls(memory, monkeypatch):
     # the next attempt must fully initialise
     assert memory._db() is not None
     assert calls["n"] == 2
+
+
+def test_daily_pick_rows_are_graded_but_never_neighbours(memory):
+    """DP-4: a pick re-records a setup already in memory under another origin. It gets its own
+    scorecard, and it must not enter the k-NN base rate a second time."""
+    buy = {"signal": "buy", "conviction": 70, "thesis": "t"}
+    for i in range(6):
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i, date=_day(i)), verdict=buy,
+                              origin=memory.ORIGIN_DAILY_PICK)
+        memory.record_verdict(symbol="AAPL", summary=_summary(rsi=30 + i, date=_day(i)), verdict=buy,
+                              origin=memory.ORIGIN_DAILY_PICK_RULE)
+    _score_all(memory)
+    stats = memory.stats()
+    assert stats["daily_picks"]["n"] == 6 and stats["daily_pick_rule"]["n"] == 6
+    assert "buy_calls" not in stats
+    assert memory.similar_setups("MSFT", _summary(rsi=31)) is None
+
+
+def test_outcomes_returns_marks_by_key_and_omits_unknown_rows(memory):
+    memory.record_verdict(symbol="AAPL", summary=_summary(date=_day(0)), verdict={"signal": "buy"},
+                          origin=memory.ORIGIN_DAILY_PICK)
+    before = memory.outcomes(memory.ORIGIN_DAILY_PICK, [("AAPL", _day(0)), ("MSFT", _day(0))])
+    assert list(before) == [("AAPL", _day(0))]
+    assert before[("AAPL", _day(0))]["fwd_20d"] is None
+    _score_all(memory)
+    after = memory.outcomes(memory.ORIGIN_DAILY_PICK, [("aapl", _day(0))])
+    assert after[("AAPL", _day(0))]["fwd_20d"] is not None
