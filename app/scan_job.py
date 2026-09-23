@@ -678,7 +678,7 @@ async def run_scan() -> dict:
         try:
             from . import universe as _universe
             _prev = _universe.load()
-            if not _universe.is_stale(_prev):
+            if not _universe.due_for_rebuild(_prev):
                 # ALWAYS log an outcome. Logging only on rebuild meant the common case left no
                 # trace, so "the hook ran and correctly did nothing" was indistinguishable from
                 # "the hook never ran" — no way to tell a working guard from an absent one.

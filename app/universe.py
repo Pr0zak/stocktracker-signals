@@ -88,6 +88,12 @@ DEFAULT_MIN_CAP = 0.0
 
 STALE_AFTER_S = 7 * 24 * 3600
 
+# The nightly watchlist scan (06:30 CT) rebuilds the universe, but the market scan that REFUSES a stale
+# one runs earlier (05:45 CT). Rebuilding only once the universe was already stale therefore left one
+# morning in every eight where the market scan had refused before the rebuild ran — measured
+# 2026-09-22, when the 2026-09-21 session was never scanned. Rebuilding a day early closes the gap.
+REBUILD_AFTER_S = STALE_AFTER_S - 24 * 3600
+
 # Below this share of successful quote batches the build is a subsample, not a universe, and must not
 # overwrite a good one — a partial fetch stamped fresh for a week is worse than a slightly old build.
 MIN_COVERAGE = 0.90
@@ -355,6 +361,13 @@ def is_stale(blob: dict | None, *, now: float | None = None) -> bool:
     if not blob or not blob.get("built_at"):
         return True
     return (now or time.time()) - float(blob["built_at"]) > STALE_AFTER_S
+
+
+def due_for_rebuild(blob: dict | None, *, now: float | None = None) -> bool:
+    """True a day BEFORE is_stale — see REBUILD_AFTER_S for why the rebuilder must lead the refusal."""
+    if not blob or not blob.get("built_at"):
+        return True
+    return (now or time.time()) - float(blob["built_at"]) > REBUILD_AFTER_S
 
 
 def publish(blob: dict, *, previous: dict | None = None) -> tuple[bool, str]:

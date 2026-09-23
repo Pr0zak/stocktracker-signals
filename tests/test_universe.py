@@ -137,6 +137,17 @@ def test_freshness_is_measured_from_the_build_time():
     assert u.is_stale({"built_at": now - (8 * 24 * 3600)}, now=now) is True
 
 
+def test_the_rebuilder_leads_the_staleness_refusal_by_a_day():
+    """The market scan (05:45) refuses a stale universe; the rebuild runs later (06:30). If the rebuild
+    waited until the universe was stale, one morning in eight was refused before it ran."""
+    now = 1_800_000_000.0
+    six_and_a_half = {"built_at": now - 6.5 * 24 * 3600}
+    assert u.due_for_rebuild(six_and_a_half, now=now) is True
+    assert u.is_stale(six_and_a_half, now=now) is False
+    assert u.due_for_rebuild({"built_at": now - 5 * 24 * 3600}, now=now) is False
+    assert u.due_for_rebuild(None) is True
+
+
 def test_save_and_load_round_trip(tmp_path, monkeypatch):
     monkeypatch.setattr(u, "_DATA_DIR", tmp_path)
     monkeypatch.setattr(u, "_FILE", tmp_path / "universe.json")
