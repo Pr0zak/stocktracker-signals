@@ -120,7 +120,7 @@ def test_the_slice_is_ranked_by_the_requested_sort_and_says_what_it_is_a_slice_o
     assert [r["symbol"] for r in body["results"]] == ["S08", "S07", "S06"]
     assert body["total_matching"] == 9
     assert "Top 3 of 9 matching" in body["note"]
-    assert "3,113 scored of 3,147" in body["note"]
+    assert "3,113 stocks measured (3,147 on the list)" in body["note"]
     # The caveat travels with the payload, not just the docstring.
     assert "NOT A BUY SIGNAL" in body["note"].upper()
 

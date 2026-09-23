@@ -2531,15 +2531,15 @@ def _market_scan_note(shown: int, total: int | None, prov: dict) -> str:
     head = f"Top {shown} of {total:,} matching" if total is not None else f"Top {shown} matching"
     scanned, size = prov.get("scanned"), prov.get("universe_size")
     if scanned is not None and size is not None:
-        mid = f", from {scanned:,} scored of {size:,} in the universe."
+        mid = f", out of {scanned:,} stocks measured ({size:,} on the list)."
     elif scanned is not None:
-        mid = f", from {scanned:,} scored."
+        mid = f", out of {scanned:,} stocks measured."
     else:
         # Rows without a matching run summary. Saying "of 3,113 scanned" here would be inventing the
         # denominator; saying nothing at all would let the reader assume the whole market.
         mid = ", from a scan whose run summary is unavailable."
-    return (head + mid + " Where these names sit relative to the market on this night — "
-            "CONTEXT, NOT A BUY SIGNAL.")
+    return (head + mid + " This shows where each stock stood against the rest of the market last "
+            "night — context, not a buy signal.")
 
 
 def _market_scan_percentiles(row: dict | None) -> dict:
