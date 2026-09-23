@@ -120,8 +120,8 @@ def test_a_failed_earnings_lookup_is_absent_not_quiet():
 
 def test_regime_factor_reads_all_three_gate_states():
     shut = {"available": True, "passed": False, "failing": ["Breadth > 55%"], "market_score": 69.5}
-    assert "shut" in dp.factors_for(_row(), {}, gate=shut)["regime"]["display"]
-    assert "undecided" in dp.factors_for(_row(), {}, gate={"available": True, "passed": None})["regime"]["display"]
+    assert "narrow" in dp.factors_for(_row(), {}, gate=shut)["regime"]["display"]
+    assert "could not be measured" in dp.factors_for(_row(), {}, gate={"available": True, "passed": None})["regime"]["display"]
     assert "regime" not in dp.factors_for(_row(), {}, gate={"available": False})
 
 
@@ -188,6 +188,8 @@ def test_a_shut_gate_raises_the_floor_and_adds_itself_as_a_reason_against():
     shut = {"available": True, "passed": False, "failing": ["Breadth > 55%"]}
     low = dp.reconcile(_choice(conviction=65), candidates=_cands(gate=shut), gate=shut)
     assert low["status"] == dp.STATUS_NONE and low["conviction_floor"] == 70
+    assert low["none_reason"].startswith("The best candidate, AAA, scored 65 out of 100")
+    assert "fewer than 55% of stocks are in uptrends" in low["none_reason"]
     ok = dp.reconcile(_choice(conviction=74), candidates=_cands(gate=shut), gate=shut)
     assert ok["status"] == dp.STATUS_PICK
     assert any(r["factor"] == "regime" and r["stance"] == "against" for r in ok["reasons"])
@@ -317,3 +319,11 @@ def test_fit_sees_the_same_exposure_through_another_ticker():
 def test_fit_never_returns_a_share_count():
     fit = dp.portfolio_fit("XOM", 100.0, [{"symbol": "CVX", "value": 1000}], group_of=_grp, sectors={})
     assert not any("share" in k for k in fit)
+
+
+def test_gate_failures_read_as_plain_words():
+    assert dp.gate_failing_words({"failing": ["VIX < 20"]}) == "the fear index (VIX) is above 20"
+    two = dp.gate_failing_words({"failing": ["Breadth > 55%", "SPY 20-day momentum > 0"]})
+    assert two.startswith("2 market checks failed")
+    assert dp.gate_failing_words({"failing": ["Something new"]}) == "Something new"
+    assert dp.gate_failing_words(None) == "a market check failed"

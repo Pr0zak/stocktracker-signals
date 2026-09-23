@@ -265,23 +265,25 @@ def sessions_until(today_iso: str, event_iso: str | None, is_trading_day: Callab
 # Every factor the analyst may cite. The key is what a reason points at; the card's row for it is
 # built by the server from measured data. Order is the card's display order.
 FACTOR_LABELS: dict[str, str] = {
+    # Plain words, not trader shorthand: the card is read by someone who may not know what RSI or
+    # relative strength means. Each has a tap-to-explain in the app for the exact definition.
     "trend": "Trend",
-    "rel_strength": "Relative strength",
-    "momentum": "Momentum",
-    "rsi": "RSI",
-    "extension": "Distance from 50-day",
-    "range_52w": "52-week range",
-    "long_cycle": "Long cycle",
-    "volume": "Volume",
-    "volatility": "Volatility",
-    "track_record": "Similar setups",
+    "rel_strength": "Vs the S&P 500",
+    "momentum": "Recent run",
+    "rsi": "Overheated?",
+    "extension": "How stretched",
+    "range_52w": "Vs its yearly high",
+    "long_cycle": "4-year trend",
+    "volume": "Trading activity",
+    "volatility": "Daily swings",
+    "track_record": "Similar past setups",
     "insider": "Insider buying",
     "quality": "Business quality",
-    "short_interest": "Short interest",
-    "seasonality": "Seasonality",
-    "macro": "Macro backdrop",
+    "short_interest": "Bets against it",
+    "seasonality": "Time of year",
+    "macro": "News backdrop",
     "earnings": "Earnings",
-    "regime": "Market regime gate",
+    "regime": "Market checks",
 }
 FACTOR_KEYS = tuple(FACTOR_LABELS)
 
@@ -311,9 +313,9 @@ def factors_for(row: dict | None, summary: dict | None, *, gate: dict | None = N
     t = trend_component(row)
     if t is not None:
         if _flag(row.get("ma_stacked")):
-            txt = "price above a stacked 50 > 150 > 200-day"
+            txt = "rising steadily: above its 50-, 150- and 200-day averages, in order"
         elif _flag(row.get("above_sma200")) and _flag(row.get("above_sma50")):
-            txt = "above its 50- and 200-day averages"
+            txt = "above both its 50-day and 200-day averages"
         elif _flag(row.get("above_sma200")):
             txt = "above its 200-day, below its 50-day"
         elif _flag(row.get("above_sma50")):
@@ -325,25 +327,30 @@ def factors_for(row: dict | None, summary: dict | None, *, gate: dict | None = N
     rs = _num(row.get("rel_strength_3mo"))
     if rs is not None:
         out["rel_strength"] = _factor(
-            "rel_strength", f"{_signed(rs)} pts vs the S&P over 3 months", value=rs, unit="pp",
+            "rel_strength",
+            (f"beat the S&P 500 by {abs(rs):.1f} points over 3 months" if rs >= 0
+             else f"trailed the S&P 500 by {abs(rs):.1f} points over 3 months"),
+            value=rs, unit="pp",
             pctile=_num(row.get("rel_strength_3mo_pctile")))
 
     m60 = _num(row.get("mom_60d"))
     if m60 is not None:
         out["momentum"] = _factor(
-            "momentum", f"{_signed(m60)}% over 60 sessions", value=m60, unit="pct",
+            "momentum", f"{_signed(m60)}% over the last 3 months", value=m60, unit="pct",
             pctile=_num(row.get("mom_60d_pctile")))
 
     rsi = _num(row.get("rsi14"))
     if rsi is not None:
-        zone = "overbought" if rsi >= 70 else "oversold" if rsi <= 30 else "neutral"
-        out["rsi"] = _factor("rsi", f"RSI {rsi:.0f} ({zone})", value=rsi, unit="rsi",
+        zone = ("overheated — it has risen fast" if rsi >= 70 else "washed out — it has fallen fast"
+                if rsi <= 30 else "not overheated")
+        out["rsi"] = _factor("rsi", f"{zone} (RSI {rsi:.0f})", value=rsi, unit="rsi",
                              pctile=_num(row.get("rsi14_pctile")))
 
     ext = _num(row.get("pct_vs_sma50"))
     if ext is not None:
         side = "above" if ext >= 0 else "below"
-        out["extension"] = _factor("extension", f"{abs(ext):.1f}% {side} its 50-day", value=ext, unit="pct")
+        out["extension"] = _factor("extension", f"{abs(ext):.1f}% {side} its 50-day average price",
+                                   value=ext, unit="pct")
 
     off = _num(row.get("pct_off_52w_high"))
     if off is not None:
@@ -355,12 +362,12 @@ def factors_for(row: dict | None, summary: dict | None, *, gate: dict | None = N
     v200 = _num((lt or {}).get("price_vs_200w_sma_pct"))
     if v200 is not None:
         side = "above" if v200 >= 0 else "below"
-        out["long_cycle"] = _factor("long_cycle", f"{abs(v200):.0f}% {side} its 200-week line",
+        out["long_cycle"] = _factor("long_cycle", f"{abs(v200):.0f}% {side} its 4-year (200-week) average",
                                     value=v200, unit="pct")
 
     rv = _num(row.get("rel_volume"))
     if rv is not None:
-        out["volume"] = _factor("volume", f"{rv:.1f}× its normal volume", value=rv, unit="x",
+        out["volume"] = _factor("volume", f"traded {rv:.1f}× its normal amount", value=rv, unit="x",
                                 pctile=_num(row.get("rel_volume_pctile")))
 
     adr = _num(row.get("adr20_pct"))
@@ -378,7 +385,7 @@ def factors_for(row: dict | None, summary: dict | None, *, gate: dict | None = N
         names = f" across {ns} names" if isinstance(ns, int) else ""
         out["track_record"] = _factor(
             "track_record",
-            f"similar setups beat the S&P {beat * 100:.0f}% of the time over 20 days (n={n}{names})",
+            f"in {n} similar past cases{names}, it beat the S&P 500 {beat * 100:.0f}% of the time over the next month",
             value=round(beat * 100, 1), unit="pct")
 
     ins = s.get("insider") if isinstance(s.get("insider"), dict) else None
@@ -403,8 +410,8 @@ def factors_for(row: dict | None, summary: dict | None, *, gate: dict | None = N
     sp = s.get("short_pressure") if isinstance(s.get("short_pressure"), dict) else None
     if sp and sp.get("state"):
         dtc = _num(sp.get("days_to_cover"))
-        tail = f", {dtc:.1f} days to cover" if dtc is not None else ""
-        out["short_interest"] = _factor("short_interest", f"short pressure: {sp['state']}{tail}",
+        tail = f" ({dtc:.1f} days of normal trading to buy back)" if dtc is not None else ""
+        out["short_interest"] = _factor("short_interest", f"short sellers betting against it: {sp['state']}{tail}",
                                         value=dtc, unit="days")
 
     sea = s.get("seasonality") if isinstance(s.get("seasonality"), dict) else None
@@ -420,7 +427,7 @@ def factors_for(row: dict | None, summary: dict | None, *, gate: dict | None = N
     mac = s.get("macro") if isinstance(s.get("macro"), dict) else None
     if mac and mac.get("risk_level"):
         head = str(mac.get("headline") or "").strip()
-        txt = f"macro risk {mac['risk_level']}" + (f": {head}" if head else "")
+        txt = f"news risk {mac['risk_level']}" + (f": {head}" if head else "")
         if mac.get("stale"):
             txt += " (stale read)"
         out["macro"] = _factor("macro", txt[:200])
@@ -437,14 +444,36 @@ def factors_for(row: dict | None, summary: dict | None, *, gate: dict | None = N
     if gate is not None and gate.get("available"):
         passed = gate.get("passed")
         if passed is True:
-            txt = "market gate open: all five conditions pass"
+            txt = "all five market checks pass"
         elif passed is False:
-            failing = ", ".join(gate.get("failing") or []) or "a condition"
-            txt = f"market gate shut: {failing} failing"
+            txt = f"market checks: {gate_failing_words(gate)}"
         else:
-            txt = "market gate undecided: a condition could not be measured"
+            txt = "a market check could not be measured"
         out["regime"] = _factor("regime", txt, value=_num(gate.get("market_score")), unit="score")
     return out
+
+
+# Plain words for each market check the gate can fail, keyed like gate.py's legs.
+_GATE_FAIL_WORDS = {
+    "breadth_55": "the market is narrow — fewer than 55% of stocks are in uptrends",
+    "spy_above_ema50": "the S&P 500 is below its 50-day average",
+    "qqq_above_ema50": "the Nasdaq-100 is below its 50-day average",
+    "vix_under_20": "the fear index (VIX) is above 20",
+    "spy_mom_20d": "the S&P 500 is down over the last month",
+}
+_GATE_NAME_TO_KEY = {
+    "Breadth > 55%": "breadth_55", "SPY > 50-EMA": "spy_above_ema50", "QQQ > 50-EMA": "qqq_above_ema50",
+    "VIX < 20": "vix_under_20", "SPY 20-day momentum > 0": "spy_mom_20d",
+}
+
+
+def gate_failing_words(gate: dict | None) -> str:
+    """Why the market checks failed, in a clause a non-trader can read."""
+    names = (gate or {}).get("failing") or []
+    words = [_GATE_FAIL_WORDS.get(_GATE_NAME_TO_KEY.get(n, n), n) for n in names]
+    if not words:
+        return "a market check failed"
+    return words[0] if len(words) == 1 else f"{len(words)} market checks failed ({'; '.join(words)})"
 
 
 # ------------------------------------------------------------------------------------ reconcile (DP-2)
@@ -541,13 +570,15 @@ def reconcile(choice: dict, *, candidates: dict[str, dict], gate: dict | None) -
     base = {"runners_up": runners, "conviction_floor": floor, "gate_shut": gate_shut}
 
     def none(reason: str, **extra) -> dict:
+        # Shown as a sentence on the card and in the notification, so it starts with a capital.
+        reason = reason[:1].upper() + reason[1:]
         return {"status": STATUS_NONE, "symbol": None, "none_reason": reason, **base, **extra}
 
     if sym is None:
-        why = str(choice.get("none_reason") or "").strip() or "the analyst found nothing worth buying today"
+        why = str(choice.get("none_reason") or "").strip() or "the AI found nothing worth buying today"
         return none(why[:400])
     if sym not in candidates:
-        return none(f"the analyst named {sym}, which was not on today's shortlist, so it was discarded",
+        return none(f"the AI named {sym}, which was not one of today's candidates, so its answer was thrown out",
                     rejected_symbol=sym)
 
     cand = candidates[sym]
@@ -570,13 +601,13 @@ def reconcile(choice: dict, *, candidates: dict[str, dict], gate: dict | None) -
     reasons = reasons[:MAX_REASONS]
 
     if not any(r["stance"] == SUPPORTS for r in reasons):
-        return none(f"the analyst's case for {sym} cited nothing that was measured", rejected_symbol=sym)
+        return none(f"the AI's case for {sym} rested only on data that could not be checked, so it was not shown", rejected_symbol=sym)
     if not any(r["stance"] == AGAINST for r in reasons):
-        return none(f"the analyst named no reason against {sym}; an analysis that finds nothing "
-                    f"against a buy has not looked", rejected_symbol=sym)
+        return none(f"the AI gave no reason against {sym}; a pick with no downside listed has not been "
+                    f"thought through, so it was not shown", rejected_symbol=sym)
     if conviction < floor:
-        tail = " (raised because the market gate is shut)" if gate_shut else ""
-        return none(f"best candidate {sym} came in at conviction {conviction}, under the floor of "
+        tail = (f" today because {gate_failing_words(gate)}" if gate_shut else "")
+        return none(f"the best candidate, {sym}, scored {conviction} out of 100 for confidence; it needed "
                     f"{floor}{tail}", rejected_symbol=sym, rejected_conviction=conviction)
 
     price = _num(cand.get("price"))

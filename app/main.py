@@ -4822,6 +4822,9 @@ def _gate_brief(g: dict | None) -> dict:
         "unmeasured": g.get("unmeasured") or [],
         "market_score": g.get("market_score"),
         "note": g.get("note"),
+        # The five checks with their readings, so the card can show what each one measured.
+        "legs": [{k: leg.get(k) for k in ("name", "key", "ok", "value", "threshold", "note")}
+                 for leg in (g.get("legs") or []) if isinstance(leg, dict)],
     }
 
 
@@ -4872,7 +4875,7 @@ async def _daily_pick_compute(today: str, now_et) -> dict:
     ranked = sl["ranked"]
     if not ranked:
         rec["status"] = daily_pick.STATUS_NONE
-        rec["none_reason"] = "no name passed the screen's filters"
+        rec["none_reason"] = "No stock passed the screen's basic filters (price, trading volume, history)"
         return rec
 
     end = (_dt.date.fromisoformat(today) + _dt.timedelta(days=_DP_EARNINGS_WINDOW_DAYS)).isoformat()
@@ -4892,7 +4895,7 @@ async def _daily_pick_compute(today: str, now_et) -> dict:
             break
     if not finalists:
         rec["status"] = daily_pick.STATUS_NONE
-        rec["none_reason"] = "every name that passed the screen reports earnings within 3 sessions"
+        rec["none_reason"] = "Every stock that passed the screen reports earnings within the next 3 trading days"
         return rec
 
     try:
