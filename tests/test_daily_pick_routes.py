@@ -116,3 +116,46 @@ def test_history_reports_unwritten_marks_as_none(env):
     assert item["marks"]["20d"] is None and item["rule_marks"]["20d"] is None
     assert body["comparison"]["20d"]["n_days"] == 0
     assert body["report_cards"] == []
+
+
+def test_recheck_needs_a_morning_pick(env, monkeypatch):
+    m, dps, c = env
+    body = c.post("/daily_pick/recheck").json()
+    assert body["status"] == "failed" and "morning pick" in body["error"]
+    assert body["graded"] is False
+
+
+def test_recheck_cooldown_returns_the_last_one(env, monkeypatch):
+    m, dps, c = env
+    calls = []
+
+    async def fake(today, now_et):
+        calls.append(1)
+        return {"date": today, "ts": m.time.time(), "status": "pick", "graded": False,
+                "pick": {"symbol": "AAA"}, "same_as_morning": True}
+    monkeypatch.setattr(m, "_daily_pick_recheck_compute", fake)
+    first = c.post("/daily_pick/recheck").json()
+    second = c.post("/daily_pick/recheck").json()
+    assert len(calls) == 1 and first["cooldown_seconds"] == 0 and second["cooldown_seconds"] > 0
+
+
+def test_a_failed_recheck_does_not_block_a_retry(env, monkeypatch):
+    m, dps, c = env
+    calls = []
+
+    async def fake(today, now_et):
+        calls.append(1)
+        return {"date": today, "ts": m.time.time(), "status": "failed", "error": "x", "graded": False}
+    monkeypatch.setattr(m, "_daily_pick_recheck_compute", fake)
+    c.post("/daily_pick/recheck"); c.post("/daily_pick/recheck")
+    assert len(calls) == 2
+
+
+def test_the_card_carries_todays_recheck_beside_the_pick(env):
+    m, dps, c = env
+    today = m._et_now().date().isoformat()
+    dps.append_run(_pick_run(today))
+    dps.append_recheck({"date": today, "ts": 0, "status": "pick", "pick": {"symbol": "BBB"}, "same_as_morning": False})
+    body = c.get("/daily_pick").json()
+    assert body["pick"]["symbol"] == "AAA"          # the morning pick is untouched
+    assert body["recheck"]["pick"]["symbol"] == "BBB"

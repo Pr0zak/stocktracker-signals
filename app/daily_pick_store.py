@@ -24,6 +24,9 @@ log = logging.getLogger("signals.daily_pick_store")
 _DATA_DIR = Path(os.environ.get("SIGNALS_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
 _RUNS = _DATA_DIR / "daily_picks.jsonl"
 _SETTINGS = _DATA_DIR / "daily_pick_settings.json"
+# Intraday re-checks. Separate from the run log on purpose: a re-check never replaces the morning pick
+# and is never graded, so it must not be able to land in the file the grading reads.
+_RECHECKS = _DATA_DIR / "daily_pick_rechecks.jsonl"
 _lock = threading.Lock()
 
 UNIVERSES = ("market", "watchlist")
@@ -69,6 +72,29 @@ def runs(limit: int = 60) -> list[dict]:
 def run_for(date: str) -> dict | None:
     for row in runs(limit=400):
         if row["date"] == date:
+            return row
+    return None
+
+
+def append_recheck(row: dict) -> None:
+    with _lock:
+        _RECHECKS.parent.mkdir(parents=True, exist_ok=True)
+        with _RECHECKS.open("a") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+
+
+def latest_recheck(date: str) -> dict | None:
+    """The newest re-check recorded for `date`, or None."""
+    if not _RECHECKS.exists():
+        return None
+    with _lock:
+        lines = _RECHECKS.read_text().splitlines()
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("date") == date:
             return row
     return None
 

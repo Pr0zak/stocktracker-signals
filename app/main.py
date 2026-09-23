@@ -5039,6 +5039,140 @@ async def run_daily_pick(*, force: bool = False) -> dict:
         return rec
 
 
+_daily_pick_recheck_lock = asyncio.Lock()
+# A re-check makes one deep-model call and ~40 data requests; one every 10 minutes is plenty for a
+# person watching a pick, and it keeps a repeatedly tapped button from queueing a dozen of them.
+_DP_RECHECK_COOLDOWN_S = 600
+
+
+async def _daily_pick_recheck_compute(today: str, now_et) -> dict:
+    """Re-run the pick on THIS MORNING's shortlist with live prices. Never replaces the morning pick
+    and is never recorded in memory — it answers "does the pick still hold right now?", which is a
+    question with no fixed point to grade from."""
+    assert _http is not None
+    cfg = settings_store.get()
+    rec: dict = {"date": today, "ts": time.time(), "status": daily_pick.STATUS_FAILED, "error": None,
+                 "graded": False, "model": cfg["deep_model"], "pick": None, "none_reason": None,
+                 "morning_symbol": None, "same_as_morning": None, "gate": None, "candidates": []}
+    morning = daily_pick_store.run_for(today)
+    if not morning or morning.get("status") not in (daily_pick.STATUS_PICK, daily_pick.STATUS_NONE):
+        rec["error"] = "there is no completed morning pick to re-check yet today"
+        return rec
+    mp = morning.get("pick") or {}
+    rec["morning_symbol"] = mp.get("symbol") if morning.get("status") == daily_pick.STATUS_PICK else None
+    syms = [c["symbol"] for c in (morning.get("candidates") or []) if not c.get("snapshot_error")]
+    if not syms:
+        rec["error"] = "this morning's run left no candidates to re-check"
+        return rec
+
+    try:
+        quotes = await market_now.fetch_quotes(_http, syms)
+    except Exception as e:  # noqa: BLE001 — without live prices a re-check says nothing new
+        rec["error"] = f"live prices could not be read: {redact.redact(e)}"
+        return rec
+    g = await gate_endpoint()
+    rec["gate"] = _gate_brief(g)
+    try:
+        bench = (await fetch_series(_http, "^GSPC")).closes
+    except Exception:  # noqa: BLE001
+        bench = None
+    names = _universe_names()
+    candidates: dict[str, dict] = {}
+    for sym in syms:
+        q = quotes.get(sym) or {}
+        price = market_now.session_price(q)
+        if price is None:
+            continue  # a name we cannot price live cannot be re-checked live
+        try:
+            summary = await _snapshot(sym, crypto=False, bench_closes=bench)
+        except HTTPException:
+            continue
+        try:
+            track = await asyncio.to_thread(memory.similar_setups, sym, summary)
+            if track:
+                summary["track_record"] = track
+        except Exception:  # noqa: BLE001
+            pass
+        today_block = {"price": price, "change_pct": q.get("pct"), "market_state": q.get("state")}
+        summary["today"] = today_block
+        row = await asyncio.to_thread(scan_store.symbol_row, sym)
+        earnings = ({"ok": True, "date": summary["next_earnings"],
+                     "sessions": daily_pick.sessions_until(today, summary["next_earnings"],
+                                                           market_calendar.is_trading_day)}
+                    if summary.get("next_earnings") else None)
+        candidates[sym] = {"price": price, "summary": summary, "name": _clean_name(names.get(sym)),
+                           "factors": daily_pick.factors_for(row, summary, gate=g, earnings=earnings,
+                                                             today=today_block),
+                           "earnings": earnings}
+    if not candidates:
+        rec["error"] = "none of this morning's candidates could be priced right now"
+        return rec
+    rec["candidates"] = [{"symbol": k, "name": c["name"], "price": c["price"],
+                          "change_pct": c["summary"]["today"].get("change_pct")} for k, c in candidates.items()]
+
+    mac = None
+    try:
+        mac = macro.compact(macro.load_state(), limit=3)
+    except Exception:  # noqa: BLE001
+        pass
+    context = {
+        "mode": "intraday_recheck",
+        "date": today,
+        "morning_pick": ({"symbol": mp.get("symbol"), "conviction": mp.get("conviction"), "thesis": mp.get("thesis")}
+                         if rec["morning_symbol"] else {"symbol": None, "none_reason": morning.get("none_reason")}),
+        "market_gate": rec["gate"],
+        "macro": mac or "no macro read is available — that means UNKNOWN, not calm",
+        "shortlist": [
+            {"symbol": k, "name": c["name"], "today": c["summary"]["today"],
+             "factors": {fk: f["display"] for fk, f in c["factors"].items()}, "snapshot": c["summary"]}
+            for k, c in candidates.items()
+        ],
+    }
+    try:
+        choice, usage = await analyst_daily_pick(context, deep=True)
+    except Exception as e:  # noqa: BLE001
+        rec["error"] = f"the analyst call failed: {redact.redact(e)}"
+        return rec
+    usage_store.record(usage, symbol="", kind="daily_pick_recheck")
+    rec["model"] = usage.get("model") or rec["model"]
+    result = daily_pick.reconcile(choice.model_dump(mode="json"), candidates=candidates, gate=g)
+    if result["status"] == daily_pick.STATUS_NONE:
+        rec["status"] = daily_pick.STATUS_NONE
+        rec["none_reason"] = result["none_reason"]
+        rec["same_as_morning"] = rec["morning_symbol"] is None
+        return rec
+    c = candidates[result["symbol"]]
+    rec["status"] = daily_pick.STATUS_PICK
+    rec["same_as_morning"] = result["symbol"] == rec["morning_symbol"]
+    rec["pick"] = {
+        **result, "name": c["name"], "price_at_pick": c["price"],
+        "today_change_pct": c["summary"]["today"].get("change_pct"),
+        "earnings": c["earnings"],
+        "factors": [c["factors"][k] for k in daily_pick.FACTOR_KEYS if k in c["factors"]],
+    }
+    return rec
+
+
+@app.post("/daily_pick/recheck", dependencies=[Depends(require_api_token)])
+async def daily_pick_recheck_endpoint() -> dict:
+    """Re-check this morning's pick against live prices. At most one every 10 minutes: within the
+    cooldown the latest re-check is returned with `cooldown_seconds` left, not recomputed."""
+    today = _et_now().date().isoformat()
+    async with _daily_pick_recheck_lock:
+        last = daily_pick_store.latest_recheck(today)
+        age = time.time() - float((last or {}).get("ts") or 0)
+        if last and last.get("status") != daily_pick.STATUS_FAILED and age < _DP_RECHECK_COOLDOWN_S:
+            return {**last, "cooldown_seconds": int(_DP_RECHECK_COOLDOWN_S - age)}
+        try:
+            rec = await _daily_pick_recheck_compute(today, _et_now())
+        except Exception as e:  # noqa: BLE001 — a crash is a recorded failure, never silence
+            _log.warning("daily_pick: recheck crashed", exc_info=True)
+            rec = {"date": today, "ts": time.time(), "status": daily_pick.STATUS_FAILED,
+                   "error": f"the re-check crashed: {redact.redact(e)}", "graded": False}
+        daily_pick_store.append_recheck(rec)
+        return {**rec, "cooldown_seconds": 0}
+
+
 class DailyPickRunRequest(BaseModel):
     force: bool = False
 
@@ -5089,7 +5223,9 @@ async def daily_pick_endpoint() -> dict:
                 "reason": "the daily pick has not run yet — it runs at 08:05 ET on trading days"}
     latest = runs[0]
     out = {**latest, "available": True, "stale": latest["date"] != today, "today": today,
-           "live": None, "chase": None, "repeats": None}
+           "live": None, "chase": None, "repeats": None,
+           # Today's latest intraday re-check, if one was run. Never merged into the pick above.
+           "recheck": daily_pick_store.latest_recheck(today) if latest["date"] == today else None}
     pick = latest.get("pick") or {}
     if latest.get("status") == daily_pick.STATUS_PICK and pick.get("symbol"):
         sym = pick["symbol"]

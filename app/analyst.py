@@ -1602,6 +1602,7 @@ class PickFactor(str, Enum):
     macro = "macro"
     earnings = "earnings"
     regime = "regime"
+    today_move = "today_move"
 
 
 class PickStance(str, Enum):
@@ -1668,13 +1669,24 @@ is the first realistic upside level. Return null for any level you cannot justif
 - Plain text, no markdown, no disclaimer (the app adds one). Decision support, not advice."""
 
 
+RECHECK_NOTE = """This is an INTRADAY RE-CHECK of this morning's shortlist, not the morning run. \
+Each candidate carries a `today` block with its live price and today's change, and a `today_move` \
+factor. The snapshot's daily bars may already include today's unfinished session, so treat the `today` \
+block as the authoritative live read. `morning_pick` says what this morning's \
+run chose (or why it chose nothing). Decide afresh with today's move in view: keep the morning's pick \
+if it still holds, change it if today's action has changed the case, or return no pick. Set the entry \
+zone, stop and target against the LIVE price. When today's move matters to the decision, cite \
+`today_move` as a reason."""
+
+
 async def daily_pick(context: dict, *, deep: bool = True) -> tuple[DailyPickChoice, dict]:
     """DP-2: pick at most one name from the shortlist in `context`. Deep model by default — it runs
     once a trading day, and on the cli provider it costs nothing per token."""
+    system = DAILY_PICK_SYSTEM + ("\n\n" + RECHECK_NOTE if context.get("mode") == "intraday_recheck" else "")
     prompt = (
         "Today's shortlist and context. Return your structured daily pick (or no pick):\n"
         + json.dumps(context, indent=2, default=str)
     )
-    choice, usage = await _parse(DAILY_PICK_SYSTEM, prompt, DailyPickChoice, deep=deep, max_tokens=4096)
+    choice, usage = await _parse(system, prompt, DailyPickChoice, deep=deep, max_tokens=4096)
     choice.conviction = max(0, min(100, choice.conviction))
     return choice, usage

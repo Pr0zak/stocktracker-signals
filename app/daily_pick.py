@@ -284,6 +284,7 @@ FACTOR_LABELS: dict[str, str] = {
     "macro": "News backdrop",
     "earnings": "Earnings",
     "regime": "Market checks",
+    "today_move": "Today so far",
 }
 FACTOR_KEYS = tuple(FACTOR_LABELS)
 
@@ -302,7 +303,7 @@ def _factor(key: str, display: str, *, value: float | None = None, pctile: float
 
 
 def factors_for(row: dict | None, summary: dict | None, *, gate: dict | None = None,
-                earnings: dict | None = None) -> dict[str, dict]:
+                earnings: dict | None = None, today: dict | None = None) -> dict[str, dict]:
     """The measured factor rows for one candidate. A factor that could not be measured is ABSENT from
     the dict — never present with a zero — so a reason citing it can be dropped and the card has no
     row for it."""
@@ -440,6 +441,15 @@ def factors_for(row: dict | None, summary: dict | None, *, gate: dict | None = N
             out["earnings"] = _factor(
                 "earnings", f"no earnings report in the next {earnings['window_days']} days")
         # A failed lookup is left ABSENT here; the card shows it as an unknown chip instead.
+
+    # Intraday re-check only: the live quote. The daily history ends at yesterday's close during the
+    # session, so without this block a re-check would reason about exactly what the morning did.
+    if today is not None:
+        px, chg = _num(today.get("price")), _num(today.get("change_pct"))
+        if px is not None and chg is not None:
+            word = "up" if chg >= 0 else "down"
+            out["today_move"] = _factor("today_move", f"{word} {abs(chg):.1f}% today, at ${px:,.2f}",
+                                        value=chg, unit="pct")
 
     if gate is not None and gate.get("available"):
         passed = gate.get("passed")

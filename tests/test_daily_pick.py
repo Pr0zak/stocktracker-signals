@@ -327,3 +327,10 @@ def test_gate_failures_read_as_plain_words():
     assert two.startswith("2 market checks failed")
     assert dp.gate_failing_words({"failing": ["Something new"]}) == "Something new"
     assert dp.gate_failing_words(None) == "a market check failed"
+
+
+def test_today_move_factor_only_with_a_live_quote():
+    f = dp.factors_for(_row(), {}, today={"price": 71.2, "change_pct": -4.25})
+    assert f["today_move"]["display"] == "down 4.2% today, at $71.20"
+    assert "today_move" not in dp.factors_for(_row(), {})
+    assert "today_move" not in dp.factors_for(_row(), {}, today={"price": None, "change_pct": 1.0})
