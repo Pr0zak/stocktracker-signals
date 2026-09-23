@@ -1624,7 +1624,8 @@ class PickRunnerUp(BaseModel):
 class DailyPickChoice(BaseModel):
     symbol: str | None               # null = no pick today
     conviction: int                  # 0-100
-    thesis: str                      # one sentence, plain English
+    thesis: str                      # one short plain sentence, at most 14 words
+    headline: str = ""               # the verdict in at most 10 words — what the card shows first
     reasons: list[PickReason]        # 3-6, at least one "against"
     invalidation: str                # the condition that makes the pick wrong, in words
     entry_low: float | None = None
@@ -1632,7 +1633,7 @@ class DailyPickChoice(BaseModel):
     stop: float | None = None
     target: float | None = None
     runners_up: list[PickRunnerUp] = []
-    none_reason: str | None = None   # required when symbol is null
+    none_reason: str | None = None   # required when symbol is null: at most 15 words
 
 
 DAILY_PICK_SYSTEM = """You choose AT MOST ONE stock or ETF for one retail investor to consider buying \
@@ -1648,13 +1649,25 @@ Rules:
 none_reason when no candidate has a setup you would genuinely act on. Never force a pick.
 - Choose ONLY from the shortlist. A symbol not on it will be discarded.
 - Every reason must name a `factor` that appears in the chosen candidate's `factors` block — a \
-reason about anything else is deleted before the investor sees it. Write each reason's `text` as one \
-plain sentence (at most 25 words) that says what the number means, e.g. "It has beaten the S&P by 9 \
-points over three months, stronger than 88% of stocks." Use only numbers present in the data.
+reason about anything else is deleted before the investor sees it. Write each reason's `text` as a \
+short plain phrase (at most 12 words) that says what the number means, e.g. "Beat the S&P by 9 \
+points in 3 months." Use only numbers present in the data.
+- BE BRIEF. The investor reads this on a phone between other things. `headline` is the verdict in at \
+most 10 words ("Strong trend, fair price — buy zone $72-75"). `thesis` at most 14 words. \
+`none_reason` at most 15 words ("DK was closest but the market is too narrow today"). `why_not` at \
+most 10 words. No hedging preambles, no restating numbers the card already shows.
 - Give 3-6 reasons and AT LEAST ONE with stance "against". An analysis that finds nothing against a \
 buy has not looked. If the market gate is shut, that belongs among the reasons against.
 - Weight relative strength and momentum most (the best-evidenced factors). Treat a stretched move \
-(far above the 50-day, very high RSI) as a reason for caution, not for chasing. A `track_record` \
+(far above the 50-day, very high RSI) as a reason for caution, not for chasing.
+- A FALLING PRICE IS NOT BY ITSELF A REASON AGAINST. The investor holds for the long term. When a \
+name with sound long-term metrics (above its 200-day and 200-week lines, good quality or track record, \
+trend intact) pulls back toward its 50-day or support, that is a cheaper entry into something worth \
+owning — say so, as a reason FOR. A drop counts against only when it BREAKS something: the price falls \
+through the 200-day or the invalidation level, or the fall comes with news or earnings that change the \
+case. A down day — even one shared by its whole industry — is NOT a reason against, and must not be \
+cited as one, unless it broke one of those things. Do not tell the investor to wait for a further \
+dip: buying a stock you want has measured better here than waiting for one. A `track_record` \
 block's vs_benchmark numbers are the measured history of similar setups — respect its n, and ignore \
 raw positive rates, which mostly reflect market drift.
 - conviction 0-100, calibrated: 70+ only for genuine confluence; a mixed picture is 40-55. The \
@@ -1665,7 +1678,7 @@ thesis has failed; size it against the candidate's atr14 (at least one atr14 bel
 is the first realistic upside level. Return null for any level you cannot justify from the data.
 - invalidation: the concrete condition, in words, that makes the pick wrong.
 - runners_up: the two or three candidates that came closest, each with one short why_not.
-- thesis: one plain sentence, no jargon.
+- thesis: one short plain sentence, no jargon.
 - Plain text, no markdown, no disclaimer (the app adds one). Decision support, not advice."""
 
 
@@ -1676,7 +1689,8 @@ block as the authoritative live read. `morning_pick` says what this morning's \
 run chose (or why it chose nothing). Decide afresh with today's move in view: keep the morning's pick \
 if it still holds, change it if today's action has changed the case, or return no pick. Set the entry \
 zone, stop and target against the LIVE price. When today's move matters to the decision, cite \
-`today_move` as a reason."""
+`today_move` as a reason. A down day on a sound long-term name can make it MORE attractive — a better \
+price — not less; judge whether the fall broke anything before counting it against."""
 
 
 async def daily_pick(context: dict, *, deep: bool = True) -> tuple[DailyPickChoice, dict]:

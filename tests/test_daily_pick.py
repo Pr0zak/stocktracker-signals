@@ -156,7 +156,7 @@ def test_a_clean_pick_passes_with_server_numbers():
 
 def test_null_symbol_is_no_pick_with_the_models_reason():
     out = dp.reconcile(_choice(symbol=None, none_reason="Nothing clean today."), candidates=_cands(), gate=None)
-    assert out["status"] == dp.STATUS_NONE and out["none_reason"] == "Nothing clean today."
+    assert out["status"] == dp.STATUS_NONE and out["none_reason"] == "Nothing clean today"
 
 
 def test_off_list_symbol_is_discarded():
@@ -175,6 +175,7 @@ def test_no_reason_against_means_no_pick():
     only_for = [r for r in _choice()["reasons"] if r["stance"] == "supports"]
     out = dp.reconcile(_choice(reasons=only_for), candidates=_cands(), gate=None)
     assert out["status"] == dp.STATUS_NONE and "no reason against" in out["none_reason"]
+    assert len(out["none_reason"]) <= 110
 
 
 def test_a_case_citing_only_unmeasured_factors_is_no_pick():
@@ -188,8 +189,8 @@ def test_a_shut_gate_raises_the_floor_and_adds_itself_as_a_reason_against():
     shut = {"available": True, "passed": False, "failing": ["Breadth > 55%"]}
     low = dp.reconcile(_choice(conviction=65), candidates=_cands(gate=shut), gate=shut)
     assert low["status"] == dp.STATUS_NONE and low["conviction_floor"] == 70
-    assert low["none_reason"].startswith("The best candidate, AAA, scored 65 out of 100")
-    assert "fewer than 55% of stocks are in uptrends" in low["none_reason"]
+    assert low["none_reason"] == "AAA scored 65/100; it needed 70 — the market is narrow"
+    assert low["none_detail"].startswith("The best candidate, AAA, scored 65 out of 100")
     ok = dp.reconcile(_choice(conviction=74), candidates=_cands(gate=shut), gate=shut)
     assert ok["status"] == dp.STATUS_PICK
     assert any(r["factor"] == "regime" and r["stance"] == "against" for r in ok["reasons"])
@@ -322,7 +323,7 @@ def test_fit_never_returns_a_share_count():
 
 
 def test_gate_failures_read_as_plain_words():
-    assert dp.gate_failing_words({"failing": ["VIX < 20"]}) == "the fear index (VIX) is above 20"
+    assert dp.gate_failing_words({"failing": ["VIX < 20"]}) == "fear (VIX) is high"
     two = dp.gate_failing_words({"failing": ["Breadth > 55%", "SPY 20-day momentum > 0"]})
     assert two.startswith("2 market checks failed")
     assert dp.gate_failing_words({"failing": ["Something new"]}) == "Something new"
@@ -334,3 +335,24 @@ def test_today_move_factor_only_with_a_live_quote():
     assert f["today_move"]["display"] == "down 4.2% today, at $71.20"
     assert "today_move" not in dp.factors_for(_row(), {})
     assert "today_move" not in dp.factors_for(_row(), {}, today={"price": None, "change_pct": 1.0})
+
+
+def test_short_line_keeps_the_first_sentence_and_caps_length():
+    assert dp.short_line("DK was closest. The market is narrow and breadth is weak.") == "DK was closest"
+    long = "word " * 60
+    out = dp.short_line(long, 40)
+    assert len(out) <= 41 and out.endswith("…")
+    assert dp.short_line("Short and done.") == "Short and done"
+
+
+def test_a_long_model_reason_is_split_into_line_and_detail():
+    why = ("Today's re-check made the morning's case weaker, not stronger: the two best-ranked leaders are each "
+           "down about 2.4% and trading below their 20-day averages, while the market gate stays shut.")
+    out = dp.reconcile({"symbol": None, "none_reason": why, "conviction": 0}, candidates=_cands(), gate=None)
+    assert out["none_reason"] == "Today's re-check made the morning's case weaker, not stronger"
+    assert out["none_detail"].startswith("Today's re-check made")
+
+
+def test_headline_falls_back_to_a_trimmed_thesis():
+    out = dp.reconcile(_choice(thesis="Strong trend at a fair price. More words follow here."), candidates=_cands(), gate=None)
+    assert out["headline"] == "Strong trend at a fair price"

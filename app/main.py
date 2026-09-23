@@ -4981,6 +4981,7 @@ async def _daily_pick_compute(today: str, now_et) -> dict:
     if result["status"] == daily_pick.STATUS_NONE:
         rec["status"] = daily_pick.STATUS_NONE
         rec["none_reason"] = result["none_reason"]
+        rec["none_detail"] = result.get("none_detail")
         rec["pick"] = {"runners_up": result["runners_up"], "conviction_floor": result["conviction_floor"],
                        "rejected_symbol": result.get("rejected_symbol"),
                        "rejected_conviction": result.get("rejected_conviction")}
@@ -5139,6 +5140,7 @@ async def _daily_pick_recheck_compute(today: str, now_et) -> dict:
     if result["status"] == daily_pick.STATUS_NONE:
         rec["status"] = daily_pick.STATUS_NONE
         rec["none_reason"] = result["none_reason"]
+        rec["none_detail"] = result.get("none_detail")
         rec["same_as_morning"] = rec["morning_symbol"] is None
         return rec
     c = candidates[result["symbol"]]

@@ -465,11 +465,11 @@ def factors_for(row: dict | None, summary: dict | None, *, gate: dict | None = N
 
 # Plain words for each market check the gate can fail, keyed like gate.py's legs.
 _GATE_FAIL_WORDS = {
-    "breadth_55": "the market is narrow — fewer than 55% of stocks are in uptrends",
-    "spy_above_ema50": "the S&P 500 is below its 50-day average",
-    "qqq_above_ema50": "the Nasdaq-100 is below its 50-day average",
-    "vix_under_20": "the fear index (VIX) is above 20",
-    "spy_mom_20d": "the S&P 500 is down over the last month",
+    "breadth_55": "the market is narrow",
+    "spy_above_ema50": "the S&P 500 is below its 50-day",
+    "qqq_above_ema50": "the Nasdaq is below its 50-day",
+    "vix_under_20": "fear (VIX) is high",
+    "spy_mom_20d": "the S&P fell this month",
 }
 _GATE_NAME_TO_KEY = {
     "Breadth > 55%": "breadth_55", "SPY > 50-EMA": "spy_above_ema50", "QQQ > 50-EMA": "qqq_above_ema50",
@@ -483,7 +483,25 @@ def gate_failing_words(gate: dict | None) -> str:
     words = [_GATE_FAIL_WORDS.get(_GATE_NAME_TO_KEY.get(n, n), n) for n in names]
     if not words:
         return "a market check failed"
-    return words[0] if len(words) == 1 else f"{len(words)} market checks failed ({'; '.join(words)})"
+    return words[0] if len(words) == 1 else f"{len(words)} market checks failed"
+
+
+def short_line(text: str, limit: int = 110) -> str:
+    """The first sentence of `text`, cut at a word boundary to at most `limit` characters.
+
+    The model is asked for short fields and mostly complies; this is the guarantee, so a long answer
+    can never push the card's first line into a paragraph. The full text stays available as detail.
+    """
+    t = " ".join(str(text or "").split())
+    for stop in (". ", "; ", ": "):
+        i = t.find(stop)
+        if 0 < i < limit:
+            t = t[:i]
+            break
+    if len(t) <= limit:
+        return t.rstrip(".")
+    cut = t[:limit].rsplit(" ", 1)[0].rstrip(",;:—- ")
+    return cut + "…"
 
 
 # ------------------------------------------------------------------------------------ reconcile (DP-2)
@@ -579,16 +597,22 @@ def reconcile(choice: dict, *, candidates: dict[str, dict], gate: dict | None) -
 
     base = {"runners_up": runners, "conviction_floor": floor, "gate_shut": gate_shut}
 
-    def none(reason: str, **extra) -> dict:
-        # Shown as a sentence on the card and in the notification, so it starts with a capital.
+    def none(reason: str, detail: str | None = None, **extra) -> dict:
+        # `none_reason` is the one short line the card and the notification show; `none_detail` is
+        # the full explanation, shown only when the reader asks for it.
         reason = reason[:1].upper() + reason[1:]
-        return {"status": STATUS_NONE, "symbol": None, "none_reason": reason, **base, **extra}
+        detail = (detail[:1].upper() + detail[1:]) if detail else None
+        return {"status": STATUS_NONE, "symbol": None, "none_reason": reason,
+                # No detail when it would only repeat the short line (give or take a full stop).
+                "none_detail": detail if detail and detail.rstrip(".…") != reason.rstrip(".…") else None,
+                **base, **extra}
 
     if sym is None:
-        why = str(choice.get("none_reason") or "").strip() or "the AI found nothing worth buying today"
-        return none(why[:400])
+        why = str(choice.get("none_reason") or "").strip() or "nothing was convincing enough today"
+        return none(short_line(why), detail=why[:600])
     if sym not in candidates:
-        return none(f"the AI named {sym}, which was not one of today's candidates, so its answer was thrown out",
+        return none("the AI's answer named a stock outside today's list",
+                    detail=f"the AI named {sym}, which was not one of today's candidates, so its answer was thrown out",
                     rejected_symbol=sym)
 
     cand = candidates[sym]
@@ -611,14 +635,19 @@ def reconcile(choice: dict, *, candidates: dict[str, dict], gate: dict | None) -
     reasons = reasons[:MAX_REASONS]
 
     if not any(r["stance"] == SUPPORTS for r in reasons):
-        return none(f"the AI's case for {sym} rested only on data that could not be checked, so it was not shown", rejected_symbol=sym)
+        return none(f"the case for {sym} couldn't be checked",
+                    detail=f"the AI's case for {sym} rested only on data that could not be checked, so it was not shown",
+                    rejected_symbol=sym)
     if not any(r["stance"] == AGAINST for r in reasons):
-        return none(f"the AI gave no reason against {sym}; a pick with no downside listed has not been "
-                    f"thought through, so it was not shown", rejected_symbol=sym)
+        return none(f"the case for {sym} gave no reason against, so it wasn't shown",
+                    detail=f"the AI gave no reason against {sym}; a pick with no downside listed has not been "
+                           f"thought through, so it was not shown", rejected_symbol=sym)
     if conviction < floor:
         tail = (f" today because {gate_failing_words(gate)}" if gate_shut else "")
-        return none(f"the best candidate, {sym}, scored {conviction} out of 100 for confidence; it needed "
-                    f"{floor}{tail}", rejected_symbol=sym, rejected_conviction=conviction)
+        short_tail = f" — {gate_failing_words(gate)}" if gate_shut else ""
+        return none(f"{sym} scored {conviction}/100; it needed {floor}{short_tail}",
+                    detail=f"the best candidate, {sym}, scored {conviction} out of 100 for confidence; it needed "
+                           f"{floor}{tail}", rejected_symbol=sym, rejected_conviction=conviction)
 
     price = _num(cand.get("price"))
     levels, level_notes = sanitize_levels(choice, price)
@@ -627,6 +656,8 @@ def reconcile(choice: dict, *, candidates: dict[str, dict], gate: dict | None) -
         "symbol": sym,
         "conviction": conviction,
         "thesis": str(choice.get("thesis") or "").strip()[:300],
+        # The card's first line. Falls back to a trimmed thesis for answers written before it existed.
+        "headline": short_line(str(choice.get("headline") or "").strip() or str(choice.get("thesis") or "").strip(), 80),
         "invalidation": str(choice.get("invalidation") or "").strip()[:300],
         "reasons": reasons,
         "reasons_dropped": dropped,
