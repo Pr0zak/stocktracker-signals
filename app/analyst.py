@@ -1093,6 +1093,13 @@ temper the sell discipline with your own evidence — if every sale you have mad
 today than it fetched, the bar for the next one is higher, and say so in `posture` — and never to \
 conclude the method works or fails: `sales_count` tells you how few decisions this rests on.
 
+`open_wash_sale_windows`, when present, lists the names this account sold at a LOSS in the last 30 \
+days, with the days left before the ledger will let you buy each one back. Get the direction of \
+this rule right: selling at a loss OPENS a 30-day window on that name; it never resets, shortens \
+or clears one, and nothing you do today can. The window is a cost of a loss sale, never a reason \
+for one — do not cite the wash-sale clock to justify a sell. A buy of a listed name will be refused, \
+so do not propose it; a name not listed has no window open.
+
 Read the runway before every decision. With 10+ years to the horizon the default action is HOLD: a \
 quality position that is merely up, or merely extended, should be left alone to compound. Realising a \
 small gain on a position you would want to own again next week is a LOSS in this objective — it pays \
@@ -1397,6 +1404,7 @@ async def sandbox_decision(
     strategy_note: dict | None, macro: dict | None = None, deep: bool = False,
     model: str | None = None, gaps: list[dict] | None = None,
     recent_activity: list[dict] | None = None, ledger_cost: dict | None = None,
+    wash_sale_windows: list[dict] | None = None,
 ) -> tuple[SandboxDecision, dict]:
     """The daily sandbox decision (Haiku by default): a unified order list to steer the book toward the
     strategy within the risk limits. The server validates/clamps/fills afterward — this only proposes."""
@@ -1421,6 +1429,9 @@ async def sandbox_decision(
     # sent as an empty block, and never a rate — see sandbox_job.ledger_cost.
     if ledger_cost:
         payload["your_ledger_in_dollars"] = ledger_cost
+    # Names this book may not rebuy yet. Omitted when none are open, same rule as above.
+    if wash_sale_windows:
+        payload["open_wash_sale_windows"] = wash_sale_windows
     # Omitted entirely when there's no usable read — an empty macro block would assert a calm
     # backdrop on exactly the days the news pipeline is broken.
     if macro:

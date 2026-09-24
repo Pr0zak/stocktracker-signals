@@ -383,6 +383,31 @@ GOLD_ETFS = frozenset({"GLD", "GLDM", "IAU", "IAUM", "SGOL", "OUNZ", "BAR", "AAA
 
 
 
+# The wash-sale windows currently open on this book, for the tick prompt.
+#
+# Measured 2026-09-24: the analyst sold 10 SCHD at a $14.87 loss eleven days after buying it, giving
+# as its reason that the sale "resets wash-sale lockout". It does the opposite -- a loss sale OPENS a
+# 30-day window on that name -- and the model had no way to check, because the windows lived only on
+# the ledger (`recent_loss_sales`) and were never shown to it. The guard below them refused rebuys
+# correctly; the model simply reasoned about a rule it could not see.
+#
+# Handed over as facts (symbol, days left), sorted so the prompt is stable tick to tick. Empty when
+# the guard is switched off: a window the ledger will not enforce is not a constraint on the book.
+def wash_sale_windows(recent_loss_sales: dict | None, *, now_ts: float,
+                      enabled: bool = True) -> list[dict]:
+    if not enabled or not recent_loss_sales:
+        return []
+    out = []
+    for sym, ts in recent_loss_sales.items():
+        try:
+            days = (now_ts - float(ts)) / 86_400.0
+        except (TypeError, ValueError):
+            continue
+        if 0 <= days < 30:
+            out.append({"symbol": str(sym).upper(), "days_left": 30 - int(days)})
+    return sorted(out, key=lambda w: (w["days_left"], w["symbol"]))
+
+
 # The number of days of its own ledger the analyst is shown. Long enough to hold a reversal — the
 # 2026-09-02/09-04 SCHD round trip was two days apart — and short enough that a stale opinion from
 # three weeks ago is not still arguing its case.

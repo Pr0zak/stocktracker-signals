@@ -3428,7 +3428,10 @@ async def _run_extra_arm(
                 # Likewise this arm's own ledger in dollars, from its own trades and positions.
                 ledger_cost=sandbox_job.ledger_cost(
                     sandbox_store.read_trades(_LEDGER_COST_ROWS, arm), blob["positions"],
-                    price_of=price_of, bench=bench, today=sandbox_job.today_et_str()))
+                    price_of=price_of, bench=bench, today=sandbox_job.today_et_str()),
+                wash_sale_windows=sandbox_job.wash_sale_windows(
+                    blob.get("recent_loss_sales"), now_ts=time.time(),
+                    enabled=bool(settings.get("avoid_wash_sales", True))))
             usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
             _arm_orders = [o.model_dump() for o in decision.orders]
             # Review on the arm path too. This was implemented on main only, so review_enabled on an
@@ -3838,7 +3841,10 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                     recent_activity=sandbox_job.recent_activity(
                         sandbox_store.read_trades(120, sandbox_store.MAIN_ARM),
                         today=sandbox_job.today_et_str()),
-                    ledger_cost=ledger_cost)
+                    ledger_cost=ledger_cost,
+                    wash_sale_windows=sandbox_job.wash_sale_windows(
+                        blob.get("recent_loss_sales"), now_ts=time.time(),
+                        enabled=bool(settings.get("avoid_wash_sales", True))))
                 usage_store.record(usage, symbol="SANDBOX", kind="sandbox_tick")
                 orders = [o.model_dump() for o in decision.orders]
                 posture = decision.posture
