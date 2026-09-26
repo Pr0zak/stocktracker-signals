@@ -192,7 +192,7 @@ def test_staking_is_read_from_the_fund_name_and_the_ether_group_says_why():
 
 
 def test_request_is_deduplicated_and_capped():
-    out = _run(["spy", "SPY", " voo "] + [f"X{i}" for i in range(40)], _yahoo(LIVE))
+    out = _run(["spy", "SPY", " voo "] + [f"X{i}" for i in range(fc.MAX_SYMBOLS + 20)], _yahoo(LIVE))
     assert list(out["funds"])[:2] == ["SPY", "VOO"]
     assert len(out["funds"]) == fc.MAX_SYMBOLS
 
@@ -220,3 +220,13 @@ def test_route_serves_fund_costs(tmp_path, monkeypatch):
         spym = next(f for f in body["funds"]["SPY"]["group"]["funds"] if f["symbol"] == "SPYM")
         assert spym["expense_ratio_pct"] == 0.02 and spym["fee_source"] == "issuer"
         assert c.get("/fund_costs").json()["funds"] == {}
+
+
+def test_an_empty_answer_does_not_pin_every_symbol_as_unknown():
+    async def empty(_client, symbols):
+        return {}
+    _run(["VOO"], empty, now=1_000.0)
+    assert "VOO" not in fc._cache                       # nothing learned, nothing cached
+    y = _yahoo(LIVE)
+    _run(["VOO"], y, now=1_001.0)                       # so the next ask goes straight back to Yahoo
+    assert y.asked

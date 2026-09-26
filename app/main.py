@@ -38,7 +38,7 @@ from .analyst import (
 from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
 from .news import earnings_on, fetch_context, fetch_dated_news, fetch_next_earnings
-from . import fund_cost, macro, scan_job, sectors
+from . import fund_cost, fund_overlap, macro, scan_job, sectors
 from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
 
@@ -1989,6 +1989,40 @@ async def fund_costs_endpoint(symbols: str = "") -> dict:
     if not want:
         return {"funds": {}, "live": True, "as_of": time.time()}
     return await fund_cost.lookup(_http, want, saved=_EXPENSE_RATIO_PCT, saved_as_of=_EXPENSE_RATIO_AS_OF)
+
+
+@app.get("/funds/groups")
+async def funds_groups_endpoint() -> dict:
+    """Every measured look-alike group with each fund's fee, cheapest first (FUND-4). Free — NO LLM."""
+    assert _http is not None
+    return await fund_cost.groups_overview(_http, saved=_EXPENSE_RATIO_PCT, saved_as_of=_EXPENSE_RATIO_AS_OF)
+
+
+@app.get("/funds/overlap")
+async def funds_overlap_endpoint(symbols: str = "") -> dict:
+    """What each fund covers, how every pair overlaps, and which rise and fall as one (FUND-1/2).
+    Free — NO LLM. Pass a whole watchlist if you like: single stocks come back in `not_funds`.
+
+    Only symbols travel here. What the user holds, and how much, stays on the phone, which weights
+    these results itself — the same line RPT-1 drew for the report's portfolio section.
+    """
+    assert _http is not None
+    want = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not want:
+        return {"funds": {}, "not_funds": [], "unknown": [], "unmeasured": [], "pairs": [], "same_bets": [],
+                "same_bet_corr": fund_overlap.SAME_BET_CORR, "live": True, "as_of": time.time()}
+    return await fund_overlap.overlap(_http, want, saved=_EXPENSE_RATIO_PCT, saved_as_of=_EXPENSE_RATIO_AS_OF)
+
+
+@app.get("/funds/performance")
+async def funds_performance_endpoint(symbols: str = "", series: bool = False) -> dict:
+    """Dividends-in returns over 1/2/3/5 years and the worst drop, per symbol (FUND-5). Free — NO
+    LLM. `series=true` adds a weekly price line for the comparison chart."""
+    assert _http is not None
+    want = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not want:
+        return {"funds": {}, "as_of": time.time()}
+    return await fund_overlap.performance(_http, want, include_series=series)
 
 
 async def _build_portfolio_snapshot(

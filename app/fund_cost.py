@@ -64,8 +64,9 @@ MISSING_TTL_SECONDS = 3600
 # One v7 call per chunk. The largest group is eleven funds, so even a full request stays one or two
 # calls; the chunk only keeps the URL a sane length.
 _CHUNK = 60
-# Most symbols one request may ask about (each also pulls in its group).
-MAX_SYMBOLS = 20
+# Most symbols one request may ask about (each fund also pulls in its group). Sized for a whole
+# portfolio: the app's fee-change check sends every stock-type holding in one call.
+MAX_SYMBOLS = 60
 
 
 @dataclass(frozen=True)
@@ -171,9 +172,16 @@ FIDELITY_ONLY = frozenset({"FZROX", "FZILX", "FNILX"})
 ISSUER_FEES: dict[str, float] = {"HODL": 0.20, "BRRR": 0.25, "ETHW": 0.20, "SPYM": 0.02}
 ISSUER_FEES_CHECKED = "2026-09-26"
 
-# SYMBOL -> (fetched_at, {"long_name", "quote_type", "fee"}), or (fetched_at, None) for a symbol
-# Yahoo did not return.
+# SYMBOL -> (fetched_at, {"long_name", "quote_type", "fee", "net_assets"}), or (fetched_at, None)
+# for a symbol Yahoo did not return.
 _cache: dict[str, tuple[float, dict | None]] = {}
+
+# SYMBOL -> (measured_at, spread as % of the midpoint), from the last read taken DURING the regular
+# session. Outside it Yahoo's bid and ask are stale or zero, and a spread computed from them would
+# be a number about nothing, so the last in-session reading is kept, with its own time, instead.
+_spreads: dict[str, tuple[float, float]] = {}
+# A quote whose spread is wider than this is a broken print, not a trading cost worth quoting.
+_MAX_SANE_SPREAD_PCT = 5.0
 
 Fetch = Callable[[httpx.AsyncClient, list[str]], Awaitable[dict[str, dict]]]
 
@@ -241,7 +249,87 @@ def _row(symbol: str, saved: dict[str, float], saved_as_of: str) -> dict:
         "fidelity": symbol in FIDELITY,
         "fidelity_only": symbol in FIDELITY_ONLY,
         "staking": "staking" in (name or "").lower(),
+        # Fund size in dollars (None = unknown), and the last regular-session bid/ask spread as a
+        # percent of the price, measured at `spread_at` (epoch seconds). A mutual fund has none.
+        "net_assets": (live or {}).get("net_assets"),
+        "spread_pct": _spreads[symbol][1] if symbol in _spreads else None,
+        "spread_at": _spreads[symbol][0] if symbol in _spreads else None,
     }
+
+
+def row(symbol: str, *, saved: dict[str, float], saved_as_of: str) -> dict:
+    """One symbol's fee row from whatever is cached, without its group. See [refresh]."""
+    return _row(symbol.upper(), saved, saved_as_of)
+
+
+async def refresh(
+    client: httpx.AsyncClient,
+    symbols: list[str],
+    *,
+    fetch: Fetch = market_now.fetch_quotes,
+    now: float | None = None,
+) -> bool:
+    """Make sure every symbol's Yahoo read is fresh, fetching only the stale ones.
+
+    Returns False when Yahoo was asked and did not answer (the cache then serves whatever it last
+    had). Never raises for a Yahoo failure.
+    """
+    now = time.time() if now is None else now
+    stale = [s for s in dict.fromkeys(x.upper() for x in symbols) if not _fresh(s, now)]
+    if not stale:
+        return True
+    try:
+        got: dict[str, dict] = {}
+        for i in range(0, len(stale), _CHUNK):
+            got.update(await fetch(client, stale[i:i + _CHUNK]))
+    except Exception as e:  # noqa: BLE001 — the rows say what is unknown
+        log.warning("fund_cost: Yahoo quote failed for %d symbols: %s", len(stale), redact(e))
+        return False
+    for s in stale:
+        q = got.get(s)
+        # An empty answer for a non-empty ask is a soft failure, not proof that every symbol is
+        # unknown to Yahoo: caching those misses would pin "unknown" on all of them for an hour.
+        if q is None and not got:
+            continue
+        _cache[s] = (now, None if q is None else {
+            "long_name": q.get("long_name") or q.get("name"),
+            "quote_type": q.get("quote_type"),
+            "fee": q.get("expense_ratio_pct"),
+            "net_assets": q.get("net_assets"),
+        })
+        if q is not None:
+            _note_spread(s, q, now)
+    return True
+
+
+def _note_spread(symbol: str, q: dict, now: float) -> None:
+    bid, ask = q.get("bid"), q.get("ask")
+    if (q.get("state") or "").upper() != "REGULAR" or not bid or not ask or ask < bid:
+        return
+    mid = (bid + ask) / 2.0
+    pct = (ask - bid) / mid * 100.0
+    if 0.0 <= pct <= _MAX_SANE_SPREAD_PCT:
+        _spreads[symbol] = (now, pct)
+
+
+async def groups_overview(
+    client: httpx.AsyncClient,
+    *,
+    saved: dict[str, float],
+    saved_as_of: str,
+    fetch: Fetch = market_now.fetch_quotes,
+    now: float | None = None,
+) -> dict:
+    """Every look-alike group with its funds' fees, cheapest first — the Funds screen's catalogue."""
+    now = time.time() if now is None else now
+    live = await refresh(client, [m for g in GROUPS for m in g.members], fetch=fetch, now=now)
+    groups = [{
+        "id": g.id,
+        "label": g.label,
+        "note": g.note,
+        "funds": sorted((_row(m, saved, saved_as_of) for m in g.members), key=_fee_order),
+    } for g in GROUPS]
+    return {"groups": groups, "live": live, "as_of": now}
 
 
 def _fee_order(row: dict) -> tuple:
@@ -279,23 +367,7 @@ async def lookup(
             if m not in needed:
                 needed.append(m)
 
-    stale = [s for s in needed if not _fresh(s, now)]
-    live = True
-    if stale:
-        try:
-            got: dict[str, dict] = {}
-            for i in range(0, len(stale), _CHUNK):
-                got.update(await fetch(client, stale[i:i + _CHUNK]))
-            for s in stale:
-                q = got.get(s)
-                _cache[s] = (now, None if q is None else {
-                    "long_name": q.get("long_name") or q.get("name"),
-                    "quote_type": q.get("quote_type"),
-                    "fee": q.get("expense_ratio_pct"),
-                })
-        except Exception as e:  # noqa: BLE001 — the rows below say what is unknown
-            live = False
-            log.warning("fund_cost: Yahoo quote failed for %d symbols: %s", len(stale), redact(e))
+    live = await refresh(client, needed, fetch=fetch, now=now)
 
     funds: dict[str, dict] = {}
     for s in want:

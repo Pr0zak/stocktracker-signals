@@ -100,6 +100,10 @@ async def fetch_quotes(client: httpx.AsyncClient, symbols: list[str]) -> dict[st
             "long_name": q.get("longName"),
             "quote_type": q.get("quoteType"),
             "expense_ratio_pct": _num(q.get("netExpenseRatio")),
+            # Fund size in dollars, and the live bid/ask behind a fund's trading-cost line.
+            "net_assets": _num(q.get("netAssets")),
+            "bid": _num(q.get("bid")),
+            "ask": _num(q.get("ask")),
         }
     return out
 
