@@ -5357,3 +5357,71 @@ async def daily_pick_settings_post(req: DailyPickSettingsRequest) -> dict:
         return daily_pick_store.save_settings(req.model_dump(exclude_none=True))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+
+
+# --- RPT-1: the weekly and monthly report -------------------------------------------------------------
+
+from . import report, report_job  # noqa: E402 — grouped with the feature it serves
+
+_NO_REPORT_YET = ("No report yet. The weekly one is made after Friday's close, the monthly one after "
+                  "the month's last close.")
+
+
+@app.get("/reports", dependencies=[Depends(require_api_token)])
+async def reports_endpoint(kind: str | None = None, limit: int = 30) -> dict:
+    """Stored reports, newest first, as list rows. Token-gated: a row carries the sandbox's result."""
+    if kind is not None and kind not in report.KINDS:
+        raise HTTPException(status_code=422, detail=f"kind must be one of {report.KINDS}")
+    return {"reports": report_job.list_reports(kind=kind, limit=max(1, min(int(limit), 200)))}
+
+
+@app.get("/report/latest", dependencies=[Depends(require_api_token)])
+async def report_latest_endpoint(kind: str = "week") -> dict:
+    """The newest stored report of `kind`. `available: false` with a reason when none exists yet —
+    never an empty report shaped like a quiet week."""
+    if kind not in report.KINDS:
+        raise HTTPException(status_code=422, detail=f"kind must be one of {report.KINDS}")
+    rows = report_job.list_reports(kind=kind, limit=1)
+    rep = report_job.load(rows[0]["id"]) if rows else None
+    if rep is None:
+        return {"available": False, "kind": kind, "reason": _NO_REPORT_YET}
+    return {"available": True, **rep}
+
+
+@app.get("/report/{rid}", dependencies=[Depends(require_api_token)])
+async def report_endpoint(rid: str) -> dict:
+    rep = report_job.load(rid)
+    if rep is None:
+        raise HTTPException(status_code=404, detail="no such report")
+    return {"available": True, **rep}
+
+
+@app.post("/report/run", dependencies=[Depends(require_api_token)])
+async def report_run_endpoint(kind: str = "auto", end: str | None = None, force: bool = False) -> dict:
+    """Build the newest closed week and/or month if it is not stored yet (`kind=auto`, the timer's
+    call), or one named period. A period that cannot be measured comes back `failed` with its reason
+    and nothing is stored, so the next timer slot tries again."""
+    kinds = report.KINDS if kind == "auto" else (kind,)
+    if any(k not in report.KINDS for k in kinds):
+        raise HTTPException(status_code=422, detail="kind must be auto, week or month")
+    end_date = None
+    if end is not None:
+        if kind == "auto":
+            raise HTTPException(status_code=422, detail="end needs an explicit kind")
+        try:
+            import datetime as _dt
+            end_date = _dt.date.fromisoformat(end)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail="end must be YYYY-MM-DD") from e
+    results = []
+    for k in kinds:
+        try:
+            out = await report_job.build(k, client=_http, end=end_date, force=force)
+            rep = out["report"]
+            results.append({"kind": k, "id": rep["id"], "status": out["status"], "headline": rep["headline"]})
+        except report_job.ReportError as e:
+            _log.warning("report %s failed: %s", k, e)
+            results.append({"kind": k, "status": "failed", "error": str(e)})
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+    return {"results": results}

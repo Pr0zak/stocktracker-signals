@@ -39,6 +39,13 @@ class Series:
     # Series that predates them, so they must not become required positional fields.
     highs: list[float | None] = field(default_factory=list)
     lows: list[float | None] = field(default_factory=list)
+    # The RAW close per bar, index-aligned with `closes` (None where Yahoo omitted it). `closes` is
+    # split- AND dividend-adjusted, which is right for indicators and wrong for "how much did it move
+    # this week": in the week a fund goes ex-dividend its adjusted change runs ahead of the price
+    # change everyone quotes by the size of the dividend (RSP's read -0.18% against a -0.56% price
+    # move in the week of 2026-09-21). report.py quotes price changes from these and falls back to
+    # the adjusted series only across a split. Defaulted and last, like highs/lows.
+    raw_closes: list[float | None] = field(default_factory=list)
 
 
 async def _fetch_chart(client: httpx.AsyncClient, symbol: str, rng: str = "1y", interval: str = "1d") -> dict:
@@ -101,7 +108,7 @@ async def _webull_series(client: httpx.AsyncClient, symbol: str) -> Series:
     return Series(
         symbol=symbol.upper(), closes=closes, opens=opens, volumes=vols, dates=dates,
         fifty_two_high=max(recent), fifty_two_low=min(recent), currency="USD", source="webull",
-        highs=highs, lows=lows,
+        highs=highs, lows=lows, raw_closes=list(closes),
     )
 
 
@@ -137,12 +144,15 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str, rng: str = "1y", 
     vols: list[float | None] = []
     highs: list[float | None] = []
     lows: list[float | None] = []
+    raws: list[float | None] = []
     dates: list[str] = []
     for i in range(len(ts)):
         c = adj_closes[i] if i < len(adj_closes) else None
         if c is None:  # Yahoo pads gaps with null
             continue
         closes.append(float(c))
+        raw_c = raw_closes[i] if i < len(raw_closes) else None
+        raws.append(float(raw_c) if raw_c is not None else None)
         v = raw_vols[i] if i < len(raw_vols) else None
         vols.append(float(v) if v is not None else None)
         # Yahoo's quote arrays (open/high/low/close) are RAW prices, but `closes` above are the
@@ -178,6 +188,7 @@ async def fetch_series(client: httpx.AsyncClient, symbol: str, rng: str = "1y", 
         currency=meta.get("currency", "USD"),
         highs=highs,
         lows=lows,
+        raw_closes=raws,
     )
 
 

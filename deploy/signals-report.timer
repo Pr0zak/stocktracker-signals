@@ -1,0 +1,13 @@
+[Unit]
+Description=Build the weekly/monthly report after the close (15:25 CT = 16:25 ET), with a Saturday catch-up
+
+[Timer]
+# 25 minutes after the 4 PM ET close so the day's bars are final at Yahoo, and after the sandbox's
+# 14:35 CT tick. The app polls every 15 minutes, so the alert lands roughly 3:30-3:45 PM CT. The
+# Saturday slot rebuilds anything a failed or missed Friday left behind.
+OnCalendar=Mon-Fri 15:25:00
+OnCalendar=Sat 08:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

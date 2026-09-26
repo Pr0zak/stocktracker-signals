@@ -48,6 +48,7 @@ The container runs on `America/Chicago`, so every `OnCalendar` below is Central 
 | 10:00, 14:20 | `signals-macro` | intraday refreshes |
 | 14:35 | `signals-sandbox` | paper-trading tick |
 | 14:40 | `signals-parked` | sweep parked orders |
+| 15:25 Mon-Fri, Sat 08:00 | `signals-report` | weekly/monthly report (RPT-1) once a week or month has closed; no-op otherwise |
 | Mon+Tue 06:05 | `signals-swt-check` | post-wave verification → `/var/log/signals-swt.log` |
 
 The ordering is load-bearing at the top. Market breadth is derived from the market scan, so anything

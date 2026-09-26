@@ -1,0 +1,13 @@
+[Unit]
+Description=StockTracker Signals — weekly and monthly report (RPT-1), built after the close
+After=network-online.target signals.service
+Wants=network-online.target
+OnFailure=signals-notify@%n.service
+
+[Service]
+Type=oneshot
+# kind=auto builds the newest CLOSED week and month when either is not stored yet, so this is a no-op
+# on most days and the only work happens after a week's or a month's last close. A period that could
+# not be measured is reported as failed and stored nowhere, so the next slot retries it. 900s covers
+# ~1,000 series fetches with room for Yahoo backing off.
+ExecStart=/usr/bin/curl -fsS -m 900 -X POST "http://127.0.0.1:8000/report/run?kind=auto"
