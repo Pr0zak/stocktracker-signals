@@ -42,7 +42,7 @@ SERIES_TTL_SECONDS = 6 * 3600
 FAILED_TTL_SECONDS = 10 * 60         # a failed read is retried soon, not stuck for a day
 MAX_SYMBOLS = 80                     # what one overlap request may name (stocks are sorted out)
 MAX_FUNDS = 40                       # funds actually measured: pairs grow with the square (780 at 40)
-MAX_PERFORMANCE_SYMBOLS = 12
+MAX_PERFORMANCE_SYMBOLS = 40              # a whole portfolio's funds, ranked side by side
 _CONCURRENCY = 6
 
 # Funds that correlate this closely rise and fall as one: counted as ONE bet. Complete linkage, so a
