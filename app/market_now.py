@@ -95,6 +95,11 @@ async def fetch_quotes(client: httpx.AsyncClient, symbols: list[str]) -> dict[st
             "post_price": _num(q.get("postMarketPrice")),
             "state": q.get("marketState"),
             "name": q.get("shortName") or sym,
+            # For fund_cost: what the symbol is and what it charges. `netExpenseRatio` is already a
+            # percent (VOO 0.03 = 0.03% a year) and is ABSENT, not zero, for a single stock.
+            "long_name": q.get("longName"),
+            "quote_type": q.get("quoteType"),
+            "expense_ratio_pct": _num(q.get("netExpenseRatio")),
         }
     return out
 

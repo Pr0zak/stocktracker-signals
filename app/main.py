@@ -38,7 +38,7 @@ from .analyst import (
 from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
 from .news import earnings_on, fetch_context, fetch_dated_news, fetch_next_earnings
-from . import macro, scan_job, sectors
+from . import fund_cost, macro, scan_job, sectors
 from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
 
@@ -1902,7 +1902,7 @@ for _s in ("VXUS", "IXUS", "VEU",            # all-world ex-US
 # the S&P is ~80-85% of US market cap, so VTI adds a mid/small tail. At 0.997 that tail is not
 # diversification, and pretending otherwise defeats the cap. Deliberately NOT merged: VXUS (0.778 vs
 # VTI) and SCHD (0.641) do real work and keep their own groups.
-for _s in ("SPY", "VOO", "IVV", "SPLG",      # S&P 500
+for _s in ("SPY", "VOO", "IVV", "SPLG", "SPYM",  # S&P 500 (SPLG became SPYM on 2025-10-31)
            "VTI", "ITOT", "SCHB",            # total US market
            "QQQ", "QQQM",                    # Nasdaq-100
            "SPMO"):                          # S&P 500 momentum
@@ -1934,6 +1934,10 @@ for _s in ("SP500",):
 # Absent from this map = unknown, not free. Single stocks have no expense ratio at all and are simply
 # omitted rather than recorded as 0.
 _EXPENSE_RATIO_PCT: dict[str, float] = {
+    # SPLG has traded as SPYM since 2025-10-31 (same fund, same 0.02%, confirmed on the issuer's page
+    # 2026-09-26). Yahoo files SPYM as an EQUITY with no fee at all, so nothing live will supply this
+    # figure. fund_cost.ISSUER_FEES carries the same number for the app's fee comparison.
+    "SPYM": 0.020,
     "SPLG": 0.020, "VTI": 0.030, "VOO": 0.030, "ITOT": 0.030, "SCHB": 0.030, "SPTM": 0.030,
     "IVV": 0.030, "SPY": 0.095, "SPMO": 0.130, "QQQM": 0.150, "QQQ": 0.180,
     # International. VXUS is the cheapest TRUE total-international vehicle here: VEA/SCHF/SPDW look
@@ -1947,9 +1951,10 @@ _EXPENSE_RATIO_PCT: dict[str, float] = {
     # the same issuer, and the group above means the ledger already refuses to churn one into the
     # other — so this number can only ever steer NEW money, which is the only place it belongs.
     "IAUM": 0.090, "GLDM": 0.100, "SGOL": 0.170, "IAU": 0.250, "OUNZ": 0.250, "GLD": 0.400,
-    # Spot bitcoin. HODL and BRRR are 0.000 by PROMOTIONAL WAIVER, not by pricing — both revert on
-    # expiry, so re-check these two before treating them as the cheap option.
-    "HODL": 0.000, "BRRR": 0.000, "BITB": 0.200, "ARKB": 0.210,
+    # Spot bitcoin. HODL and BRRR were 0.000 here by PROMOTIONAL WAIVER, and both waivers are over:
+    # on 2026-09-26 VanEck's own August 2026 guide priced HODL at 0.20% and CoinShares' page gave BRRR
+    # a 0.25% sponsor fee, while Yahoo still listed both at 0%. See fund_cost.ISSUER_FEES.
+    "HODL": 0.200, "BRRR": 0.250, "BITB": 0.200, "ARKB": 0.210,
     "FBTC": 0.250, "IBIT": 0.250, "BTCO": 0.250, "GBTC": 1.500,
 }
 
@@ -1963,6 +1968,27 @@ def _exposure_group(symbol: str) -> str:
 def _expense_ratio(symbol: str) -> float | None:
     """Annual expense ratio in %, or None when unknown (which is NOT the same as zero)."""
     return _EXPENSE_RATIO_PCT.get(symbol.upper().removesuffix("-USD"))
+
+
+# When the table above was last checked against Yahoo, for fund_cost to print beside any figure it
+# has to take from here because Yahoo did not answer.
+_EXPENSE_RATIO_AS_OF = "2026-08-27"
+
+
+@app.get("/fund_costs")
+async def fund_costs_endpoint(symbols: str = "") -> dict:
+    """What each fund charges a year, and the near-copies it can be compared with (FC-1). Free — NO LLM.
+
+    `symbols` is a comma list (up to 20). Each row carries the fund's fee as a percent a year and a
+    `group`: every fund measured to hold the same thing (the fund itself included), cheapest first,
+    with Fidelity's own funds flagged — the user buys on Fidelity. A single stock comes back with
+    kind "other" and no fee, and a fee that cannot be found is null, never 0. See app/fund_cost.py.
+    """
+    assert _http is not None
+    want = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not want:
+        return {"funds": {}, "live": True, "as_of": time.time()}
+    return await fund_cost.lookup(_http, want, saved=_EXPENSE_RATIO_PCT, saved_as_of=_EXPENSE_RATIO_AS_OF)
 
 
 async def _build_portfolio_snapshot(
