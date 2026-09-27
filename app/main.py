@@ -38,7 +38,7 @@ from .analyst import (
 from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
 from .news import earnings_on, fetch_context, fetch_dated_news, fetch_next_earnings
-from . import fund_cost, fund_overlap, macro, scan_job, sectors
+from . import fund_catalog, fund_cost, fund_overlap, macro, scan_job, sectors
 from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
 
@@ -112,9 +112,12 @@ async def lifespan(app: FastAPI):
         memory.seed_research()  # idempotent by slug; safe on every restart
     except Exception:  # noqa: BLE001 — memory must never block startup
         _log.warning("memory: seeding skipped", exc_info=True)
+    # FUND-8: measure the Explore catalogue in the background, so its first visitor does not wait.
+    warm = asyncio.create_task(fund_catalog.warm(_http, saved=_EXPENSE_RATIO_PCT, saved_as_of=_EXPENSE_RATIO_AS_OF))
     try:
         yield
     finally:
+        warm.cancel()
         await _http.aclose()
 
 
@@ -2023,6 +2026,19 @@ async def funds_performance_endpoint(symbols: str = "", series: bool = False) ->
     if not want:
         return {"funds": {}, "as_of": time.time()}
     return await fund_overlap.performance(_http, want, include_series=series)
+
+
+@app.get("/funds/explore")
+async def funds_explore_endpoint() -> dict:
+    """About 180 well-known funds with a plain name, a type, the fee, and 1/3/5-year returns and
+    worst drops to one shared day, plus each one's cheaper measured copy (FUND-8). Free — NO LLM.
+    Served from the last finished build; see app/fund_catalog.py."""
+    assert _http is not None
+    try:
+        return await fund_catalog.explore(_http, saved=_EXPENSE_RATIO_PCT, saved_as_of=_EXPENSE_RATIO_AS_OF)
+    except Exception as e:  # noqa: BLE001 — nothing built yet and the build failed
+        _log.warning("funds/explore failed: %s", redact.redact(e))
+        raise HTTPException(status_code=503, detail="fund catalogue not available yet")
 
 
 async def _build_portfolio_snapshot(

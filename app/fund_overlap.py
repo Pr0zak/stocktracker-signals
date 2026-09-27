@@ -309,23 +309,34 @@ def returns(s: Series, *, last: dt.date | None = None) -> dict:
     ds = _dates(s)
     out: dict[str, float | None] = {}
     none = {k: None for k in ("1y", "2y", "3y", "5y")}
-    if len(ds) < 2:
+    end = end_index(ds, last)
+    if end is None:
         return none
-    end = len(ds) - 1 if last is None else bisect.bisect_right(ds, last) - 1
-    if end < 1:
-        return none
-    last, last_c = ds[end], s.closes[end]
+    last_c = s.closes[end]
     for label, years in (("1y", 1), ("2y", 2), ("3y", 3), ("5y", 5)):
-        target = last - dt.timedelta(days=round(365.25 * years))
-        if ds[0] <= target:
-            i = bisect.bisect_right(ds, target) - 1
-        elif (ds[0] - target).days <= 7:
-            i = 0
-        else:
-            out[label] = None
-            continue
-        out[label] = round((last_c / s.closes[i] - 1) * 100, 2)
+        i = window_start(ds, end, years)
+        out[label] = None if i is None else round((last_c / s.closes[i] - 1) * 100, 2)
     return out
+
+
+def end_index(ds: list[dt.date], last: dt.date | None) -> int | None:
+    """Index of the bar a window ends on: the latest on or before [last] (the latest of all when
+    [last] is None). None when there is no earlier bar to measure from."""
+    if len(ds) < 2:
+        return None
+    end = len(ds) - 1 if last is None else bisect.bisect_right(ds, last) - 1
+    return end if end >= 1 else None
+
+
+def window_start(ds: list[dt.date], end: int, years: int) -> int | None:
+    """Index of the bar a [years]-long window ending at [end] starts on, or None when the history
+    does not reach that far back. A week of slack covers where Yahoo's range happens to start."""
+    target = ds[end] - dt.timedelta(days=round(365.25 * years))
+    if ds[0] <= target:
+        return bisect.bisect_right(ds, target) - 1
+    if (ds[0] - target).days <= 7:
+        return 0
+    return None
 
 
 def worst_drop(s: Series) -> dict:
