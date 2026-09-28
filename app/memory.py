@@ -80,7 +80,11 @@ _RETAIN_DAYS = 1826
 # DP-4: the Daily Pick records its choice and its mechanical baseline under their own origins.
 ORIGIN_DAILY_PICK = "daily_pick"
 ORIGIN_DAILY_PICK_RULE = "daily_pick_rule"
-PICK_ORIGINS = (ORIGIN_DAILY_PICK, ORIGIN_DAILY_PICK_RULE)
+# The ETF pick (etf_pick.py), graded separately: a different thesis on a different universe.
+ORIGIN_DAILY_PICK_ETF = "daily_pick_etf"
+ORIGIN_DAILY_PICK_ETF_RULE = "daily_pick_etf_rule"
+PICK_ORIGINS = (ORIGIN_DAILY_PICK, ORIGIN_DAILY_PICK_RULE, ORIGIN_DAILY_PICK_ETF,
+                ORIGIN_DAILY_PICK_ETF_RULE)
 # Prose notes have no horizon to wait for; two years remains plenty.
 _NOTES_RETAIN_DAYS = 730
 
@@ -987,6 +991,8 @@ def stats() -> dict:
                 # against, kept apart from buy_calls so the three questions never blur.
                 "daily_picks": (ORIGIN_DAILY_PICK, BUY_SIGNALS, True),
                 "daily_pick_rule": (ORIGIN_DAILY_PICK_RULE, BUY_SIGNALS, True),
+                "daily_etf_picks": (ORIGIN_DAILY_PICK_ETF, BUY_SIGNALS, True),
+                "daily_etf_pick_rule": (ORIGIN_DAILY_PICK_ETF_RULE, BUY_SIGNALS, True),
             }
             rows_20 = {label: _card(*spec, 20) for label, spec in cards.items()}
             # Long horizons on the ANALYST's cards only. The sandbox's own decisions are a handful

@@ -1693,6 +1693,8 @@ class PickFactor(str, Enum):
     earnings = "earnings"
     regime = "regime"
     today_move = "today_move"
+    fee = "fee"
+    worst_drop = "worst_drop"
 
 
 class PickStance(str, Enum):
@@ -1783,10 +1785,31 @@ zone, stop and target against the LIVE price. When today's move matters to the d
 price — not less; judge whether the fall broke anything before counting it against."""
 
 
+ETF_PICK_NOTE = """THIS IS THE ETF PICK, a second card beside the stock pick, and it has a different \
+thesis: A SOUND, LOW-COST FUND AT A BETTER PRICE. Every candidate is an index fund that a screen found \
+above its 200-day average (its long trend intact) and 5-25% below its 52-week high, with a known fee and \
+at least three years of history. Each carries a `fund` block (what it holds, its type, its fee, its \
+1/3/5-year return and worst drop) and two fund-only factors, `fee` and `worst_drop`.
+
+This REPLACES the base rule to weight relative strength and momentum most. For a fund, a pullback \
+toward its long-term trend is the setup, so a weak 3-month read is expected here and is not a reason \
+against by itself. Weigh, in order: how sound the fund is to hold for years (what it holds, how broad, \
+its worst drop), how good the price is (`range_52w`, `extension`, `long_cycle`), and its cost (`fee`). \
+Prefer a broad fund to a narrow theme at a similar discount. Never choose a fund for its past return. \
+A pullback that BREAKS something — close to the 200-day with the market checks failing, or a sector \
+under a named macro threat — is a reason against. The fund named is already the cheapest copy of its \
+index. Say what the fund holds in plain words in the headline, e.g. "Whole US market, 7% off its high". \
+Entry zone, stop and target work as for a stock: the stop below the 200-day average is the usual \
+invalidation."""
+
+
 async def daily_pick(context: dict, *, deep: bool = True) -> tuple[DailyPickChoice, dict]:
     """DP-2: pick at most one name from the shortlist in `context`. Deep model by default — it runs
-    once a trading day, and on the cli provider it costs nothing per token."""
+    once a trading day, and on the cli provider it costs nothing per token. `context["kind"] == "etf"`
+    adds ETF_PICK_NOTE."""
     system = DAILY_PICK_SYSTEM + ("\n\n" + RECHECK_NOTE if context.get("mode") == "intraday_recheck" else "")
+    if context.get("kind") == "etf":
+        system += "\n\n" + ETF_PICK_NOTE
     prompt = (
         "Today's shortlist and context. Return your structured daily pick (or no pick):\n"
         + json.dumps(context, indent=2, default=str)

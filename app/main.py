@@ -41,7 +41,7 @@ from .analyst import (
 from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
 from .news import earnings_on, fetch_context, fetch_dated_news, fetch_next_earnings
-from . import etf_arm, fund_catalog, fund_cost, fund_overlap, macro, scan_job, sectors
+from . import etf_arm, etf_pick, fund_catalog, fund_cost, fund_overlap, macro, scan_job, sectors
 from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
 
@@ -5384,6 +5384,193 @@ async def _daily_pick_compute(today: str, now_et) -> dict:
     return rec
 
 
+async def _etf_pick_compute(today: str, now_et) -> dict:
+    """One ETF-pick run (etf_pick.py). Same record shape as the stock pick's, `kind` "etf", and the
+    same rule: whatever happens, a record — a failure is never an absent row."""
+    assert _http is not None
+    cfg = settings_store.get()
+    rec: dict = {
+        "date": today, "ts": time.time(), "kind": "etf", "status": daily_pick.STATUS_FAILED,
+        "error": None, "universe": "etf_catalogue", "model": cfg["deep_model"], "gate": None,
+        "macro_available": False, "screen": None, "rule_pick": None, "pick": None, "candidates": [],
+        "none_reason": None,
+    }
+    build = await fund_catalog.explore(_http, saved=_EXPENSE_RATIO_PCT, saved_as_of=_EXPENSE_RATIO_AS_OF)
+    if not build or not build.get("measured"):
+        rec["error"] = "the fund list could not be measured this morning"
+        return rec
+    rec["history_as_of"] = build.get("aligned_to")
+    pool = etf_arm.pool_symbols(build)
+    try:
+        bench_series = await fetch_series(_http, "^GSPC")
+        bench = bench_series.closes
+    except Exception:  # noqa: BLE001 — relative strength goes unmeasured, nothing else does
+        bench = None
+
+    async def _read(sym: str):
+        async with _SANDBOX_CAND_SEM:
+            try:
+                s = await fetch_series(_http, sym)
+                summ = summarize(s, bench)
+            except Exception:  # noqa: BLE001 — an unreadable fund is counted as unmeasured
+                return sym, None
+            return sym, etf_pick.tech_row(s.closes, bench_closes=bench, rsi14=summ.get("rsi14"),
+                                          high_52w=summ.get("fifty_two_week_high"))
+    rows = dict(await asyncio.gather(*[_read(x) for x in pool]))
+    sl = etf_pick.shortlist(build, rows, pool=pool, limit=etf_pick.SHORTLIST_N)
+    rec["screen"] = {"scanned": sl["scanned"], "eligible": sl["eligible"], "rejects": sl["rejects"]}
+
+    g = await gate_endpoint()
+    rec["gate"] = _gate_brief(g)
+    mac = None
+    try:
+        mac = macro.compact(macro.load_state(), limit=3)
+    except Exception:  # noqa: BLE001 — absent macro is reported as absent, never as calm
+        pass
+    rec["macro_available"] = bool(mac)
+
+    finalists = sl["ranked"] if sl["eligible"] else []
+    if not finalists:
+        rec["status"] = daily_pick.STATUS_NONE
+        rec["none_reason"] = etf_pick.none_reason(sl)
+        return rec
+
+    for c in finalists:
+        try:
+            summary = await _snapshot(c["symbol"], crypto=False, bench_closes=bench)
+        except HTTPException as e:
+            c["snapshot_error"] = str(e.detail)
+            continue
+        f = c["fund"]
+        c["summary"] = summary
+        c["price"] = summary.get("price")
+        c["name"] = f.get("name")
+        c["earnings"] = None
+        c["factors"] = {**daily_pick.factors_for(c["row"], summary, gate=g, earnings=None),
+                        **etf_pick.fund_factors(f)}
+
+    candidates = {c["symbol"]: c for c in finalists if "summary" in c}
+    rec["candidates"] = [
+        {"symbol": c["symbol"], "name": c.get("name"), "screen_score": c["score"],
+         "parts": c["parts"], "snapshot_error": c.get("snapshot_error")}
+        for c in finalists
+    ]
+    rule = next((c for c in finalists if c["symbol"] in candidates), None)
+    if rule is not None:
+        rec["rule_pick"] = {"symbol": rule["symbol"], "name": rule.get("name"), "screen_score": rule["score"],
+                            "price": rule.get("price"), "as_of_date": rule["summary"].get("as_of_date")}
+        memory.record_verdict(
+            symbol=rule["symbol"], summary=rule["summary"],
+            verdict={"signal": "buy", "conviction": None,
+                     "thesis": "mechanical top of the ETF-pick screen (no model)"},
+            model=None, deep=False, origin=memory.ORIGIN_DAILY_PICK_ETF_RULE)
+    if not candidates:
+        rec["error"] = "no shortlisted fund could be priced this morning"
+        return rec
+
+    history = [h for h in daily_pick_store.runs(limit=daily_pick.REPEAT_WINDOW_SESSIONS + 1, kind="etf")
+               if h.get("date") != today]
+    context = {
+        "kind": "etf",
+        "date": today,
+        "fund_history_as_of": build.get("aligned_to"),
+        "market_gate": rec["gate"],
+        "macro": mac or "no macro read is available — that means UNKNOWN, not calm",
+        "recent_picks": [h.get("pick", {}).get("symbol") for h in history
+                         if h.get("status") == daily_pick.STATUS_PICK and h.get("pick")],
+        "shortlist": [
+            {"symbol": c["symbol"], "name": c.get("name"), "screen_rank": i + 1,
+             "screen_score": c["score"], "screen_parts": c["parts"],
+             "fund": {"holds": c["fund"].get("name"),
+                      "type": dict(fund_catalog.CATEGORIES).get(c["fund"].get("category")),
+                      "fee_pct": c["fund"].get("expense_ratio_pct"),
+                      "return_pct": c["fund"].get("returns"), "worst_drop_pct": c["fund"].get("drops")},
+             "factors": {k: f["display"] for k, f in c["factors"].items()},
+             "snapshot": c["summary"]}
+            for i, c in enumerate(candidates.values())
+        ],
+    }
+    try:
+        choice, usage = await analyst_daily_pick(context, deep=True)
+    except Exception as e:  # noqa: BLE001
+        rec["error"] = f"the analyst call failed: {redact.redact(e)}"
+        return rec
+    usage_store.record(usage, symbol="", kind="daily_pick_etf")
+    rec["model"] = usage.get("model") or rec["model"]
+
+    result = daily_pick.reconcile(choice.model_dump(mode="json"), candidates=candidates, gate=g)
+    for r in result.get("runners_up") or []:
+        c = candidates.get(r["symbol"]) or {}
+        r["name"] = c.get("name")
+        r["price"] = c.get("price")
+    if result["status"] == daily_pick.STATUS_NONE:
+        rec["status"] = daily_pick.STATUS_NONE
+        rec["none_reason"] = result["none_reason"]
+        rec["none_detail"] = result.get("none_detail")
+        rec["pick"] = {"runners_up": result["runners_up"], "conviction_floor": result["conviction_floor"],
+                       "rejected_symbol": result.get("rejected_symbol"),
+                       "rejected_conviction": result.get("rejected_conviction")}
+        closest = result.get("rejected_symbol") or (result["runners_up"][0]["symbol"] if result["runners_up"] else None)
+        if closest and closest in candidates:
+            cc = candidates[closest]
+            rec["pick"]["closest"] = {"symbol": closest, "name": cc.get("name"), "price": cc.get("price")}
+        return rec
+
+    c = candidates[result["symbol"]]
+    summ = c["summary"]
+    rec["status"] = daily_pick.STATUS_PICK
+    rec["pick"] = {
+        **result,
+        "name": c.get("name"),
+        "price_at_pick": c.get("price"),
+        "as_of_date": summ.get("as_of_date"),
+        "screen_score": c["score"],
+        "earnings": None,
+        "factors": [c["factors"][k] for k in daily_pick.FACTOR_KEYS if k in c["factors"]],
+        "rsi14": summ.get("rsi14"),
+        "atr14": summ.get("atr14"),
+        "fifty_two_week_high": summ.get("fifty_two_week_high"),
+        "fifty_two_week_low": summ.get("fifty_two_week_low"),
+        "sma_200w": (summ.get("long_term_trend") or {}).get("sma_200w"),
+        "fee_pct": c["fund"].get("expense_ratio_pct"),
+        "same_index_as": [m for m in ((fund_cost.group_of(c["symbol"]).members
+                                       if fund_cost.group_of(c["symbol"]) else ()))
+                          if m != c["symbol"]],
+    }
+    memory.record_verdict(
+        symbol=result["symbol"], summary=summ,
+        verdict={"signal": "buy", "conviction": result["conviction"], "thesis": result["thesis"]},
+        model=rec["model"], deep=True, origin=memory.ORIGIN_DAILY_PICK_ETF)
+    return rec
+
+
+_etf_pick_lock = asyncio.Lock()
+
+
+async def run_etf_pick(*, force: bool = False) -> dict:
+    """Once per ET trading day, like the stock pick, and on its own lock and its own log: a failed or
+    slow ETF pick must never hold up or replace the stock pick, and the reverse."""
+    async with _etf_pick_lock:
+        now_et = _et_now()
+        today = now_et.date().isoformat()
+        if not force:
+            if not market_calendar.is_trading_day(now_et.date()):
+                return {"status": "skipped", "date": today, "reason": "not a trading day"}
+            prior = daily_pick_store.run_for(today, kind="etf")
+            if prior and prior.get("status") in (daily_pick.STATUS_PICK, daily_pick.STATUS_NONE):
+                return {"status": "already_ran", "date": today, "result": prior.get("status")}
+        try:
+            rec = await _etf_pick_compute(today, now_et)
+        except Exception as e:  # noqa: BLE001 — a crash is recorded as a failure, never as silence
+            _log.warning("etf_pick: run crashed", exc_info=True)
+            rec = {"date": today, "ts": time.time(), "kind": "etf", "status": daily_pick.STATUS_FAILED,
+                   "error": f"the run crashed: {redact.redact(e)}"}
+        daily_pick_store.append_run(rec, kind="etf")
+        _log.info("etf_pick %s: %s %s", today, rec.get("status"),
+                  (rec.get("pick") or {}).get("symbol") or rec.get("none_reason") or rec.get("error") or "")
+        return rec
+
+
 async def run_daily_pick(*, force: bool = False) -> dict:
     """Once per ET trading day. A completed run (pick or none) is not repeated without `force`; a
     FAILED run is, so the 07:40 retry timer can recover a morning the 07:05 run lost."""
@@ -5545,13 +5732,23 @@ async def daily_pick_recheck_endpoint() -> dict:
 
 class DailyPickRunRequest(BaseModel):
     force: bool = False
+    # "stock" (the default, and what the app's re-run sends), "etf", or "all". The pre-market timer
+    # on CT 237 posts {"kind": "all"}, so the ETF pick runs right after the stock pick.
+    kind: str = "stock"
 
 
 @app.post("/daily_pick/run", dependencies=[Depends(require_api_token)])
 async def daily_pick_run_endpoint(req: DailyPickRunRequest = DailyPickRunRequest()) -> dict:
     """DP-3 — run today's pick (the systemd timer curls this pre-market). `force` re-runs a day that
-    already completed; the new run is appended and becomes the one served."""
-    return await run_daily_pick(force=req.force)
+    already completed; the new run is appended and becomes the one served. `kind` picks which card
+    runs; "all" runs the stock pick then the ETF pick, each on its own lock and its own log."""
+    kind = (req.kind or "stock").lower()
+    if kind == "etf":
+        return await run_etf_pick(force=req.force)
+    out = await run_daily_pick(force=req.force)
+    if kind == "all":
+        out = {**out, "etf": await run_etf_pick(force=req.force)}
+    return out
 
 
 async def _dp_live_quote(symbol: str) -> dict:
@@ -5575,7 +5772,7 @@ async def _dp_live_quote(symbol: str) -> dict:
 
 
 @app.get("/daily_pick")
-async def daily_pick_endpoint() -> dict:
+async def daily_pick_endpoint(kind: str = "stock") -> dict:
     """DP-3 — the card. The pick is fixed for the day; the live price and where it sits against the
     plan are refreshed on read (~60s cache).
 
@@ -5587,15 +5784,18 @@ async def daily_pick_endpoint() -> dict:
         "no pick today".
     """
     today = _et_now().date().isoformat()
-    runs = daily_pick_store.runs(limit=daily_pick.REPEAT_WINDOW_SESSIONS + 1)
+    kind = "etf" if str(kind).lower() == "etf" else "stock"
+    runs = daily_pick_store.runs(limit=daily_pick.REPEAT_WINDOW_SESSIONS + 1, kind=kind)
     if not runs:
-        return {"available": False, "stale": None, "today": today,
+        return {"available": False, "stale": None, "today": today, "kind": kind,
                 "reason": "the daily pick has not run yet — it runs at 08:05 ET on trading days"}
     latest = runs[0]
     out = {**latest, "available": True, "stale": latest["date"] != today, "today": today,
-           "live": None, "chase": None, "repeats": None,
+           "kind": kind, "live": None, "chase": None, "repeats": None,
            # Today's latest intraday re-check, if one was run. Never merged into the pick above.
-           "recheck": daily_pick_store.latest_recheck(today) if latest["date"] == today else None}
+           # The ETF pick has no re-check yet, so it never borrows the stock pick's.
+           "recheck": (daily_pick_store.latest_recheck(today)
+                       if latest["date"] == today and kind == "stock" else None)}
     pick = latest.get("pick") or {}
     if latest.get("status") == daily_pick.STATUS_PICK and pick.get("symbol"):
         sym = pick["symbol"]
@@ -5607,7 +5807,7 @@ async def daily_pick_endpoint() -> dict:
         out["repeats"] = daily_pick.repeat_counts(
             [{"status": h.get("status"), "symbol": (h.get("pick") or {}).get("symbol")}
              for h in runs[1:]],
-            sym, group_of=_exposure_group)
+            sym, group_of=etf_arm.group_of if kind == "etf" else _exposure_group)
     return out
 
 
@@ -5624,20 +5824,24 @@ def _dp_marks(row: dict | None) -> dict:
 
 
 @app.get("/daily_pick/history")
-async def daily_pick_history_endpoint(limit: int = 20) -> dict:
+async def daily_pick_history_endpoint(limit: int = 20, kind: str = "stock") -> dict:
     """DP-4/11/14 — past runs with their graded outcomes, and the AI-vs-rule comparison.
 
     Outcomes come from memory's nightly grading; a mark not written yet is None, never 0%. `report_cards`
     lists every written 5-day and 20-day mark on an AI pick so the app can notify once per mark.
     """
     limit = max(1, min(int(limit), 250))
-    runs = daily_pick_store.runs(limit=limit)
+    etf = str(kind).lower() == "etf"
+    runs = daily_pick_store.runs(limit=limit, kind="etf" if etf else "stock")
     ai_keys = [((r.get("pick") or {}).get("symbol"), (r.get("pick") or {}).get("as_of_date"))
                for r in runs if r.get("status") == daily_pick.STATUS_PICK]
     rule_keys = [((r.get("rule_pick") or {}).get("symbol"), (r.get("rule_pick") or {}).get("as_of_date"))
                  for r in runs if r.get("rule_pick")]
-    ai = await asyncio.to_thread(memory.outcomes, memory.ORIGIN_DAILY_PICK, ai_keys)
-    rule = await asyncio.to_thread(memory.outcomes, memory.ORIGIN_DAILY_PICK_RULE, rule_keys)
+    ai = await asyncio.to_thread(
+        memory.outcomes, memory.ORIGIN_DAILY_PICK_ETF if etf else memory.ORIGIN_DAILY_PICK, ai_keys)
+    rule = await asyncio.to_thread(
+        memory.outcomes, memory.ORIGIN_DAILY_PICK_ETF_RULE if etf else memory.ORIGIN_DAILY_PICK_RULE,
+        rule_keys)
     items = []
     paired = {h: [] for h in (5, 20)}
     cards = []

@@ -23,6 +23,16 @@ log = logging.getLogger("signals.daily_pick_store")
 
 _DATA_DIR = Path(os.environ.get("SIGNALS_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
 _RUNS = _DATA_DIR / "daily_picks.jsonl"
+# The ETF pick's own run log (etf_pick.py). Separate so the stock pick's history, grading and repeat
+# counts never mix with it.
+_ETF_RUNS = _DATA_DIR / "daily_etf_picks.jsonl"
+KINDS = ("stock", "etf")
+
+
+def _runs_path(kind: str) -> Path:
+    if kind not in KINDS:
+        raise ValueError(f"kind must be one of {', '.join(KINDS)}")
+    return _ETF_RUNS if kind == "etf" else _RUNS
 _SETTINGS = _DATA_DIR / "daily_pick_settings.json"
 # Intraday re-checks. Separate from the run log on purpose: a re-check never replaces the morning pick
 # and is never graded, so it must not be able to land in the file the grading reads.
@@ -33,19 +43,21 @@ UNIVERSES = ("market", "watchlist")
 _DEFAULT_SETTINGS = {"universe": "market"}
 
 
-def append_run(row: dict) -> None:
+def append_run(row: dict, kind: str = "stock") -> None:
+    path = _runs_path(kind)
     with _lock:
-        _RUNS.parent.mkdir(parents=True, exist_ok=True)
-        with _RUNS.open("a") as f:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
             f.write(json.dumps(row, default=str) + "\n")
 
 
-def _read_all() -> list[dict]:
-    if not _RUNS.exists():
+def _read_all(kind: str = "stock") -> list[dict]:
+    path = _runs_path(kind)
+    if not path.exists():
         return []
     out: list[dict] = []
     with _lock:
-        text = _RUNS.read_text()
+        text = path.read_text()
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -60,17 +72,17 @@ def _read_all() -> list[dict]:
     return out
 
 
-def runs(limit: int = 60) -> list[dict]:
+def runs(limit: int = 60, kind: str = "stock") -> list[dict]:
     """The latest run for each ET date, NEWEST FIRST."""
     latest: dict[str, dict] = {}
-    for row in _read_all():
+    for row in _read_all(kind):
         latest[row["date"]] = row          # later lines win
     ordered = sorted(latest.values(), key=lambda r: r["date"], reverse=True)
     return ordered[:max(1, int(limit))]
 
 
-def run_for(date: str) -> dict | None:
-    for row in runs(limit=400):
+def run_for(date: str, kind: str = "stock") -> dict | None:
+    for row in runs(limit=400, kind=kind):
         if row["date"] == date:
             return row
     return None

@@ -285,6 +285,9 @@ FACTOR_LABELS: dict[str, str] = {
     "earnings": "Earnings",
     "regime": "Market checks",
     "today_move": "Today so far",
+    # The ETF pick only (etf_pick.fund_factors): what the fund costs and how far it has fallen before.
+    "fee": "Yearly cost",
+    "worst_drop": "Worst drop",
 }
 FACTOR_KEYS = tuple(FACTOR_LABELS)
 
