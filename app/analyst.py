@@ -1365,7 +1365,7 @@ Return the verdict. `concerns` is what you would tell the account owner; keep ea
 async def review_decision(
     decision: SandboxDecision, book: dict, candidates: list[dict], *, cash: float,
     settings: dict, strategy_note: dict | None, deep: bool = True,
-    model: str | None = None,
+    model: str | None = None, extra_system: str | None = None,
 ) -> tuple[ReviewVerdict, dict]:
     """A second model reads the proposed orders before they reach the ledger.
 
@@ -1395,7 +1395,8 @@ async def review_decision(
         + json.dumps(payload, indent=2, default=str)
         + "\n\nReturn the ReviewVerdict."
     )
-    return await _parse(REVIEW_SYSTEM, prompt, ReviewVerdict, deep=deep, max_tokens=1024,
+    system = REVIEW_SYSTEM + ("\n\n" + extra_system if extra_system else "")
+    return await _parse(system, prompt, ReviewVerdict, deep=deep, max_tokens=1024,
                         model=model)
 
 
@@ -1405,9 +1406,13 @@ async def sandbox_decision(
     model: str | None = None, gaps: list[dict] | None = None,
     recent_activity: list[dict] | None = None, ledger_cost: dict | None = None,
     wash_sale_windows: list[dict] | None = None,
+    extra_system: str | None = None, extra_payload: dict | None = None,
 ) -> tuple[SandboxDecision, dict]:
     """The daily sandbox decision (Haiku by default): a unified order list to steer the book toward the
-    strategy within the risk limits. The server validates/clamps/fills afterward — this only proposes."""
+    strategy within the risk limits. The server validates/clamps/fills afterward — this only proposes.
+
+    `extra_system` is appended to the system prompt and `extra_payload` merged into the payload, for
+    an arm that trades a different universe (the ETF-only arms: ETF_DAILY_NOTE and its fund data)."""
     payload = {
         "equity": book.get("total_value"),
         "cash": round(cash, 2),
@@ -1436,12 +1441,15 @@ async def sandbox_decision(
     # backdrop on exactly the days the news pipeline is broken.
     if macro:
         payload["macro"] = macro
+    if extra_payload:
+        payload.update(extra_payload)
     prompt = (
         "Make today's paper-trading decision for this account.\n"
         + json.dumps(payload, indent=2, default=str)
         + "\n\nReturn the SandboxDecision (a short, concrete order list; empty if nothing clears the bar)."
     )
-    return await _parse(SANDBOX_SYSTEM, prompt, SandboxDecision, deep=deep, max_tokens=2048,
+    system = SANDBOX_SYSTEM + ("\n\n" + extra_system if extra_system else "")
+    return await _parse(system, prompt, SandboxDecision, deep=deep, max_tokens=2048,
                         model=model)
 
 
@@ -1577,16 +1585,87 @@ plan that is still working deserves to be left alone rather than rewritten for t
 text, no markdown."""
 
 
-async def strategy_review(context: dict, *, settings: dict, deep: bool = True) -> tuple[StrategyNote, dict]:
+async def strategy_review(context: dict, *, settings: dict, deep: bool = True,
+                          extra_system: str | None = None) -> tuple[StrategyNote, dict]:
     """The weekly strategy review (Opus by default): a durable game plan the daily sandbox decision then
-    executes toward. Degrades gracefully upstream — the caller keeps the prior note if this fails."""
+    executes toward. Degrades gracefully upstream — the caller keeps the prior note if this fails.
+    `extra_system` is appended to the system prompt (ETF_STRATEGY_NOTE for the ETF-only arm)."""
     payload = {**context, "settings": settings}
     prompt = (
         "Set the weekly strategy for this paper-trading account.\n"
         + json.dumps(payload, indent=2, default=str)
         + "\n\nReturn the StrategyNote (stance, cash target, per-exposure targets, themes, avoid, notes)."
     )
-    return await _parse(STRATEGY_SYSTEM, prompt, StrategyNote, deep=deep, max_tokens=1536)
+    system = STRATEGY_SYSTEM + ("\n\n" + extra_system if extra_system else "")
+    return await _parse(system, prompt, StrategyNote, deep=deep, max_tokens=1536)
+
+
+# ETF-only arms. Appended to the system prompts above, so everything they say still holds (the
+# objective, the sell discipline, the cap arithmetic) and these only say what differs. Two things
+# differ: the universe is funds only, and each fund carries its cost and its history — which do
+# different jobs, and the notes say which.
+ETF_STRATEGY_NOTE = """THIS ACCOUNT BUYS ETFs ONLY. No single stocks, no mutual funds. The ledger refuses \
+any buy that is not on its fund list, so a plan that names a stock is a plan that cannot be filled.
+
+`etf_groups` is every group you may name, keyed exactly as `exposure_groups`. Each carries its own \
+`cap_pct` — broad index groups (whole US market, all non-US stocks, US bonds, Treasuries) carry the \
+larger `settings.broad_position_pct`; sectors, themes, single countries, gold and crypto carry \
+`settings.max_position_pct`. Every target must be at or under ITS group's `cap_pct`. This replaces \
+the single-cap rule above for this account, and with it the rule on how many groups you need: \
+count against each group's own `cap_pct`, so two or three broad groups can carry the whole invested \
+share, and such a plan is complete when it sums to (100 - cash_target_pct). Do not add narrow groups \
+to make up a count. Funds in one group move together (measured, 0.90 or more on two years of daily \
+returns), so two funds from one group are ONE position, not two. A target named with anything other \
+than an `etf_groups` key cannot be bought and is dropped from the plan.
+
+Each group lists its funds cheapest first with the fee, and `return_pct` and `worst_drop_pct` over \
+1, 3 and 5 years for the fund named in `measured_on` (its cheapest; null = too young for that \
+window, not zero). Use them for different jobs:
+- WORST DROP sets size. It is the fall an owner actually sat through. Size a volatile group so a \
+repeat of its worst drop is survivable for this runway and risk tolerance.
+- RETURN is context, not a forecast. Past return across DIFFERENT kinds of funds says little about \
+the next five years, and last year's best funds are often narrow themes that then cool. Never rank \
+groups by return and buy the top. A plan built mostly from broad index groups is the honest default \
+for a long runway; each narrow group needs a reason beyond its recent return.
+- FEE decides nothing here. Within a group the server already sends every buy to the cheapest \
+fund, and it never sells one fund to buy a cheaper copy. Plan in groups.
+
+Name the groups by their keys, exactly. `notes` in plain words: say what mix you chose and why, \
+without fund jargon."""
+
+ETF_REVIEW_NOTE = """This account buys ETFs only and fills a weekly plan by fund group. A buy of a \
+broad index fund whose reason is filling a planned group is a complete reason: do not ask it for a \
+stock-picking setup. The server moves each buy to the cheapest fund holding the same index; that is \
+not a swap, and an order naming a different copy of the same index is not a defect. Broad index \
+groups here are capped at `settings.broad_position_pct`, not `max_position_pct`: a broad fund held \
+under that cap is NOT a cap breach, so a sell whose reason is fixing a cap breach on one is a \
+defect — drop it."""
+
+ETF_DAILY_NOTE = """THIS ACCOUNT BUYS ETFs ONLY. Every candidate is a fund. The ledger refuses a buy of \
+anything not on its fund list.
+
+CAPS ARE PER GROUP HERE, and this replaces the single `max_position_pct` rule above, including what \
+it says about cap breaches. Broad index groups (listed in `etf_universe.group_caps_pct`) are capped at \
+`settings.broad_position_pct`; every other group at `settings.max_position_pct`. A broad group held \
+between those two numbers is NOT over its cap — never sell it to "fix a cap breach". Buys are also \
+cut to the plan's target for their group, so asking for more than the gap buys nothing extra.
+
+Each candidate row carries: `name` (what it holds, in plain words), `type`, `exposure_group`, \
+`fee_pct` (this account's `expense_ratio_pct`) and `fee_per_10k_usd` (dollars a year per $10,000 \
+held; null = unknown, never free), `return_pct` and `worst_drop_pct` over 1y/3y/5y with dividends \
+reinvested (null = too young for that window), measured to `etf_universe.history_as_of`, and \
+`same_index_as` — other funds holding the same index. Rows carry no `source`. How to use them:
+- The PLAN decides which groups to own. Fill `allocation_gaps` with a fund from that group.
+- To open a group, any fund in it is fine to name: the server sends the buy to the cheapest fund \
+holding the SAME INDEX (`same_index_as`). To add to a group you already hold, name the fund you hold \
+— the server only consolidates onto a held fund of the same index, not the same group. A buy the \
+server moves to another fund fills at the market; its entry zone is dropped. Do not sell a fund to \
+buy a cheaper copy — that is refused, and it is the churn the sell rules forbid.
+- A fund's past return is not a reason to buy it over the plan. Its worst drop is a reason to size \
+it smaller. A fund that has pulled back but still holds what the plan wants is a better price, not \
+a warning.
+- Index funds rarely have a thesis that breaks. Sell only for the reasons above (usually reason 3, \
+the plan dropped the group), never because a broad fund had a bad week."""
 
 
 # ======================================================================================

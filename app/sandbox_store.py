@@ -197,6 +197,13 @@ DEFAULT_SETTINGS = {
     "max_turnover_pct": 25.0,
     # App-side preference, stored here so it rides with the account: push a notification per trade.
     "notify_on_trade": True,
+    # What an arm may buy. "all" = main's universe (the fund shelf plus the market screen); "etf" =
+    # only the ETFs in the fund catalogue, with look-alike funds sharing one cap and every buy routed
+    # to the cheapest copy of its index. See app/etf_arm.py. Never set on main.
+    "universe": "all",
+    # The per-group cap for BROAD index groups on an "etf" arm (whole US market, all non-US stocks,
+    # US bonds, Treasuries). Everything else keeps max_position_pct. Unused when universe is "all".
+    "broad_position_pct": 60.0,
     # Per-arm LLM backbone. None = whatever the service's scan_model is set to, which is what every
     # arm should use unless the BACKBONE is the thing being compared — an arm that pins a model and
     # also changes a limit has two variables and measures neither.

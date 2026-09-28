@@ -34,11 +34,14 @@ from .analyst import (
     review_portfolio,
     sandbox_decision,
     strategy_review,
+    ETF_DAILY_NOTE,
+    ETF_REVIEW_NOTE,
+    ETF_STRATEGY_NOTE,
 )
 from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
 from .news import earnings_on, fetch_context, fetch_dated_news, fetch_next_earnings
-from . import fund_catalog, fund_cost, fund_overlap, macro, scan_job, sectors
+from . import etf_arm, fund_catalog, fund_cost, fund_overlap, macro, scan_job, sectors
 from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
 
@@ -3207,6 +3210,22 @@ async def _sandbox_prices(held: list[str], candidate_syms: list[str]) -> dict[st
     return prices
 
 
+async def _quote_prices(symbols: list[str]) -> dict[str, float | None]:
+    """Session prices for a list of symbols, 60 to a request (fund_cost's chunk size), so one long
+    list is never a single URL Yahoo can refuse whole. A chunk that fails is skipped, not fatal."""
+    out: dict[str, float | None] = {}
+    for i in range(0, len(symbols), 60):
+        chunk = symbols[i:i + 60]
+        try:
+            quotes = await market_now.fetch_quotes(_http, chunk)
+        except Exception:  # noqa: BLE001 — these funds go unpriced today; the rest still are
+            _log.warning("quote chunk failed (%d symbols)", len(chunk), exc_info=True)
+            continue
+        for x in chunk:
+            out[x] = market_now.session_price(quotes.get(x) or {})
+    return out
+
+
 def _crypto_symbol(entry: str) -> str:
     """A crypto watchlist entry as a Yahoo symbol, whichever shape it was stored in.
 
@@ -3241,10 +3260,18 @@ def _exposure_vocabulary(symbols: Iterable[str]) -> dict[str, list[str]]:
 
 async def _maybe_weekly_review(
     blob: dict, book: dict, settings: dict, *, tradable: Iterable[str] = (),
-    ledger_cost: dict | None = None,
+    ledger_cost: dict | None = None, arm: str = sandbox_store.MAIN_ARM,
+    group_of: "Callable[[str], str] | None" = None, vocabulary: dict | None = None,
+    extra_context: dict | None = None, extra_system: str | None = None,
+    note_kind: str = "strategy", cap_pct_of: "Callable[[str], float] | None" = None,
 ) -> bool:
     """Run the Opus weekly strategy review if it's due (>=7 days). Mutates blob's strategy note/date on
-    success; on failure keeps the prior note and does NOT advance the cursor (retries next trading day)."""
+    success; on failure keeps the prior note and does NOT advance the cursor (retries next trading day).
+
+    Main's review by default. An arm that plans for itself (the ETF-only arm) passes its own group
+    map, vocabulary, extra prompt and a `note_kind` of its own, so its weekly notes never appear as
+    main's `prior_strategy_notes` and main's never appear as its."""
+    group_of = group_of or _exposure_group
     from datetime import date as _date
     last = blob.get("last_weekly_review_date")
     today = sandbox_job.now_et().date()
@@ -3259,7 +3286,7 @@ async def _maybe_weekly_review(
     context = {
         "book": book,
         # The ONLY legal target labels, with their members. See _exposure_vocabulary.
-        "exposure_groups": _exposure_vocabulary(
+        "exposure_groups": vocabulary if vocabulary is not None else _exposure_vocabulary(
             [p.get("symbol") for p in (book.get("positions") or [])] + list(tradable)),
         "performance": {
             "funded_total": blob.get("funded_total"), "cash": blob.get("cash"),
@@ -3306,18 +3333,19 @@ async def _maybe_weekly_review(
             context["own_ledger"] = ledger_cost
         # Which rules actually bound. A cap firing constantly means the plan keeps asking for
         # something the account forbids — the strategy is the right level to resolve that, not the
-        # daily tick, which can only keep getting refused.
-        blocked = memory.blocked_summary()
+        # daily tick, which can only keep getting refused. Main's only: the blocked notes are
+        # written from main's tick, and another arm must not re-plan around main's refusals.
+        blocked = memory.blocked_summary() if arm == sandbox_store.MAIN_ARM else None
         if blocked:
             context["blocked_trades"] = blocked
         # The previous few weeks' stances, so the plan has continuity instead of re-deciding from
         # scratch every Monday with no memory of what it already tried.
-        prior = memory.recent_notes(kind="strategy", limit=4)
+        prior = memory.recent_notes(kind=note_kind, limit=4)
         if prior:
             context["prior_strategy_notes"] = [n["body"][:400] for n in prior]
         # Your own last plans that did not add up. Without this the strategist repeats the same short
         # allocation every week and never learns that the remainder silently became cash.
-        gaps = memory.recent_notes(kind="strategy_gap", limit=3)
+        gaps = memory.recent_notes(kind=f"{note_kind}_gap", limit=3)
         if gaps:
             context["prior_allocation_gaps"] = [n["body"][:400] for n in gaps]
     except Exception:  # noqa: BLE001 — enrichment, never a blocker
@@ -3331,23 +3359,45 @@ async def _maybe_weekly_review(
             context["macro"] = mac
     except Exception:  # noqa: BLE001 — enrichment, never a blocker
         pass
+    if extra_context:
+        context.update(extra_context)
     try:
         note, usage = await strategy_review(
-            context, settings=sandbox_job.settings_for_prompt(settings), deep=True)
-        usage_store.record(usage, symbol="SANDBOX", kind="sandbox_strategy")
+            context, settings=sandbox_job.settings_for_prompt(settings), deep=True,
+            extra_system=extra_system)
+        usage_store.record(usage, symbol="SANDBOX" if arm == sandbox_store.MAIN_ARM else f"SANDBOX:{arm}",
+                           kind="sandbox_strategy")
         # Resolve the targets onto today's exposure groups BEFORE anything stores or reads them, so a
         # plan can never carry two labels for one group past this line. One dict from here on: the
         # note that gets stored must be the same object that gets audited and remembered.
         d = note.model_dump()
-        renamed = sandbox_job.canonicalize_targets(d, group_of=_exposure_group)
+        renamed = sandbox_job.canonicalize_targets(d, group_of=group_of)
         if renamed:
-            _log.info("sandbox strategy targets canonicalised: %s", ", ".join(renamed))
+            _log.info("sandbox strategy targets canonicalised (%s): %s", arm, ", ".join(renamed))
+        # A plan written in a vocabulary of its own (the ETF arm's) can name a label that is not in
+        # it. Such a target can never be bought: dropped here, said in the log and in the gap note
+        # the next review reads, so the daily model is never handed a gap no buy can close. The
+        # shortfall it leaves shows up in allocation_gap below like any short plan.
+        unknown: list[str] = []
+        if vocabulary is not None:
+            kept = []
+            for t in d.get("targets") or []:
+                if str(t.get("exposure_group") or "") in vocabulary:
+                    kept.append(t)
+                else:
+                    unknown.append(str(t.get("exposure_group") or ""))
+            if unknown:
+                _log.warning("sandbox strategy (%s) named groups outside its vocabulary, dropped: %s",
+                             arm, ", ".join(unknown))
+                d["targets"] = kept
+        if arm != sandbox_store.MAIN_ARM:
+            d["written_for"] = arm      # which arm's review wrote this plan (see _run_extra_arm)
         blob["last_strategy_note"] = d
         blob["last_weekly_review_date"] = today.isoformat()
         # Keep the weekly reads searchable. Without this each review overwrites the last and the
         # strategy's own history — what it believed and when — is lost.
         memory.add_note(
-            "strategy",
+            note_kind,
             f"[{today.isoformat()}] stance={d.get('stance')} cash_target={d.get('cash_target_pct')}%\n"
             f"{d.get('note') or d.get('summary') or ''}",
             meta={"date": today.isoformat(), "stance": d.get("stance")},
@@ -3358,16 +3408,25 @@ async def _maybe_weekly_review(
         # stage that can add groups or honestly raise the cash target.
         gap = sandbox_job.allocation_gap(
             d, max_position_pct=float(settings.get("max_position_pct", 25.0)),
-            group_of=_exposure_group)
-        if gap:
-            _log.warning("sandbox strategy plan is short: %s", gap)
+            group_of=group_of, cap_pct_of=cap_pct_of)
+        if unknown:
             memory.add_note(
-                "strategy_gap",
+                f"{note_kind}_gap",
+                f"[{today.isoformat()}] targets named groups that do not exist and were dropped: "
+                f"{', '.join(unknown)}. Name only keys of exposure_groups.",
+                meta={"date": today.isoformat(), "unknown_groups": unknown})
+        if gap:
+            _log.warning("sandbox strategy plan is short (%s): %s", arm, gap)
+            memory.add_note(
+                f"{note_kind}_gap",
                 f"[{today.isoformat()}] targets sum to {gap['targets_sum_pct']}% against an investable "
                 f"{gap['investable_pct']}% ({gap['cash_target_pct']}% cash target) — "
                 f"{gap['unallocated_pct']}% left with no owner, which becomes idle cash. "
                 f"{gap['groups']} group(s) named, at least {gap['groups_needed']} needed to cover the "
-                f"invested share under the {settings.get('max_position_pct')}% per-group cap."
+                + (f"invested share under the {settings.get('max_position_pct')}% per-group cap."
+                   if cap_pct_of is None else
+                   f"invested share under this arm's per-group caps (broad "
+                   f"{cap_pct_of('US_EQUITY'):.0f}%, others {settings.get('max_position_pct')}%).")
                 + (f" Targets above the cap (unreachable): {gap['targets_over_cap']}."
                    if gap["targets_over_cap"] else ""),
                 meta={"date": today.isoformat(), **gap},
@@ -3399,11 +3458,32 @@ def _extension_lookup(book: dict) -> "Callable[[str], float | None]":
     return lambda sym: ext.get(str(sym).upper())
 
 
+def _arm_group_of(settings: dict | None) -> "Callable[[str], str]":
+    """The exposure-group map an arm is capped, planned and displayed in: the ETF arms' own map for
+    an ETF arm, main's for every other."""
+    return etf_arm.group_of if etf_arm.is_etf_arm(settings) else _exposure_group
+
+
+def _arm_fill_rules(settings: dict | None, plan: dict | None = None) -> dict:
+    """The validate_and_fill arguments that differ by arm: group map, per-group caps, buy list.
+
+    One place for them because there is more than one fill path. The daily tick is the obvious one;
+    the parked-order sweep (/sandbox/fill_parked, every arm, on a timer after the tick) is the other,
+    and a fill path that forgot these would cap an ETF arm's parked index-fund buy at the narrow cap
+    and in main's group vocabulary — the same arm judged by two rulebooks on one afternoon."""
+    s = settings or {}
+    if not etf_arm.is_etf_arm(s):
+        return {"group_of": _exposure_group}
+    return {"group_of": etf_arm.group_of, "cap_pct_of": etf_arm.cap_pct_of(s),
+            "allowed_buys": etf_arm.universe_set(),
+            "target_limit_of": etf_arm.target_limit_of(plan, s)}
+
+
 async def _run_extra_arm(
     arm: str, *, now, price_of, spy_price: float | None, shared_plan: dict | None,
     candidates: list[dict], macro_block, force: bool, held_rows: list[dict] | None = None,
     rejected: dict[str, list[dict]] | None = None,
-    gate: dict | None = None, bench=None,
+    gate: dict | None = None, bench=None, etf_ctx: dict | None = None,
 ) -> dict:
     """One decision cycle for a NON-main arm, against the market snapshot main already fetched.
 
@@ -3418,7 +3498,14 @@ async def _run_extra_arm(
     the difference between one Opus call a week and one per arm per week.
 
     Failures are contained: an arm that raises is reported and skipped, never allowed to take down
-    main's tick, which is the account that actually matters."""
+    main's tick, which is the account that actually matters.
+
+    ETF-ONLY ARMS (settings.universe == "etf", see app/etf_arm.py) are the exception to "inherit
+    main's plan": main's plan names single stocks, which an ETF arm cannot buy. The `llm` one writes
+    its own weekly plan from the fund catalogue; the `rules` one follows a fixed target-date mix. Both
+    use the ETF arms' own cap groups, route every buy to the cheapest copy of its index, and may buy
+    nothing outside the fund list. `etf_ctx` carries the tick's shared fund data: the catalogue
+    build, each arm's candidate pool, and the candidate rows (built once for all ETF arms)."""
     blob = sandbox_store.get(arm)
     engine = blob.get("engine", "llm")
     label = blob.get("label") or arm
@@ -3429,6 +3516,30 @@ async def _run_extra_arm(
     settings = blob["settings"]
     warnings: list[str] = []
     exclude = {s.upper() for s in (settings.get("exclusions") or [])}
+    etf = etf_arm.is_etf_arm(settings)
+    gof = _arm_group_of(settings)
+    etf_ctx = etf_ctx or {}
+    if etf and etf_ctx.get("price_of"):
+        # Main's quotes plus the ETF arms' own batch. Only ETF arms read the second batch.
+        price_of = etf_ctx["price_of"]
+    etf_build = etf_ctx.get("build")
+    etf_fees = etf_arm.fee_table(etf_build)
+    if etf and not etf_build:
+        warnings.append("fund catalogue unavailable — no fee data, so buys are not routed to the "
+                        "cheapest copy today")
+    # The plan this arm steers toward. Main's for every ordinary arm (see the docstring); an ETF arm
+    # has its own. The no-AI ETF arm's is recomputed from its settings every tick and stored on its
+    # blob, so the app shows the mix it is following exactly as it shows the analyst's weekly plan.
+    plan = shared_plan
+    if etf and engine == "rules":
+        plan = etf_arm.glidepath_plan(settings, now.date())
+        blob["last_strategy_note"] = plan
+    elif etf:
+        # Only a plan this arm's own review wrote. A note carried over by clone_from is main's,
+        # naming single stocks, and must never steer an ETF book — not even for a day the review
+        # happens to fail.
+        _own = blob.get("last_strategy_note") or {}
+        plan = _own if _own.get("written_for") == arm else None
 
     earned = sandbox_job.accrue_cash_interest(blob, now=now)
     if earned > 0:
@@ -3458,7 +3569,8 @@ async def _run_extra_arm(
         orders, source, posture = flat, "exit_date", "Exit date reached — flattening to cash."
     elif engine == "rules":
         d = sandbox_job.rules_decision(
-            blob, plan=shared_plan, group_of=_exposure_group, price_of=price_of)
+            blob, plan=plan, group_of=gof, price_of=price_of,
+            representatives=etf_arm.REPRESENTATIVES if etf else None)
         orders, source, posture = d["orders"], "rules_tick", d["posture"]
     elif engine == "rejects":
         # The review model's control group. Takes exactly what the reviewer refused on its source
@@ -3478,36 +3590,80 @@ async def _run_extra_arm(
         # not, minus whatever this arm holds itself (already in its positions block) and its own
         # exclusions. Without this the arm inherits main's blind spots — see
         # sandbox_job.candidates_for_arm.
-        arm_candidates = sandbox_job.candidates_for_arm(
-            candidates, held_rows or [],
-            held=[p["symbol"] for p in blob["positions"]], exclusions=exclude)
+        if etf:
+            # The ETF pool, never main's: main's pool is mostly single stocks this arm may not buy.
+            arm_candidates = sandbox_job.candidates_for_arm(
+                [r for r in (etf_ctx.get("rows") or {}).get(arm, [])], [],
+                held=[p["symbol"] for p in blob["positions"]], exclusions=exclude)
+        else:
+            arm_candidates = sandbox_job.candidates_for_arm(
+                candidates, held_rows or [],
+                held=[p["symbol"] for p in blob["positions"]], exclusions=exclude)
         try:
             book = (await _build_portfolio_snapshot(holdings, blob["cash"], include_trend=True)
                     if holdings else
                     {"total_value": blob["cash"], "cash_pct": 100.0, "positions": []})
             if holdings and settings.get("taxable_account", True):
                 sandbox_job.annotate_holding_period(book.get("positions", []), blob["positions"])
+            if etf:
+                # The snapshot labels positions with main's group map. This arm plans, caps and is
+                # shown its gaps in its own map, so its book must speak the same vocabulary — two
+                # names for one exposure is how the 2026-08-10 plan asked for one group twice.
+                for _p in book.get("positions") or []:
+                    _p["exposure_group"] = gof(str(_p.get("symbol") or ""))
+            # This arm's own ledger in dollars, from its own trades and positions.
+            _arm_ledger = sandbox_job.ledger_cost(
+                sandbox_store.read_trades(_LEDGER_COST_ROWS, arm), blob["positions"],
+                price_of=price_of, bench=bench, today=sandbox_job.today_et_str())
+            _extra_payload = None
+            if etf:
+                _pool = (etf_ctx.get("pools") or {}).get(arm) or []
+                _vocab: dict[str, list[str]] = {}
+                for _s in etf_arm.universe():
+                    if _s in exclude:
+                        continue
+                    if not settings.get("allow_crypto_etf", True) and gof(_s) in ("BTC", "ETH"):
+                        continue
+                    _vocab.setdefault(gof(_s), []).append(_s)
+                await _maybe_weekly_review(
+                    blob, book, settings, tradable=_pool, ledger_cost=_arm_ledger, arm=arm,
+                    group_of=gof, vocabulary=_vocab,
+                    extra_context={"etf_groups": etf_arm.group_summary(
+                        etf_build, settings=settings, exclude=exclude,
+                        allow_crypto_etf=bool(settings.get("allow_crypto_etf", True))),
+                        "fund_history_as_of": etf_arm.history_as_of(etf_build)},
+                    extra_system=ETF_STRATEGY_NOTE, note_kind=f"strategy@{arm}",
+                    cap_pct_of=etf_arm.cap_pct_of(settings))
+                _own = blob.get("last_strategy_note") or {}
+                plan = _own if _own.get("written_for") == arm else None
+                _caps = etf_arm.cap_pct_of(settings)
+                _extra_payload = {"etf_universe": {
+                    "history_as_of": etf_arm.history_as_of(etf_build),
+                    # Every group the pool or the book touches, with its own cap, so the payload says
+                    # outright which number binds each group rather than leaving it to inference.
+                    "group_caps_pct": {g: _caps(g) for g in sorted(
+                        {gof(_s) for _s in _pool}
+                        | {gof(p["symbol"]) for p in blob["positions"]})},
+                }}
             # Per-arm backbone. None = the service's configured scan model, so an arm that does not
             # set one is a true copy of main rather than a second variable.
             decision, usage = await sandbox_decision(
                 book, arm_candidates, cash=blob["cash"],
                 settings=sandbox_job.settings_for_prompt(settings),
-                strategy_note=shared_plan, macro=macro_block, deep=False,
+                strategy_note=plan, macro=macro_block, deep=False,
                 model=(str(settings.get("model")).strip() or None) if settings.get("model") else None,
                 gaps=sandbox_job.target_gaps(
                     blob["positions"], equity=book.get("total_value") or 0.0,
-                    plan=shared_plan, group_of=_exposure_group, price_of=price_of),
+                    plan=plan, group_of=gof, price_of=price_of),
                 # This arm's own ledger. Read per-arm, never shared: an arm that is a control for
                 # another must not be told what that other one did.
                 recent_activity=sandbox_job.recent_activity(
                     sandbox_store.read_trades(120, arm), today=sandbox_job.today_et_str()),
-                # Likewise this arm's own ledger in dollars, from its own trades and positions.
-                ledger_cost=sandbox_job.ledger_cost(
-                    sandbox_store.read_trades(_LEDGER_COST_ROWS, arm), blob["positions"],
-                    price_of=price_of, bench=bench, today=sandbox_job.today_et_str()),
+                ledger_cost=_arm_ledger,
                 wash_sale_windows=sandbox_job.wash_sale_windows(
                     blob.get("recent_loss_sales"), now_ts=time.time(),
-                    enabled=bool(settings.get("avoid_wash_sales", True))))
+                    enabled=bool(settings.get("avoid_wash_sales", True))),
+                extra_system=ETF_DAILY_NOTE if etf else None, extra_payload=_extra_payload)
             usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
             _arm_orders = [o.model_dump() for o in decision.orders]
             # Review on the arm path too. This was implemented on main only, so review_enabled on an
@@ -3518,7 +3674,8 @@ async def _run_extra_arm(
                     verdict, rusage = await review_decision(
                         decision, book, arm_candidates, cash=blob["cash"],
                         settings=sandbox_job.settings_for_prompt(settings),
-                        strategy_note=shared_plan, deep=True)
+                        strategy_note=plan, deep=True,
+                        extra_system=ETF_REVIEW_NOTE if etf else None)
                     usage_store.record(rusage, symbol=f"SANDBOX:{arm}", kind="sandbox_review")
                     _v = verdict.model_dump()
                     kept, dropped_syms = sandbox_job.apply_review(_arm_orders, _v)
@@ -3554,15 +3711,24 @@ async def _run_extra_arm(
             warnings.append(f"decision failed: {e}")
             orders, source, posture = [], "haiku_tick", "No decision (analyst unavailable) — held."
 
+    if etf and orders and source != "exit_date":
+        # Cost picks the fund: each buy lands on the cheapest copy of its index, or on the copy
+        # already held. Before validate_and_fill, so its caps and floors judge the fund that will
+        # actually be bought. Sells are never touched.
+        orders, _routed = etf_arm.route_to_cheapest(
+            orders, positions=blob["positions"], fees=etf_fees, price_of=price_of, exclude=exclude)
+        if _routed:
+            _log.info("sandbox arm %s: routed %s", arm, "; ".join(_routed))
     try:
         new_blob, filled, skipped = sandbox_job.validate_and_fill(
-            blob, orders, price_of, group_of=_exposure_group, source=source, exclude=exclude,
+            blob, orders, price_of, source=source, exclude=exclude,
             liquidation=(source == "exit_date"),
             # Every arm on the tick sees the SAME verdict, for the same reason they all see the same
             # quotes: an arm that gated on its own evaluation seconds later would differ from its
             # control by the feed as well as by the setting.
             gate=gate,
-            extension_of=_extension_lookup(locals().get("book")))
+            extension_of=_extension_lookup(locals().get("book")),
+            **_arm_fill_rules(settings, plan))
     except AssertionError as e:
         # Main is mid-tick and already persisted. Aborting the whole request over a side arm would
         # throw away a completed real tick, so this arm alone is skipped and says why.
@@ -3798,6 +3964,42 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
             return prices.get(sym.upper())
         spy_price = prices.get("^GSPC")
 
+        # ETF-only arms buy from the fund catalogue, not from main's pool, so their funds are priced
+        # here — in a SEPARATE quote request. Main's batch is the real account's tick; adding ~100
+        # funds to one request it depends on would put main's prices at the mercy of a request it
+        # does not need. A failure here costs the ETF arms their prices and nothing else. Both ETF
+        # arms read this one snapshot, so they stay comparable to each other.
+        etf_ids = [a for a in sandbox_store.list_arms() if a != sandbox_store.MAIN_ARM
+                   and etf_arm.is_etf_arm(sandbox_store.get(a).get("settings"))]
+        etf_build: dict | None = None
+        etf_pools: dict[str, list[str]] = {}
+        etf_prices: dict[str, float] = {}
+
+        def etf_price_of(sym: str):
+            return prices.get(sym.upper()) or etf_prices.get(sym.upper())
+        if etf_ids:
+            try:
+                etf_build = await fund_catalog.explore(
+                    _http, saved=_EXPENSE_RATIO_PCT, saved_as_of=_EXPENSE_RATIO_AS_OF)
+            except Exception:  # noqa: BLE001 — the arms degrade (no fees, no routing), main is untouched
+                _log.warning("sandbox tick: fund catalogue unavailable for the ETF arms", exc_info=True)
+            for _a in etf_ids:
+                _st = sandbox_store.get(_a).get("settings") or {}
+                etf_pools[_a] = etf_arm.pool_symbols(
+                    etf_build, exclude={x.upper() for x in (_st.get("exclusions") or [])},
+                    allow_crypto_etf=bool(_st.get("allow_crypto_etf", True)),
+                    prefer=[_st.get("preferred_btc_etf"), _st.get("preferred_gold_etf")])
+            _etf_want = [x for x in dict.fromkeys(
+                [x for _p in etf_pools.values() for x in _p]
+                + [x for _r in etf_arm.REPRESENTATIVES.values() for x in _r]) if not prices.get(x)]
+            try:
+                # Kept OUT of `prices`. Main's price map is main's input: a fund main's model named
+                # off its own pool is refused as unpriced, and merging these in would let it fill —
+                # main's fills would then depend on whether an ETF arm happens to exist.
+                etf_prices.update({k: v for k, v in (await _quote_prices(_etf_want)).items() if v})
+            except Exception:  # noqa: BLE001
+                _log.warning("sandbox tick: ETF arm quotes failed", exc_info=True)
+
         # Drop candidates one share of which costs more than the position cap could ever buy. This
         # runs HERE rather than at selection because it needs live prices, which only exist now.
         # Logged, not warned: unlike a truncation this removes nothing the account could have used,
@@ -3819,6 +4021,9 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         # entirely, and the fill recorder after validate_and_fill still reads this. `macro_block` is
         # bound here for the same reason: the extra arms read it after this block on every path.
         candidates: list[dict] = []
+        # Bound on every path too: the fill recorder below reads book["positions"], and a weekly-
+        # cadence hold day never builds one (UnboundLocalError after main had already persisted).
+        book: dict = {}
         # Same reason as `candidates` and `macro_block`: the extra arms read it after this block on
         # every path, including the ones that skip the decision entirely.
         held_rows: list[dict] = []
@@ -4070,6 +4275,45 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                          "thesis": r.get("reason")},
                 model=settings_store.get()["scan_model"], origin="sandbox",
             )
+        # Candidate rows for the ETF arms the analyst runs, built once and shared: fee, return and
+        # worst drop from the catalogue, trend readings from the same light snapshot main's
+        # candidates use. Only for an arm that will actually decide today — ~100 chart fetches is
+        # worth paying for a decision, not for an arm that is switched off or already ran.
+        etf_rows: dict[str, list[dict]] = {}
+        _etf_llm = [a for a in etf_ids
+                    if sandbox_store.get(a).get("engine", "llm") == "llm"
+                    and sandbox_job.tick_gate(sandbox_store.get(a), now=now, force=force)[0]]
+        if _etf_llm:
+          try:
+            _syms = list(dict.fromkeys(x for a in _etf_llm for x in etf_pools.get(a, [])))
+            try:
+                _bc = (bench_series.closes if bench_series is not None
+                       else (await fetch_series(_http, "^GSPC")).closes)
+            except Exception:  # noqa: BLE001 — relative strength goes missing, nothing else does
+                _bc = None
+            _tech = dict(zip(_syms, await asyncio.gather(
+                *[_sandbox_candidate(x, _bc, set()) for x in _syms])))
+            _funds = etf_arm.funds_by_symbol(etf_build)
+            for _a in _etf_llm:
+                _rows = []
+                for x in etf_pools.get(_a, []):
+                    r = etf_arm.candidate_row(x, funds=_funds, tech_row=_tech.get(x))
+                    if r is None:
+                        continue
+                    # The price the order will fill against, not the chart's last bar.
+                    if etf_price_of(x):
+                        r["price"] = round(float(etf_price_of(x)), 4)
+                    _rows.append(r)
+                etf_rows[_a] = _rows
+                if len(_rows) < len(etf_pools.get(_a, [])):
+                    _log.info("sandbox arm %s: %d of %d ETF candidates could not be measured",
+                              _a, len(etf_pools.get(_a, [])) - len(_rows), len(etf_pools.get(_a, [])))
+          except Exception:  # noqa: BLE001 — main has already persisted; never cost the arms their day
+            _log.warning("sandbox tick: ETF candidate rows failed", exc_info=True)
+            etf_rows = {}
+        etf_ctx = {"build": etf_build, "pools": etf_pools, "rows": etf_rows,
+                   "price_of": etf_price_of}
+
         # ---- comparison arms, on the snapshot main just used ----
         # Only once main has proceeded, because that is where the prices come from. A day main sat
         # out (closed, already run, disabled) is a day no arm advances either — which keeps the
@@ -4087,7 +4331,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                     shared_plan=new_blob.get("last_strategy_note"), candidates=candidates,
                     held_rows=held_rows,
                     macro_block=macro_block, force=force, rejected=rejected_by_arm,
-                    gate=gate_verdict, bench=bench_series))
+                    gate=gate_verdict, bench=bench_series, etf_ctx=etf_ctx))
             except Exception as e:  # noqa: BLE001 — a side arm must never break the real account
                 _log.exception("sandbox arm %s failed", _arm)
                 arms.append({"arm": _arm, "status": "error", "warnings": [str(e)]})
@@ -4158,6 +4402,9 @@ class SandboxSettingsPatch(BaseModel):
     model: str | None = None
     label: str | None = None
     engine: str | None = None
+    # ETF-only arms (app/etf_arm.py). `universe` is refused on main.
+    universe: str | None = None
+    broad_position_pct: float | None = None
 
 
 @app.post("/sandbox/tick", dependencies=[Depends(require_api_token)])
@@ -4205,7 +4452,7 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
             # app) reported a grouping the risk engine was no longer using — after VTI and SPY were
             # merged into US_EQUITY they still displayed as two separate groups while being capped as
             # one. Same class of lie as any other stale field.
-            "exposure_group": _exposure_group(p["symbol"]),
+            "exposure_group": _arm_group_of(blob.get("settings"))(p["symbol"]),
             **({"expense_ratio_pct": _expense_ratio(p["symbol"])}
                if _expense_ratio(p["symbol"]) is not None else {}),
             "price": round(px, 4) if px else None, "value": round(val, 2),
@@ -4303,6 +4550,7 @@ async def sandbox_arms_endpoint() -> dict:
         bval = round(float(bench.get("shares") or 0.0) * spy, 2) if spy and bench.get("shares") else None
         out.append({
             "arm": a, "label": b.get("label") or a, "engine": b.get("engine", "llm"),
+            "universe": (b.get("settings") or {}).get("universe") or etf_arm.UNIVERSE_ALL,
             "enabled": bool((b.get("settings") or {}).get("master_enabled")),
             "cash": cash, "equity": equity, "positions_value": round(pv, 2),
             "funded_total": round(funded, 2), "positions": len(b.get("positions") or []),
@@ -4343,11 +4591,29 @@ async def sandbox_arms_nav_endpoint(days: int = 180) -> dict:
             bv = r.get("benchmark_value") if r else None
             bench.append(round(float(bv), 2) if bv is not None else None)
         out.append({"arm": a, "label": blob.get("label") or a, "engine": blob.get("engine", "llm"),
+                    "universe": (blob.get("settings") or {}).get("universe") or etf_arm.UNIVERSE_ALL,
                     "equity": eq, "benchmark_value": bench})
-    common = next((i for i, _ in enumerate(dates)
-                   if all(s["equity"][i] is not None for s in out)), None)
-    return {"dates": dates, "common_start": dates[common] if common is not None else None,
-            "common_start_index": common, "arms": out}
+
+    def _start(rows: list[dict]) -> int | None:
+        return next((i for i, _ in enumerate(dates)
+                     if rows and all(r["equity"][i] is not None for r in rows)), None)
+
+    # One start per UNIVERSE. The ETF arms began on 2026-09-28, weeks after the others; one start
+    # for every arm would move the whole comparison to that day and throw away the history the
+    # original arms share. `common_start` stays the start of the original ("all") arms, which is
+    # what the app has always charted; an arm with no value there is simply left off that chart.
+    # `cohorts` gives each universe its own start, main included in each so there is a reference.
+    main_row = [r for r in out if r["arm"] == sandbox_store.MAIN_ARM]
+    cohorts: dict[str, dict] = {}
+    for u in sorted({r["universe"] for r in out}):
+        members = [r for r in out if r["universe"] == u]
+        rows = members if u == etf_arm.UNIVERSE_ALL else members + main_row
+        i = _start(rows)
+        cohorts[u] = {"arms": [r["arm"] for r in rows],
+                      "common_start": dates[i] if i is not None else None, "common_start_index": i}
+    base = cohorts.get(etf_arm.UNIVERSE_ALL) or {"common_start": None, "common_start_index": None}
+    return {"dates": dates, "common_start": base["common_start"],
+            "common_start_index": base["common_start_index"], "cohorts": cohorts, "arms": out}
 
 
 @app.post("/sandbox/arms", dependencies=[Depends(require_api_token)])
@@ -4376,6 +4642,13 @@ async def sandbox_create_arm_endpoint(req: SandboxArmCreate) -> dict:
             blob["funded_total"] = round(float(blob.get("funded_total") or 0.0) + req.fund, 2)
             blob["benchmark"]["shares"] = round(req.fund / spy, 6)
             blob["benchmark"]["cost_basis"] = round(req.fund, 2)
+            if not req.clone_from:
+                # The funding IS this period's money. Without a cursor the first tick would also
+                # pay every instalment due so far this month on top of it (two, on a twice-monthly
+                # arm created after the 15th), so the arm would start with more than it was given.
+                _due = sandbox_job.due_deposit_periods(blob)
+                if _due:
+                    blob["last_deposit_period"] = _due[-1]
             sandbox_store.append_trade({
                 "ts": time.time(), "date": sandbox_job.today_et_str(), "symbol": "CASH",
                 "side": "deposit", "status": "filled", "shares": 0.0, "price": None,
@@ -4457,8 +4730,9 @@ async def sandbox_fill_parked_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dic
         # ticker added to `exclusions` at 14:38 was still bought by the 14:40 parked sweep, which
         # contradicts what that setting says it does: tickers the AI must never buy.
         new_blob, filled, skipped = sandbox_job.validate_and_fill(
-            blob, fresh, price_of, group_of=_exposure_group, source="parked_fill",
-            exclude={str(x).upper() for x in (blob.get("settings", {}).get("exclusions") or [])})
+            blob, fresh, price_of, source="parked_fill",
+            exclude={str(x).upper() for x in (blob.get("settings", {}).get("exclusions") or [])},
+            **_arm_fill_rules(blob.get("settings"), blob.get("last_strategy_note")))
         # No extension_of here: parked orders are buys by construction, and the guard only gates sells.
         pv = sandbox_job.positions_value(new_blob["positions"], price_of)
         # No NAV row: this is an intraday execution, not a valuation point. Writing one would put a
@@ -4608,6 +4882,18 @@ async def sandbox_set_settings_endpoint(
             s["max_new_positions_per_tick"] = max(0, min(20, int(d["max_new_positions_per_tick"])))
         if "slippage_bps" in d:
             s["slippage_bps"] = max(0, min(200, int(d["slippage_bps"])))
+        if "broad_position_pct" in d:
+            s["broad_position_pct"] = max(5.0, min(100.0, float(d["broad_position_pct"])))
+        if "universe" in d:
+            v = str(d["universe"] or "").strip().lower()
+            if v not in etf_arm.UNIVERSES:
+                raise HTTPException(status_code=400,
+                                    detail=f"universe must be one of {', '.join(etf_arm.UNIVERSES)}")
+            if arm == sandbox_store.MAIN_ARM and v != etf_arm.UNIVERSE_ALL:
+                # Main's pool is the shared snapshot every other arm is compared on; turning it into
+                # an ETF book would change what every comparison arm sees, not just main.
+                raise HTTPException(status_code=400, detail="main's universe cannot be changed")
+            s["universe"] = v
         if "model" in d:
             # Free text on purpose — model ids ship faster than any allow-list here could track, and
             # an allow-list that lags is how a new frontier model becomes unusable. Empty = inherit

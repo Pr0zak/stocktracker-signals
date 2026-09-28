@@ -79,6 +79,12 @@ def settings_for_prompt(settings: dict, today: dt.date | None = None) -> dict:
     personal of the two facts. So derive it here, then drop the source.
     """
     out = {k: v for k, v in settings.items() if k != "birth_date"}
+    # The ETF-arm settings mean nothing on any other arm, and a stray `broad_position_pct: 60` in
+    # main's prompt reads as permission to put 60% in one group against its real 20% cap. Dropped
+    # unless the arm is an ETF arm, so every other arm's prompt is exactly what it was before them.
+    if str(out.get("universe") or "all").lower() != "etf":
+        out.pop("universe", None)
+        out.pop("broad_position_pct", None)
     age = effective_age(settings, today)
     if age is not None:
         out["current_age"] = age
@@ -374,7 +380,10 @@ def _usd(x: float) -> str:
 
 # Spot-bitcoin ETFs. Every one holds the same asset, so which you own is a question about custody,
 # liquidity and fees — the user's call, not the model's.
-BTC_ETFS = frozenset({"IBIT", "FBTC", "GBTC", "BITB", "ARKB", "BTCO", "HODL", "BRRR", "EZBC", "BTCW"})
+# "BTC" here is Grayscale's Bitcoin Mini Trust, an ETF — not the coin, which trades as BTC-USD. It is on
+# the ETF arms' fund list, so leaving it out let a buy of it skip the user's chosen bitcoin fund.
+BTC_ETFS = frozenset({"IBIT", "FBTC", "GBTC", "BITB", "ARKB", "BTCO", "HODL", "BRRR", "EZBC", "BTCW",
+                      "BTC"})
 # Gold-bullion ETFs, the same situation as the bitcoin shelf and for the same reason: every one of
 # these holds the identical metal, so the choice between them is cost, liquidity and custody rather
 # than exposure -- the user's call, not the model's. The spread here is wider than bitcoin's: GLD
@@ -1213,6 +1222,7 @@ def canonicalize_targets(
 def allocation_gap(
     note: dict | None, *, max_position_pct: float = 25.0,
     group_of: Callable[[str], str] | None = None,
+    cap_pct_of: Callable[[str], float] | None = None,
 ) -> dict | None:
     """Audit a weekly strategy note's targets. Returns None when the plan is sound.
 
@@ -1249,9 +1259,14 @@ def allocation_gap(
     for t in targets:
         g = _g(str(t.get("exposure_group") or ""))
         by_group[g] = by_group.get(g, 0.0) + float(t.get("target_pct") or 0.0)
-    over_cap = [g for g, pct in by_group.items() if pct > max_position_pct + 0.01 and g]
-    # Fewest groups that could cover the invested share without breaching the per-group cap.
-    need = int(-(-investable // max_position_pct)) if max_position_pct > 0 else 0
+    # Per-group caps when the arm has them (the ETF arms' broad index groups carry a larger one).
+    _cap = cap_pct_of or (lambda _g: max_position_pct)
+    over_cap = [g for g, pct in by_group.items() if pct > _cap(g) + 0.01 and g]
+    # Fewest groups that could cover the invested share without breaching the per-group cap. With
+    # per-group caps this is a floor computed from the LARGEST cap a named group actually has, so a
+    # plan built on broad funds is not told it needs as many groups as one built on sectors.
+    widest = max([_cap(g) for g in by_group if g] or [max_position_pct])
+    need = int(-(-investable // widest)) if widest > 0 else 0
     if shortfall <= ALLOCATION_SLACK_PCT and not over_cap and len(targets) >= need:
         return None
     return {
@@ -1445,8 +1460,12 @@ def group_representative(
     group: str, *, positions: list[dict], price_of: Callable[[str], float | None],
     group_of: Callable[[str], str], preferred_btc_etf: str = "FBTC",
     preferred_gold_etf: str = "GLDM",
+    representatives: dict[str, tuple[str, ...]] | None = None,
 ) -> str | None:
     """The ticker to buy in order to express a target stated as an exposure GROUP.
+
+    `representatives` replaces GROUP_REPRESENTATIVE for an arm with its own group vocabulary (the
+    ETF arms, whose US_BONDS group has no ticker of that name to fall back on).
 
     Strategy notes name targets by group, not by ticker, so anything acting on a plan mechanically has
     to invert that map. Held-first matters most: buying SPLG to top up a US_EQUITY target already
@@ -1466,7 +1485,7 @@ def group_representative(
             c = (_pref or "").strip().upper()
             if c and price_of(c):
                 return c
-    for c in GROUP_REPRESENTATIVE.get(group, ()):
+    for c in (GROUP_REPRESENTATIVE if representatives is None else representatives).get(group, ()):
         if price_of(c):
             return c
     return group if price_of(group) else None
@@ -1475,6 +1494,7 @@ def group_representative(
 def rules_decision(
     blob: dict, *, plan: dict | None, group_of: Callable[[str], str],
     price_of: Callable[[str], float | None],
+    representatives: dict[str, tuple[str, ...]] | None = None,
 ) -> dict:
     """Fill toward the standing plan's targets. No model, no market opinion, no judgement.
 
@@ -1537,7 +1557,8 @@ def rules_decision(
         sym = group_representative(
             g, positions=positions, price_of=price_of, group_of=group_of,
             preferred_btc_etf=str(settings.get("preferred_btc_etf") or "FBTC"),
-            preferred_gold_etf=str(settings.get("preferred_gold_etf") or "GLDM"))
+            preferred_gold_etf=str(settings.get("preferred_gold_etf") or "GLDM"),
+            representatives=representatives)
         if not sym:
             continue
         px = price_of(sym) or 0.0
@@ -1576,6 +1597,10 @@ def rules_decision(
 # are different facts about the world. Logged identically, the gate's own failure rate becomes
 # unmeasurable — a month of broken feeds would read back as a month of bad tape, and the experiment
 # this setting exists to run would be scored against the wrong cause.
+# Why an ETF-only arm refused a buy. Fixed text, for the same GROUP BY reason as the gate strings.
+ALLOWED_BUYS_SKIP = "not on this arm's list of funds it may buy"
+PLAN_TARGET_SKIP = "exposure already at its plan target — more would overshoot the plan"
+
 GATE_SKIP_FAILED = "regime gate did not pass — standing aside from new risk (sells unaffected)"
 GATE_SKIP_UNKNOWN = ("regime gate could not be measured — standing aside from new risk "
                      "(sells unaffected)")
@@ -1663,6 +1688,9 @@ def validate_and_fill(
     liquidation: bool = False,
     extension_of: Callable[[str], float | None] | None = None,
     gate: dict | None = None,
+    cap_pct_of: Callable[[str], float] | None = None,
+    allowed_buys: frozenset[str] | None = None,
+    target_limit_of: Callable[[str], float | None] | None = None,
 ) -> tuple[dict, list[dict], list[dict]]:
     """Apply an analyst order list to the ledger under hard risk limits. Returns (new_blob, filled_rows,
     skipped_rows). Sells run before buys (free cash / cut exposure first). The blob is copied, not mutated
@@ -1676,7 +1704,23 @@ def validate_and_fill(
 
     `gate` is this tick's regime verdict, supplied by the caller (see gate_block_reason). It is
     consulted ONLY when this arm's settings have `gate_enabled` on, which no arm does by default —
-    handing a verdict to an ungated arm changes nothing about what it trades."""
+    handing a verdict to an ungated arm changes nothing about what it trades.
+
+    `cap_pct_of` maps an exposure group to its own cap (percent of equity). None = every group
+    uses `max_position_pct`, which is how every arm except the ETF arms runs. The ETF arms give broad
+    index groups a larger cap than sectors and themes — see app/etf_arm.py.
+
+    `allowed_buys` is the whole list of tickers this arm may BUY. None = no list. A buy of anything
+    else is refused with ALLOWED_BUYS_SKIP; sells are never restricted, since a position the arm
+    already holds must always be sellable. This is how an ETF-only arm stays ETF-only: the prompt
+    says so too, but a rule the ledger can check is enforced here rather than trusted to a prompt.
+
+    `target_limit_of` maps a group to the most of equity (percent) the PLAN lets it reach, or None
+    for no plan limit. A buy is cut to that room and refused with PLAN_TARGET_SKIP once the group is
+    there. The ETF arms need it because their broad cap is 60%: on the 2026-09-28 dry run the
+    analyst sized a buy for a 12% short-Treasury target at $4,237 — 38% of the book — and nothing
+    but the turnover cap stood in the way. A plan target is mechanically checkable, so it is
+    checked here rather than restated in a prompt."""
     now_ts = now_ts or time.time()
     b = {**blob, "positions": [dict(p) for p in blob.get("positions", [])]}
     s = {**b.get("settings", {})}
@@ -1913,6 +1957,8 @@ def validate_and_fill(
         sym = o["symbol"].upper()
         if exclude and (sym in exclude or sym.removesuffix("-USD") in exclude):
             _skip(o, "excluded ticker"); continue
+        if allowed_buys is not None and sym not in allowed_buys:
+            _skip(o, ALLOWED_BUYS_SKIP); continue
         if is_crypto(sym) and not allow_crypto:
             _skip(o, "direct spot crypto disabled (use the ETF)"); continue
         # A non "-USD" symbol whose exposure group is BTC/ETH is a spot-crypto ETF (IBIT/FBTC/FETH…).
@@ -1981,9 +2027,16 @@ def validate_and_fill(
                   if settles_into_a_share else "at cash floor")
             continue
         g = group_of(sym)
-        cap_room = max_pos_pct / 100.0 * equity - group_value.get(g, 0.0)
+        g_cap = float(cap_pct_of(g)) if cap_pct_of else max_pos_pct
+        cap_room = g_cap / 100.0 * equity - group_value.get(g, 0.0)
         if cap_room <= 0:
-            _skip(o, f"exposure '{g}' at {max_pos_pct:.0f}% cap"); continue
+            _skip(o, f"exposure '{g}' at {g_cap:.0f}% cap"); continue
+        plan_room = float("inf")
+        _lim = target_limit_of(g) if target_limit_of is not None else None
+        if _lim is not None:
+            plan_room = float(_lim) / 100.0 * equity - group_value.get(g, 0.0)
+            if plan_room <= 0:
+                _skip(o, PLAN_TARGET_SKIP); continue
         is_new = _find(positions, sym) is None
         if is_new and new_positions >= max_new:
             _skip(o, "max_new_positions_per_tick reached"); continue
@@ -2004,7 +2057,7 @@ def validate_and_fill(
                 want_dollars = want_shares * fill
             else:
                 _skip(o, "buy order specified neither dollars nor shares"); continue
-        headroom = min(available, cap_room, room)
+        headroom = min(available, cap_room, room, plan_room)
         spend = min(want_dollars, headroom)
         size_note: str | None = None
         if is_crypto(sym):
@@ -2057,6 +2110,8 @@ def validate_and_fill(
                        f"under one share at ${fill:,.2f}")
             elif cap_room == headroom:
                 why = f"exposure '{g}' cap left room for less than one share"
+            elif plan_room == headroom:
+                why = f"plan target for '{g}' left room for less than one share"
             else:
                 why = f"turnover cap ({turnover_pct:.0f}% of equity) left room for less than one share"
             _skip(o, why); continue

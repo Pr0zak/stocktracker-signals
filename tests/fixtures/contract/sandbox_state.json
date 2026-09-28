@@ -40,6 +40,7 @@
     "allow_etf": true,
     "avoid_wash_sales": true,
     "birth_date": null,
+    "broad_position_pct": 60.0,
     "cadence": "daily",
     "cash_apy_pct": 4.3,
     "cash_floor_pct": 10.0,
@@ -69,7 +70,8 @@
     "review_enabled": false,
     "risk_tolerance": "balanced",
     "slippage_bps": 5,
-    "taxable_account": true
+    "taxable_account": true,
+    "universe": "all"
   },
   "stale_marks": [],
   "total_return_pct": 20.0,
