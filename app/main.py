@@ -4035,6 +4035,9 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         # "rejects" arm further down. Never persisted: a rejected order is a statement about today's
         # decision, and carrying it forward would execute a trade nobody re-proposed.
         rejected_by_arm: dict[str, list[dict]] = {}
+        # Skip rows for orders the review model dropped on main. Logged with the tick's own fills
+        # below; `skipped` itself only exists once validate_and_fill has run.
+        main_review_skips: list[dict] = []
 
         flat = sandbox_job.exit_date_flatten_orders(blob, price_of)
         if flat is not None:
@@ -4146,7 +4149,12 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                         orders, dropped = sandbox_job.apply_review(orders, _v)
                         # Persisted whatever the outcome, so an APPROVED review is distinguishable
                         # from one that never ran. Both currently look like a tick with no rejection.
-                        new_blob["last_review"] = {
+                        # On `blob`, not `new_blob`: new_blob does not exist until validate_and_fill
+                        # below copies blob into it. Writing new_blob here raised NameError on every
+                        # tick where the review ran, AFTER apply_review had already dropped orders —
+                        # so the drops took effect, but no skip row, no last_review and a warning
+                        # saying the orders were NOT reviewed (seen 2026-09-28 and once before).
+                        blob["last_review"] = {
                             "date": sandbox_job.today_et_str(now), "approve": _v.get("approve", True),
                             "dropped": dropped, "concerns": _v.get("concerns") or [],
                             "note": _v.get("note") or "",
@@ -4158,7 +4166,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                             # A dropped order never reaches validate_and_fill, so nothing else would
                             # write it a row -- and a rejected order that leaves no trace is
                             # indistinguishable in the log from one that was never proposed.
-                            skipped.extend(sandbox_job.review_skip_rows(
+                            main_review_skips.extend(sandbox_job.review_skip_rows(
                                 _dropped_orders, _v, now_ts=time.time()))
                         if dropped:
                             warnings.append(
@@ -4232,6 +4240,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                 "candidates": sandbox_job.candidate_fingerprint(candidates),
             })
 
+        skipped = skipped + main_review_skips
         for r in filled + skipped:
             sandbox_store.append_trade(r)
         sandbox_store.append_nav(nav)
