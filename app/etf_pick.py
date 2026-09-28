@@ -161,7 +161,19 @@ def shortlist(build: dict | None, rows: dict[str, dict | None], *, pool: Iterabl
         scored.append({"symbol": sym, **s, "row": row, "fund": fund,
                        "penalty_reasons": [], "partial": False})
     scored.sort(key=lambda c: (-c["score"], c["symbol"]))
-    return {"ranked": scored[:max(1, int(limit))], "rejects": rejects, "scanned": scanned,
+    # One fund per group of funds that move together (etf_arm.ETF_GROUPS). The pool already holds one
+    # per INDEX, but XLF and FNCL are different indexes that move at 0.994, and on the first live run
+    # (2026-09-28) they took two of the eight slots — as did SCHA and SPSM. The best-scoring member
+    # of each group stays; the analyst chooses between different things, not copies.
+    seen: set[str] = set()
+    distinct: list[dict] = []
+    for c in scored:
+        g = etf_arm.group_of(c["symbol"])
+        if g in seen:
+            continue
+        seen.add(g)
+        distinct.append(c)
+    return {"ranked": distinct[:max(1, int(limit))], "rejects": rejects, "scanned": scanned,
             "eligible": len(scored)}
 
 

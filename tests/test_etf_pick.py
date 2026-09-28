@@ -109,3 +109,12 @@ def test_stock_and_etf_runs_never_share_a_log(monkeypatch):
     with pytest.raises(ValueError):
         st.runs(kind="bonds")
     monkeypatch.setenv("SIGNALS_DATA_DIR", str(Path(d)))
+
+
+def test_funds_that_move_together_take_one_slot():
+    """XLF and FNCL (0.994) took two of eight slots on the first live run."""
+    build = {"funds": [_fund("XLF", cat="sector"), _fund("FNCL", fee=0.084, cat="sector"), _fund("VTI")]}
+    on_sale = etf_pick.tech_row(_closes(), high_52w=110.0)
+    sl = etf_pick.shortlist(build, {s: on_sale for s in ("XLF", "FNCL", "VTI")}, pool=["XLF", "FNCL", "VTI"])
+    groups = [etf_pick.etf_arm.group_of(c["symbol"]) for c in sl["ranked"]]
+    assert len(groups) == len(set(groups)) == 2
