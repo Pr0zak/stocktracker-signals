@@ -8,13 +8,15 @@ import logging
 import math
 import copy
 import os
+import re
 import time
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
 from . import observability, redact, selfupdate, settings_store, usage_store
@@ -41,6 +43,7 @@ from .analyst import (
 from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
 from .news import earnings_on, fetch_context, fetch_dated_news, fetch_next_earnings
+from . import prices
 from . import etf_arm, etf_pick, fund_catalog, fund_cost, fund_overlap, macro, scan_job, sectors
 from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
@@ -125,6 +128,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="StockTracker Signals", version="0.2.0", lifespan=lifespan)
+# PX-1: a day of one-minute bars is ~40 KB of JSON and compresses about 8x; OkHttp inflates it.
+app.add_middleware(GZipMiddleware, minimum_size=2048)
 
 
 @app.middleware("http")
@@ -177,6 +182,9 @@ async def get_settings() -> dict:
         "anthropic_api_key_set": bool(key),
         "anthropic_api_key_hint": ("…" + key[-4:]) if len(key) >= 4 else ("set" if key else ""),
         "finnhub_api_key_set": bool(cfg.get("finnhub_api_key", "")),
+        "coingecko_api_key_set": bool(prices.coingecko_key()),
+        "coingecko_api_key_hint": ("…" + prices.coingecko_key()[-4:]) if len(prices.coingecko_key()) >= 4 else "",
+        "coingecko_status": prices.coingecko_status(),
         "deep_model": cfg["deep_model"],
         "scan_model": cfg["scan_model"],
         "llm_provider": cfg.get("llm_provider", "api"),
@@ -194,6 +202,8 @@ async def get_settings() -> dict:
 class SettingsPatch(BaseModel):
     anthropic_api_key: str | None = None
     finnhub_api_key: str | None = None
+    coingecko_api_key: str | None = None
+    clear_coingecko_api_key: bool | None = None
     deep_model: str | None = None
     scan_model: str | None = None
     llm_provider: str | None = None
@@ -1382,6 +1392,41 @@ async def news_moves_endpoint(symbol: str, deep: bool = False, refresh: bool = F
                "as_of": now, "usage": usage, "cached": False}
     _cache[key] = (now, payload)
     return payload
+
+
+@app.get("/prices/yahoo/{path:path}")
+async def prices_yahoo(path: str, request: Request) -> Response:
+    """PX-1 — Yahoo's own chart/search response, served from a short shared cache so the phone and
+    its widgets stop asking Yahoo one by one. Only `v8/finance/chart/{symbol}` and `v1/finance/search`
+    are forwarded. 502 means Yahoo could not be reached, and the app then asks it directly."""
+    if not prices.allowed(path):
+        raise HTTPException(status_code=404, detail="not a forwarded price path")
+    assert _http is not None
+    try:
+        status, body, cached = await prices.chart_passthrough(_http, path, request.url.query)
+    except prices.UpstreamError as e:
+        raise HTTPException(status_code=502, detail=f"yahoo unreachable: {redact.redact(e)}")
+    return Response(content=body, status_code=status, media_type="application/json",
+                    headers={"X-Price-Cache": "hit" if cached else "miss"})
+
+
+_COIN_RE = re.compile(r"^[a-z0-9\-]{1,64}:[A-Za-z0-9]{1,15}$")
+
+
+@app.get("/prices/crypto")
+async def prices_crypto(coins: str) -> dict:
+    """PX-1 — watchlist crypto rows. `coins` is `coingecko-id:SYMBOL` pairs, comma-separated
+    (`bitcoin:BTC,ethereum:ETH`). A coin no source could price is ABSENT from `rows`, never zero."""
+    pairs = []
+    for part in coins.split(",")[:50]:
+        part = part.strip()
+        if not _COIN_RE.match(part):
+            raise HTTPException(status_code=422, detail=f"bad coin '{part[:40]}'")
+        cid, sym = part.split(":", 1)
+        pairs.append((cid, sym.upper()))
+    assert _http is not None
+    rows = await prices.crypto_markets(_http, pairs)
+    return {"rows": rows, "as_of": time.time()}
 
 
 @app.get("/quality/{symbol}")

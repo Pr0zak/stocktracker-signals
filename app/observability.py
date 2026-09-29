@@ -507,8 +507,16 @@ async def _p_yahoo_chart(client: httpx.AsyncClient):
 
 
 async def _p_coingecko(client: httpx.AsyncClient):
-    r = await client.get("https://api.coingecko.com/api/v3/ping", timeout=_PROBE_TIMEOUT)
-    return (f"HTTP {r.status_code}", "ok" if r.status_code == 200 else "warn")
+    # A real price, not /ping: on 2026-09-29 /ping answered 200 all day while every price call from
+    # this network was refused with a 429, so the probe said "ok" over a dead source.
+    from . import prices
+    headers = {"x-cg-demo-api-key": prices.coingecko_key()} if prices.coingecko_key() else {}
+    r = await client.get("https://api.coingecko.com/api/v3/simple/price",
+                         params={"ids": "bitcoin", "vs_currencies": "usd"}, headers=headers,
+                         timeout=_PROBE_TIMEOUT)
+    if r.status_code == 200:
+        return (f"price ok · {prices.coingecko_status()}", "ok")
+    return (f"HTTP {r.status_code} — app crypto rows fall back to Yahoo", "warn")
 
 
 async def _p_finnhub(client: httpx.AsyncClient):

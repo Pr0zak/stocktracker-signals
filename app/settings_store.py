@@ -90,6 +90,9 @@ def _defaults() -> dict:
     return {
         "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
         "finnhub_api_key": os.environ.get("FINNHUB_API_KEY", ""),
+        # PX-1: a CoinGecko Demo key for /prices/crypto. Settable from the app; never returned by any
+        # endpoint, only whether it is set and its last four characters.
+        "coingecko_api_key": os.environ.get("COINGECKO_API_KEY", ""),
         "deep_model": os.environ.get("DEEP_MODEL", "claude-opus-4-8"),
         "scan_model": os.environ.get("SCAN_MODEL", "claude-haiku-4-5"),
         # Which LLM backend the analyst uses: "api" (Anthropic SDK, per-token billing) or "cli"
@@ -216,10 +219,14 @@ def update(patch: dict, *, client_id: str | None = None, replace: bool = False) 
     symbols removed, whether or not the guard applied — OPS-3 happened because that was silent."""
     global _source
     with _lock:
-        for k in ("anthropic_api_key", "finnhub_api_key", "deep_model", "scan_model", "cli_oauth_token"):
+        for k in ("anthropic_api_key", "finnhub_api_key", "coingecko_api_key", "deep_model", "scan_model",
+                  "cli_oauth_token"):
             v = patch.get(k)
             if v is not None and str(v).strip() != "":
                 _current[k] = str(v).strip()
+        # A blank field means "leave it" (above), so removing a key needs saying outright.
+        if patch.get("clear_coingecko_api_key"):
+            _current["coingecko_api_key"] = ""
         ttl = patch.get("verdict_ttl_seconds")
         if ttl is not None:
             _current["verdict_ttl_seconds"] = max(0, int(ttl))
