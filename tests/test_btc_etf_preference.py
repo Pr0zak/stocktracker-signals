@@ -72,12 +72,13 @@ def test_sells_are_never_rerouted():
 
 # --------------------------------------------------------------------------- don't fragment
 
-def test_adding_to_a_held_vehicle_is_left_alone():
-    """Splitting one exposure across two funds costs spread and leaves the cap logic two positions
-    where it expects one. The preference applies to NEW exposure."""
+def test_new_money_goes_to_the_preferred_fund_even_while_the_other_is_held():
+    """2026-09-29: consolidating onto the held fund locked every arm holding only the old fund into it
+    for good, since nothing ever sells one fund to buy its twin. The held fund stays; new money moves."""
     out, notes = prefer_btc_etf([_buy("IBIT")], preferred="FBTC",
                                 positions=[_pos("IBIT")], price_of=_px)
-    assert out[0]["symbol"] == "IBIT" and notes == []
+    assert out[0]["symbol"] == "FBTC"
+    assert notes and "preferred" in notes[0]
 
 
 def test_routing_resumes_once_the_preferred_fund_is_also_held():
@@ -175,12 +176,10 @@ def test_mixed_batch_routes_only_what_it_should():
 # proposing one leg instead of two.
 
 
-def test_ordering_the_preferred_fund_while_holding_the_other_does_not_open_a_second_position():
-    """The regression. Mirror of test_adding_to_a_held_vehicle_is_left_alone, which always passed."""
+def test_ordering_the_preferred_fund_while_holding_the_other_is_left_alone():
     out, notes = prefer_btc_etf([_buy("FBTC")], preferred="FBTC",
                                 positions=[_pos("IBIT")], price_of=_px)
-    assert out[0]["symbol"] == "IBIT", "new money must join the vehicle already held"
-    assert notes, "a symbol rewrite that the log does not mention is a silent rewrite"
+    assert out[0]["symbol"] == "FBTC" and notes == []
 
 
 def test_the_two_orderings_of_the_same_decision_agree():
@@ -199,23 +198,30 @@ def test_the_reroute_says_which_rule_moved_it():
     assert to_pref[0]["symbol"] == "FBTC"
     assert "preferred" in n1[0]
 
-    to_held, n2 = prefer_btc_etf([_buy("FBTC")], preferred="FBTC", positions=[_pos("IBIT")], price_of=_px)
+    to_held, n2 = prefer_btc_etf([_buy("FBTC")], preferred="", positions=[_pos("IBIT")], price_of=_px)
     assert to_held[0]["symbol"] == "IBIT"
     assert "already holding" in n2[0]
 
 
-def test_consolidation_outranks_the_preference_but_only_while_the_incumbent_is_open():
-    """Closing the old vehicle is what lets the preference take effect — no sale is ever forced."""
-    out, _ = prefer_btc_etf([_buy("FBTC")], preferred="FBTC",
+def test_a_closed_incumbent_is_not_a_consolidation_target():
+    """With no preference set, only an OPEN position attracts new money."""
+    out, _ = prefer_btc_etf([_buy("FBTC")], preferred="",
                             positions=[_pos("IBIT", shares=0.0)], price_of=_px)
     assert out[0]["symbol"] == "FBTC"
 
 
 def test_an_unfillable_incumbent_leaves_the_order_alone_rather_than_guaranteeing_a_skip():
-    """Same rule the preference path already had: never reroute onto something with no price."""
-    out, notes = prefer_btc_etf([_buy("FBTC")], preferred="FBTC", positions=[_pos("IBIT")],
+    """Never reroute onto something with no price — here the consolidation target."""
+    out, notes = prefer_btc_etf([_buy("FBTC")], preferred="", positions=[_pos("IBIT")],
                                 price_of=lambda s: None if s == "IBIT" else 55.0)
     assert out[0]["symbol"] == "FBTC" and notes == []
+
+
+def test_an_unpriced_preference_leaves_the_order_on_the_fund_it_named():
+    """The preference wins only when it can fill; otherwise the buy stays where the model put it."""
+    out, notes = prefer_btc_etf([_buy("IBIT")], preferred="FBTC", positions=[_pos("IBIT")],
+                                price_of=lambda s: None if s == "FBTC" else 36.7)
+    assert out[0]["symbol"] == "IBIT" and notes == []
 
 
 def test_the_consolidate_rule_applies_even_with_no_preference_set():
@@ -229,7 +235,7 @@ def test_dollar_sizing_survives_a_consolidating_reroute():
     """The two funds trade at very different share prices, so a shares count carried across would buy
     the wrong notional — the same arithmetic the preference path documents."""
     out, _ = prefer_btc_etf([{"symbol": "FBTC", "side": "buy", "shares": 4.0, "reason": "add"}],
-                            preferred="FBTC", positions=[_pos("IBIT")], price_of=_px)
+                            preferred="", positions=[_pos("IBIT")], price_of=_px)
     assert out[0]["symbol"] == "IBIT"
     assert "shares" not in out[0], "a raw share count would buy the wrong notional in the other fund"
     assert out[0]["dollars"] == round(4.0 * _px("FBTC"), 2)
@@ -285,7 +291,7 @@ def test_excluding_the_whole_family_leaves_every_order_untouched():
 
 def test_consolidation_still_applies_to_tickers_that_are_not_excluded():
     """The exclusion must not switch the rule off wholesale — an unrelated exclusion changes nothing."""
-    out, _ = prefer_btc_etf([_buy("FBTC")], preferred="FBTC", positions=[_pos("IBIT")],
+    out, _ = prefer_btc_etf([_buy("FBTC")], preferred="", positions=[_pos("IBIT")],
                             price_of=_px, exclude={"TSLA"})
     assert out[0]["symbol"] == "IBIT"
 

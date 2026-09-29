@@ -50,14 +50,14 @@ def test_the_notional_survives_the_share_price_difference():
     assert "shares" not in out[0]
 
 
-def test_an_add_to_an_existing_gld_position_is_left_alone():
-    """Consolidate, don't fragment — and the case that matters, because every arm holds GLD today.
-    Routing this would leave two positions where the cap logic expects one, and the preference is
-    about new exposure rather than about the gold already owned."""
+def test_an_add_to_an_existing_gld_position_goes_to_gldm():
+    """The case that matters: on 2026-09-29 four arms held only GLD, and consolidating onto it meant
+    every gold dollar they added paid 0.40% a year instead of 0.10%, with no end, because the sandbox
+    never sells GLD to buy GLDM. The GLD stays; new gold money goes to the cheaper fund."""
     out, notes = prefer_gold_etf([_buy("GLD")], preferred="GLDM",
                                  positions=[_pos("GLD")], price_of=_px)
-    assert out[0]["symbol"] == "GLD"
-    assert notes == []
+    assert out[0]["symbol"] == "GLDM"
+    assert notes and "preferred" in notes[0]
 
 
 def test_a_sell_is_never_rerouted():

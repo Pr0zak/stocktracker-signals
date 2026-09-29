@@ -773,7 +773,7 @@ def prefer_vehicle(
     orders: list[dict], *, preferred: str, positions: list[dict],
     price_of: Callable[[str], float | None],
     family: frozenset[str] = BTC_ETFS, label: str = "bitcoin ETF",
-    exclude: set[str] | None = None,
+    exclude: set[str] | None = None, preference_wins: bool = False,
 ) -> tuple[list[dict], list[str]]:
     """Redirect BUYs of one interchangeable vehicle onto the user's chosen one.
 
@@ -788,23 +788,28 @@ def prefer_vehicle(
 
     * **BUYS ONLY.** A sell is never redirected — you can only sell what you actually hold, and
       rewriting "sell IBIT" into "sell FBTC" would turn a valid exit into a "not held" skip.
-    * **Consolidate, don't fragment.** New money joins the vehicle the book ALREADY HOLDS, whichever
-      of the two the order happened to name. Splitting one exposure across two funds costs spread and
-      leaves two positions where the cap logic expects one; the preference governs NEW exposure only,
-      and takes effect naturally once the old vehicle is closed.
+    * **A user's chosen fund wins for new money** (`preference_wins=True`, which the bitcoin and gold
+      wrappers pass). Every
+      BUY lands on the preferred fund. The fund already held is kept and never sold, so a book holding
+      only the old vehicle simply becomes split, and the split shifts toward the cheaper fund with
+      every deposit — the same healing a book already split across both has always done. With NO
+      preference set, new money joins the vehicle already held, so the book at least stops fragmenting.
 
-      This rule used to run on one side only, and the hole is what it was written to prevent. The
-      early-out on `sym == pref` returned before the check, so with GLD held and GLDM preferred, an
-      order naming GLD consolidated onto GLD while an order naming GLDM opened a second gold position
-      — same book, same dollars, same preference, opposite outcome, decided by nothing but which
-      ticker the model wrote. On 2026-09-02 the baseline arm took that path: it bought $260 of GLDM
-      on a stated rationale of "replacing GLD (60bp fee savings)", never sold the GLD, and ended the
-      day holding both at a blended 0.347% — with gold up from 10.6% to 12.9% of equity rather than
-      flat. The model reached the outcome `intra_group_swaps` exists to refuse, by proposing one leg
-      instead of two.
+      Until 2026-09-29 consolidation outranked the preference. It was written after 2026-09-02, when
+      the baseline arm bought $260 of GLDM "replacing GLD", never sold the GLD, and took gold from
+      10.6% to 12.9% of equity. But the harm there was the overweight, which the gold target and the
+      reviewer now refuse on their own, not the second position: nothing in the sandbox caps the number
+      of positions, and both funds count toward one exposure group. What consolidation actually did
+      was lock every arm that held only GLD into it for good — the sandbox never sells one fund to buy
+      its twin, so the GLD position never closed and the GLDM preference never took effect. On
+      2026-09-29 four arms held only GLD, and every gold dollar they added paid 0.40% a year instead of
+      0.10%.
 
-      A book that is ALREADY split across both vehicles keeps its existing behaviour: new money goes
-      to the PREFERRED one, so the split heals over time without anyone having to sell anything.
+      **Otherwise consolidation outranks the preference** (`preference_wins=False`, the default). The
+      ETF-only arms pass the day's cheapest copy of an index as the preference; that can change from
+      one day to the next over a basis point, and letting it win would scatter one index across every
+      copy of it. There, new money joins the copy already held.
+
     * **Only to something fillable.** If the preferred ETF has no price this tick it cannot fill, so
       the order is left as-is rather than converted into a guaranteed skip.
     * **Say so.** Every substitution returns a note, which lands in the trade log — a silent symbol
@@ -834,7 +839,7 @@ def prefer_vehicle(
         if side != "buy" or sym not in family:
             out.append(o)
             continue
-        target = _vehicle_target(sym, held_family=held_family, pref=pref)
+        target = _vehicle_target(sym, held_family=held_family, pref=pref, preference_wins=preference_wins)
         if target in banned:
             target = sym   # nothing left to route onto; leave the order to the exclusion check
         if not target or target == sym:
@@ -868,7 +873,8 @@ def prefer_vehicle(
         sub["dollars"] = round(dollars, 2)
         # Two different reasons to reroute, and the log must not call one the other: honouring the
         # preference on new exposure, versus adding to the vehicle already held.
-        why = f"preferred {label}" if target == pref and not held_family else f"already holding {target}"
+        why = (f"preferred {label}" if target == pref and (preference_wins or not held_family)
+               else f"already holding {target}")
         reason = str(o.get("reason") or "").strip()
         sub["reason"] = (reason + f" [routed {sym}→{target}: {why}]").strip()
         out.append(sub)
@@ -876,31 +882,22 @@ def prefer_vehicle(
     return out, notes
 
 
-def _vehicle_target(sym: str, *, held_family: frozenset[str], pref: str) -> str:
+def _vehicle_target(sym: str, *, held_family: frozenset[str], pref: str, preference_wins: bool) -> str:
     """Which member of an interchangeable family a BUY of `sym` should actually land on.
 
-    Consolidation outranks preference, because a preference costs basis points a year and a second
-    position in the same exposure costs a spread now and confuses every cap that counts positions.
-
-    * Holding the preferred vehicle: everything lands there. A book already split across two funds
-      heals toward the preference this way, with no sale and no realised gain.
-    * Holding one vehicle that is not the preferred one: new money joins it, whichever of the family
-      the order named. Ordering the incumbent already did this; ordering the OTHER one is the case the
-      `sym == pref` early-out used to skip, and is how a second position got opened.
-    * Holding several, none preferred: the tie-break is alphabetical — arbitrary but stable, so a book
-      fragmented three ways at least stops fragmenting further.
-    * Holding none of the family: the preference governs, which is the one place it was ever meant to.
+    * A user-chosen preference (`preference_wins`): it, always. Whatever is already held stays held
+      and is never sold; new money going to the cheaper fund is how the book moves onto it without
+      realising a gain. (The caller leaves the order alone if that fund has no price this tick.)
+    * Otherwise, holding the preferred vehicle: it. A book split across copies heals toward it.
+    * Otherwise, holding other members: join the one the order named if it is held, else the
+      alphabetically first held one — arbitrary but stable, so the book stops fragmenting.
+    * Holding none of the family: the preference if there is one, else the fund the order named.
     """
+    if pref and (preference_wins or pref in held_family):
+        return pref
     if held_family:
-        # Already fragmented across both? Feed the PREFERENCE, so the split heals over time without
-        # anyone having to sell anything. This ordering is deliberate and predates the fix: it is why
-        # holding IBIT and FBTC routes a new IBIT order onto FBTC.
-        if pref in held_family:
-            return pref
         if sym in held_family:
             return sym
-        # Ordering a family member the book does not hold while holding another. This is the case the
-        # early-out used to skip whenever the ordered symbol happened to be the preferred one.
         return sorted(held_family)[0]
     return pref or sym
 
@@ -911,6 +908,7 @@ def prefer_btc_etf(
 ) -> tuple[list[dict], list[str]]:
     """Spot-bitcoin vehicles. See prefer_vehicle for the rules."""
     return prefer_vehicle(orders, preferred=preferred, positions=positions, price_of=price_of,
+                          preference_wins=True,
                           family=BTC_ETFS, label="bitcoin ETF", exclude=exclude)
 
 
@@ -920,11 +918,12 @@ def prefer_gold_etf(
 ) -> tuple[list[dict], list[str]]:
     """Gold-bullion vehicles. See prefer_vehicle for the rules.
 
-    The "consolidate, don't fragment" rule carries real weight here: every arm currently holds GLD,
-    so a preference for GLDM changes nothing today. It takes effect on NEW gold exposure, which is
-    the only place a fee comparison belongs -- selling GLD to buy GLDM would realise a gain to save
-    0.30% a year, which is the 2026-08-06 SPY->VTI trade wearing a different ticker."""
+    New gold money goes to the preferred fund even in an arm that holds only GLD — until 2026-09-29
+    it joined the GLD instead, which kept four arms on the 0.40% fund for good. The GLD already held
+    is never sold to switch: that would realise a gain to save 0.30% a year, the 2026-08-06 SPY->VTI
+    trade wearing a different ticker. New money moving is how the book gets there without a sale."""
     return prefer_vehicle(orders, preferred=preferred, positions=positions, price_of=price_of,
+                          preference_wins=True,
                           family=GOLD_ETFS, label="gold ETF", exclude=exclude)
 
 
