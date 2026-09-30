@@ -574,6 +574,39 @@ async def market_overview(snapshot: dict, *, deep: bool = False) -> tuple[Market
 
 
 # ======================================================================================
+# ABOUT-1 — a company in plain English, written once per company from its own description.
+# ======================================================================================
+
+class PlainProfile(BaseModel):
+    what_it_does: str   # one sentence, under ~18 words, no jargon
+    customers: str      # who buys it, under ~14 words; "" when the description does not say
+
+
+PLAIN_PROFILE_SYSTEM = """You explain what a public company does to a retail investor who has never \
+heard of it and does not know industry jargon. You receive the company's name, its sector and \
+industry labels, and its official business description.
+
+Return:
+- what_it_does: ONE sentence, under 18 words, saying what the company makes or does, in words a \
+teenager would understand. Name the product, not the category ("makes power modules that turn \
+electricity into the voltage chips need", not "provides power conversion solutions"). No company \
+name at the start, no hype, no adjectives like "leading" or "innovative".
+- customers: under 14 words naming who buys it, taken from the description (e.g. "Aircraft, defense, \
+satellite and factory equipment makers"). Empty string if the description does not say.
+
+Use ONLY what the description states. Do not add markets, products, customers, trends or news that \
+are not in it, even if you believe them to be true. Plain text, no markdown."""
+
+
+async def plain_profile(name: str, sector: str | None, industry: str | None,
+                        summary: str) -> tuple[PlainProfile, dict]:
+    """ABOUT-1: the About tab's plain-English line. Cheap scan model, one call per company, cached by
+    the caller against the description it was written from."""
+    prompt = json.dumps({"name": name, "sector": sector, "industry": industry, "description": summary})
+    return await _parse(PLAIN_PROFILE_SYSTEM, prompt, PlainProfile, deep=False, max_tokens=400)
+
+
+# ======================================================================================
 # AI daily brief (AIE-3) — a once-a-morning push: the tape, the user's names on the move, and any
 # catalyst landing today, compressed into a notification title + a couple of sentences.
 # ======================================================================================

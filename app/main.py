@@ -43,7 +43,7 @@ from .analyst import (
 from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
 from .news import earnings_on, fetch_context, fetch_dated_news, fetch_next_earnings
-from . import prices, sandbox_today
+from . import analyst, prices, profile, sandbox_today
 from . import etf_arm, etf_pick, fund_catalog, fund_cost, fund_overlap, macro, scan_job, sectors
 from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
@@ -1427,6 +1427,39 @@ async def prices_crypto(coins: str) -> dict:
     assert _http is not None
     rows = await prices.crypto_markets(_http, pairs)
     return {"rows": rows, "as_of": time.time()}
+
+
+@app.get("/profile/{symbol}")
+async def profile_endpoint(symbol: str, plain: bool = False) -> dict:
+    """ABOUT-1 — what the company is: sector, industry, its own description, staff, headquarters,
+    and the key figures a person weighs first. `plain=true` adds a plain-English line written once
+    per company by the scan model (the app asks only when its AI switch is on); a failed write is
+    reported as `plain_error`, and the facts are returned regardless. 404 = no such symbol."""
+    assert _http is not None
+    sym = symbol.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9.\-^=]{1,15}", sym):
+        raise HTTPException(status_code=422, detail="bad symbol")
+    try:
+        prof = await profile.facts(_http, sym)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"profile unavailable: {redact.redact(e)}")
+    if prof is None:
+        raise HTTPException(status_code=404, detail="no profile for this symbol")
+    out = dict(prof)
+    out.update({"what_it_does": None, "customers": None, "plain_error": None})
+    row = profile.cached_plain(sym, prof.get("summary"))
+    if row is None and plain and prof.get("summary"):
+        try:
+            p, usage = await analyst.plain_profile(prof.get("name") or sym, prof.get("sector"),
+                                                   prof.get("industry"), prof["summary"])
+            usage_store.record(usage, symbol=sym, kind="profile")
+            row = profile.store_plain(sym, prof.get("summary"), p.what_it_does, p.customers)
+        except Exception as e:  # noqa: BLE001 — the facts still stand without the plain line
+            out["plain_error"] = redact.redact(e)
+    if row:
+        out["what_it_does"] = row.get("what_it_does") or None
+        out["customers"] = row.get("customers") or None
+    return out
 
 
 @app.get("/quality/{symbol}")
