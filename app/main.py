@@ -43,7 +43,7 @@ from .analyst import (
 from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
 from .news import earnings_on, fetch_context, fetch_dated_news, fetch_next_earnings
-from . import prices
+from . import prices, sandbox_today
 from . import etf_arm, etf_pick, fund_catalog, fund_cost, fund_overlap, macro, scan_job, sectors
 from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
@@ -4558,6 +4558,24 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
 @app.get("/sandbox/nav", dependencies=[Depends(require_api_token)])
 async def sandbox_nav_endpoint(days: int = 120, arm: str = sandbox_store.MAIN_ARM) -> dict:
     return {"series": sandbox_store.read_nav(days, _arm_or_400(arm))}
+
+
+@app.get("/sandbox/today", dependencies=[Depends(require_api_token)])
+async def sandbox_today_endpoint() -> dict:
+    """TODAY-1 — every arm's most recent run in one answer: what each bought, sold and skipped, and
+    which arms held or did not run at all. Behind the token because it discloses the paper books."""
+    arms, trades, ran_at = [], {}, {}
+    for a in sandbox_store.list_arms():
+        b = sandbox_store.get(a)
+        day = b.get("last_tick_date")
+        arms.append({"arm": a, "label": b.get("label") or a, "engine": b.get("engine", "llm"),
+                     "universe": (b.get("settings") or {}).get("universe") or etf_arm.UNIVERSE_ALL,
+                     "enabled": bool((b.get("settings") or {}).get("master_enabled")), "last_tick_date": day,
+                     "last_posture": b.get("last_posture") or ""})
+        trades[a] = sandbox_store.read_trades(200, a)
+        nav = [r for r in sandbox_store.read_nav(10, a) if str(r.get("date")) == str(day)]
+        ran_at[a] = float(nav[-1]["ts"]) if nav and nav[-1].get("ts") else None
+    return sandbox_today.summarize(arms, trades, ran_at)
 
 
 @app.get("/sandbox/trades", dependencies=[Depends(require_api_token)])
