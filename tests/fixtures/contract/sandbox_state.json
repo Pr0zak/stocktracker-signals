@@ -38,6 +38,7 @@
     "allow_crypto": false,
     "allow_crypto_etf": true,
     "allow_etf": true,
+    "allow_sells": true,
     "avoid_wash_sales": true,
     "birth_date": null,
     "broad_position_pct": 60.0,
@@ -48,6 +49,7 @@
     "deposit_frequency": "monthly",
     "exclusions": [],
     "exit_date": null,
+    "funding_mode": "cash",
     "gate_enabled": false,
     "goal_amount": null,
     "goal_date": null,
@@ -69,6 +71,7 @@
     "retirement_date": null,
     "review_enabled": false,
     "risk_tolerance": "balanced",
+    "single_share": false,
     "slippage_bps": 5,
     "taxable_account": true,
     "universe": "all"

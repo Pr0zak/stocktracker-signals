@@ -208,6 +208,12 @@ DEFAULT_SETTINGS = {
     # arm should use unless the BACKBONE is the thing being compared — an arm that pins a model and
     # also changes a limit has two variables and measures neither.
     "model": None,
+    # Single-share accumulator mode: buys exactly 1 share of 1 stock/ETF per trading day, no spending limit
+    "single_share": False,
+    # Funding mode: "cash" (standard pool) or "jit" (Just-In-Time funding on buy, 0% cash drag)
+    "funding_mode": "cash",
+    # When False, sells are prohibited (pure buy-and-hold accumulation)
+    "allow_sells": True,
 }
 
 
@@ -470,3 +476,35 @@ def delete_arm(arm: str) -> None:
         _cache.pop(arm, None)
         if d.is_dir():
             shutil.rmtree(d)
+
+
+def ensure_single_share_arms() -> None:
+    """Ensure the two comparison single-share arms exist."""
+    existing = set(list_arms())
+    if "oneshare" not in existing:
+        try:
+            create_arm("oneshare", engine="llm", label="One Share Daily (Analyst)", settings={
+                "single_share": True,
+                "funding_mode": "jit",
+                "allow_sells": False,
+                "max_position_pct": 100.0,
+                "cash_floor_pct": 0.0,
+                "max_trades_per_tick": 1,
+                "master_enabled": True,
+            })
+        except ArmError:
+            pass
+    if "oneshare-rules" not in existing:
+        try:
+            create_arm("oneshare-rules", engine="rules", label="One Share Daily (Rules)", settings={
+                "single_share": True,
+                "funding_mode": "jit",
+                "allow_sells": False,
+                "max_position_pct": 100.0,
+                "cash_floor_pct": 0.0,
+                "max_trades_per_tick": 1,
+                "master_enabled": True,
+            })
+        except ArmError:
+            pass
+

@@ -1700,6 +1700,14 @@ a warning.
 - Index funds rarely have a thesis that breaks. Sell only for the reasons above (usually reason 3, \
 the plan dropped the group), never because a broad fund had a bad week."""
 
+SINGLE_SHARE_DAILY_NOTE = """ARM INSTRUCTION: SINGLE-SHARE DAILY ACCUMULATOR
+- You operate a mechanical dollar-cost-averaging accumulation portfolio.
+- Rule 1: Propose AT MOST ONE (1) buy order for EXACTLY 1 share (shares=1.0).
+- Rule 2: DO NOT propose any sell orders (pure buy-and-hold accumulation).
+- Rule 3: Pick your single highest-conviction ticker for long-term compounding from the candidates.
+- Rule 4: There are NO position caps, NO cash floor, and Just-In-Time funding covers your purchase. Focus entirely on picking the best asset."""
+
+
 
 # ======================================================================================
 # DP-2 — the Daily Pick. One buy candidate out of a mechanically ranked shortlist, or none.

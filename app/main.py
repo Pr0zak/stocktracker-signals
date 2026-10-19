@@ -39,6 +39,7 @@ from .analyst import (
     ETF_DAILY_NOTE,
     ETF_REVIEW_NOTE,
     ETF_STRATEGY_NOTE,
+    SINGLE_SHARE_DAILY_NOTE,
 )
 from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
@@ -118,6 +119,10 @@ async def lifespan(app: FastAPI):
         memory.seed_research()  # idempotent by slug; safe on every restart
     except Exception:  # noqa: BLE001 — memory must never block startup
         _log.warning("memory: seeding skipped", exc_info=True)
+    try:
+        sandbox_store.ensure_single_share_arms()
+    except Exception:  # noqa: BLE001
+        _log.warning("sandbox: ensuring single share arms skipped", exc_info=True)
     # FUND-8: measure the Explore catalogue in the background, so its first visitor does not wait.
     warm = asyncio.create_task(fund_catalog.warm(_http, saved=_EXPENSE_RATIO_PCT, saved_as_of=_EXPENSE_RATIO_AS_OF))
     try:
@@ -3646,10 +3651,21 @@ async def _run_extra_arm(
     if flat is not None:
         orders, source, posture = flat, "exit_date", "Exit date reached — flattening to cash."
     elif engine == "rules":
-        d = sandbox_job.rules_decision(
-            blob, plan=plan, group_of=gof, price_of=price_of,
-            representatives=etf_arm.REPRESENTATIVES if etf else None)
-        orders, source, posture = d["orders"], "rules_tick", d["posture"]
+        if settings.get("single_share"):
+            arm_candidates = sandbox_job.candidates_for_arm(
+                candidates, held_rows or [],
+                held=[p["symbol"] for p in blob["positions"]], exclusions=exclude)
+            d = sandbox_job.single_share_rules_pick(
+                arm_candidates,
+                held=[p["symbol"] for p in blob["positions"]],
+                exclude=exclude,
+                price_of=price_of)
+            orders, source, posture = d["orders"], "rules_tick", d["posture"]
+        else:
+            d = sandbox_job.rules_decision(
+                blob, plan=plan, group_of=gof, price_of=price_of,
+                representatives=etf_arm.REPRESENTATIVES if etf else None)
+            orders, source, posture = d["orders"], "rules_tick", d["posture"]
     elif engine == "rejects":
         # The review model's control group. Takes exactly what the reviewer refused on its source
         # arm, so the two books differ by the review verdict and nothing else. No model call: the
@@ -3741,7 +3757,8 @@ async def _run_extra_arm(
                 wash_sale_windows=sandbox_job.wash_sale_windows(
                     blob.get("recent_loss_sales"), now_ts=time.time(),
                     enabled=bool(settings.get("avoid_wash_sales", True))),
-                extra_system=ETF_DAILY_NOTE if etf else None, extra_payload=_extra_payload)
+                extra_system=SINGLE_SHARE_DAILY_NOTE if settings.get("single_share") else (ETF_DAILY_NOTE if etf else None),
+                extra_payload=_extra_payload)
             usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
             _arm_orders = [o.model_dump() for o in decision.orders]
             # Review on the arm path too. This was implemented on main only, so review_enabled on an
@@ -3779,6 +3796,14 @@ async def _run_extra_arm(
                     _arm_orders = kept
                 except Exception as e:  # noqa: BLE001
                     warnings.append(f"review model unavailable, orders NOT reviewed: {e}")
+            if settings.get("single_share"):
+                _arm_orders = [o for o in _arm_orders if str(o.get("side", "")).lower() == "buy"]
+                if len(_arm_orders) > 1:
+                    _arm_orders.sort(key=lambda o: -int(o.get("conviction") or 0))
+                    _arm_orders = _arm_orders[:1]
+                if _arm_orders:
+                    _arm_orders[0]["shares"] = 1.0
+                    _arm_orders[0].pop("dollars", None)
             # _arm_orders, not decision.orders: the reviewed list is the one that trades. Reading
             # decision.orders here would run the review, log its verdict, and then send the original
             # orders anyway -- the most expensive possible way to change nothing.
@@ -3797,6 +3822,27 @@ async def _run_extra_arm(
             orders, positions=blob["positions"], fees=etf_fees, price_of=price_of, exclude=exclude)
         if _routed:
             _log.info("sandbox arm %s: routed %s", arm, "; ".join(_routed))
+
+    funding_mode = str(settings.get("funding_mode", "cash")).lower()
+    if funding_mode == "jit" and orders and source != "exit_date":
+        _jit_buy = next((o for o in orders if str(o.get("side", "")).lower() == "buy"), None)
+        if _jit_buy:
+            _sym = _jit_buy["symbol"].upper()
+            _px = price_of(_sym)
+            if _px and _px > 0:
+                _slip = float(settings.get("slippage_bps", 5)) / 10_000.0
+                _fill_est = round(_px * (1 + _slip), 2)
+                _cash_now = float(blob.get("cash", 0.0))
+                _needed = round(_fill_est - _cash_now, 2)
+                if _needed > 0:
+                    if spy_price and spy_price > 0:
+                        _jit_trade = sandbox_job.apply_jit_deposit(
+                            blob, amount=_needed, spy_price=spy_price, symbol=_sym, now=now
+                        )
+                        sandbox_store.append_trade(_jit_trade, arm)
+                    else:
+                        warnings.append("JIT funding deferred — no benchmark quote (^GSPC)")
+
     try:
         new_blob, filled, skipped = sandbox_job.validate_and_fill(
             blob, orders, price_of, source=source, exclude=exclude,
@@ -4656,6 +4702,7 @@ async def sandbox_arms_endpoint() -> dict:
         out.append({
             "arm": a, "label": b.get("label") or a, "engine": b.get("engine", "llm"),
             "universe": (b.get("settings") or {}).get("universe") or etf_arm.UNIVERSE_ALL,
+            "single_share": bool((b.get("settings") or {}).get("single_share", False)),
             "enabled": bool((b.get("settings") or {}).get("master_enabled")),
             "cash": cash, "equity": equity, "positions_value": round(pv, 2),
             "funded_total": round(funded, 2), "positions": len(b.get("positions") or []),

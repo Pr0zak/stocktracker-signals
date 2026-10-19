@@ -1161,6 +1161,31 @@ def apply_recurring_deposit(
     }
 
 
+def apply_jit_deposit(
+    blob: dict, *, amount: float, spy_price: float, symbol: str,
+    now: dt.datetime | None = None, ts: float | None = None,
+) -> dict:
+    """Credit Just-in-Time funding to `blob` and return the trade row the caller must append.
+
+    Deposits exact cash needed to purchase 1 share of `symbol`, mirroring the same dollars
+    into the S&P 500 benchmark shadow at today's spy_price to maintain 0% cash drag.
+    """
+    amount = round(amount, 2)
+    blob.setdefault("benchmark", {"symbol": "^GSPC", "shares": 0.0, "cost_basis": 0.0})
+    if spy_price and spy_price > 0:
+        blob["benchmark"]["shares"] = round(float(blob["benchmark"].get("shares", 0.0)) + amount / spy_price, 6)
+        blob["benchmark"]["cost_basis"] = round(float(blob["benchmark"].get("cost_basis", 0.0)) + amount, 2)
+    blob["cash"] = round(float(blob.get("cash", 0.0)) + amount, 2)
+    blob["funded_total"] = round(float(blob.get("funded_total", 0.0)) + amount, 2)
+    return {
+        "ts": ts if ts is not None else time.time(),
+        "date": today_et_str(now), "symbol": "CASH", "side": "deposit", "status": "filled",
+        "shares": 0.0, "price": None, "gross": amount, "cash_after": blob["cash"],
+        "source": "jit_funding", "reason": f"Just-In-Time funding for 1 share of {symbol}",
+    }
+
+
+
 def monthly_deposit_total(settings: dict) -> float:
     """What the recurring deposit adds per month, across however many instalments it is paid in."""
     amount = float((settings or {}).get("monthly_deposit") or 0.0)
@@ -1585,6 +1610,71 @@ def rules_decision(
             "orders": orders}
 
 
+def single_share_rules_pick(
+    candidates: list[dict],
+    *,
+    held: Iterable[str] = (),
+    exclude: set[str] | None = None,
+    price_of: Callable[[str], float | None],
+) -> dict:
+    """Select the #1 technical candidate for a mechanical single-share buy.
+
+    Scores candidates by technical health:
+    - 3-month relative strength vs benchmark (+0.5 per 1%)
+    - Golden cross (+15)
+    - Price above SMA50 (+10)
+    - Constructive RSI 40-65 (+10); overbought penalty for RSI > 75 (-15)
+    - Positive MACD histogram (+5)
+    """
+    exclude = exclude or set()
+    scored = []
+    for c in candidates:
+        sym = (c.get("symbol") or "").upper()
+        if not sym or sym in exclude or sym.removesuffix("-USD") in exclude:
+            continue
+        px = price_of(sym) or c.get("price")
+        if not px or px <= 0:
+            continue
+        tech = c.get("technicals") or {}
+        rs = float(tech.get("rel_strength_3mo_vs_benchmark") or 0.0)
+        gc = bool(tech.get("golden_cross"))
+        sma50_pct = float(tech.get("pct_vs_sma50") or 0.0)
+        rsi = float(tech.get("rsi14") or 50.0)
+        macd = float(tech.get("macd_hist") or 0.0)
+
+        score = rs * 0.5
+        if gc:
+            score += 15.0
+        if sma50_pct > 0:
+            score += 10.0
+        if 40.0 <= rsi <= 65.0:
+            score += 10.0
+        elif rsi > 75.0:
+            score -= 15.0
+        if macd > 0:
+            score += 5.0
+
+        scored.append((score, sym, px, c))
+
+    if not scored:
+        return {"orders": [], "posture": "No candidate cleared the technical screen today — held."}
+
+    scored.sort(key=lambda x: -x[0])
+    best_score, best_sym, best_px, best_cand = scored[0]
+    conviction = int(min(95, max(60, 50.0 + best_score)))
+    order = {
+        "symbol": best_sym,
+        "side": "buy",
+        "shares": 1.0,
+        "conviction": conviction,
+        "reason": f"Top technical score ({best_score:.1f}) across market screen",
+    }
+    return {
+        "orders": [order],
+        "posture": f"Mechanical 1-share buy: 1 share of {best_sym} at ~${best_px:.2f} (score {best_score:.1f}).",
+    }
+
+
 # ------------------------------------------------------------- regime gate (opt-in, per arm)
 #
 # The two ways a gated arm refuses a buy, as they appear in the trade log and in
@@ -1738,7 +1828,9 @@ def validate_and_fill(
     cash_floor_pct = float(s.get("cash_floor_pct", 10.0))
     slip = float(s.get("slippage_bps", 5)) / 10_000.0
     min_conv = int(s.get("min_conviction_to_trade", 55))
-    max_trades = len(orders) + 1 if liquidation else int(s.get("max_trades_per_tick", 4))
+    single_share = bool(s.get("single_share", False))
+    allow_sells = bool(s.get("allow_sells", False if single_share else True))
+    max_trades = 1 if single_share else (len(orders) + 1 if liquidation else int(s.get("max_trades_per_tick", 4)))
     max_new = int(s.get("max_new_positions_per_tick", 2))
     allow_crypto = bool(s.get("allow_crypto", False))          # direct spot (BTC-USD)
     allow_crypto_etf = bool(s.get("allow_crypto_etf", True))   # spot-crypto ETFs (IBIT/FBTC/FETH)
@@ -1761,7 +1853,7 @@ def validate_and_fill(
     recent_loss_sales: dict[str, float] = {k.upper(): v for k, v in (blob.get("recent_loss_sales") or {}).items()}
     # Churn control: the max notional (buys+sells) allowed to change hands this tick, as a % of the
     # starting equity. 0 disables the cap. Computed off the pre-trade book so it's a stable budget.
-    turnover_pct = 0.0 if liquidation else float(s.get("max_turnover_pct", 0.0) or 0.0)
+    turnover_pct = 0.0 if (liquidation or single_share) else float(s.get("max_turnover_pct", 0.0) or 0.0)
     start_equity = cash0 + positions_value(positions, price_of)
     turnover_budget = (turnover_pct / 100.0 * start_equity) if turnover_pct > 0 else float("inf")
     traded_notional = 0.0
@@ -1840,6 +1932,10 @@ def validate_and_fill(
 
     sells = [o for o in orders if _side(o) == "sell"]
     buys = [o for o in orders if _side(o) == "buy"]
+    if not allow_sells and sells:
+        for o in sells:
+            _skip(o, "sells are disabled (pure buy-and-hold accumulation)")
+        sells = []
     # Anything else was previously dropped before any gate ran: no fill, no skip row, nothing in the
     # trade log or the blocked notes, and `orders_skipped` in the response didn't mention it either.
     # An order the model proposed and the ledger silently ate is the one case the audit trail must
@@ -1910,7 +2006,7 @@ def validate_and_fill(
     # Equity + per-group values are pinned AFTER sells so caps use one stable denominator for the tick.
     pv_after_sells = positions_value(positions, price_of)
     equity = round(cash + pv_after_sells, 2)
-    floor = cash_floor_pct / 100.0 * equity
+    floor = 0.0 if single_share else (cash_floor_pct / 100.0 * equity)
     # T+1: in a cash account today's sale proceeds are UNSETTLED and can't fund today's buys.
     # T+1 settlement, tracked ON THE LEDGER rather than scoped to this call.
     #
@@ -2026,18 +2122,22 @@ def validate_and_fill(
                   if settles_into_a_share else "at cash floor")
             continue
         g = group_of(sym)
-        g_cap = float(cap_pct_of(g)) if cap_pct_of else max_pos_pct
-        cap_room = g_cap / 100.0 * equity - group_value.get(g, 0.0)
-        if cap_room <= 0:
-            _skip(o, f"exposure '{g}' at {g_cap:.0f}% cap"); continue
-        plan_room = float("inf")
-        _lim = target_limit_of(g) if target_limit_of is not None else None
-        if _lim is not None:
-            plan_room = float(_lim) / 100.0 * equity - group_value.get(g, 0.0)
-            if plan_room <= 0:
-                _skip(o, PLAN_TARGET_SKIP); continue
+        if single_share:
+            cap_room = float("inf")
+            plan_room = float("inf")
+        else:
+            g_cap = float(cap_pct_of(g)) if cap_pct_of else max_pos_pct
+            cap_room = g_cap / 100.0 * equity - group_value.get(g, 0.0)
+            if cap_room <= 0:
+                _skip(o, f"exposure '{g}' at {g_cap:.0f}% cap"); continue
+            plan_room = float("inf")
+            _lim = target_limit_of(g) if target_limit_of is not None else None
+            if _lim is not None:
+                plan_room = float(_lim) / 100.0 * equity - group_value.get(g, 0.0)
+                if plan_room <= 0:
+                    _skip(o, PLAN_TARGET_SKIP); continue
         is_new = _find(positions, sym) is None
-        if is_new and new_positions >= max_new:
+        if is_new and new_positions >= max_new and not single_share:
             _skip(o, "max_new_positions_per_tick reached"); continue
         room = turnover_budget - traded_notional
         if room <= 0:
@@ -2047,33 +2147,41 @@ def validate_and_fill(
         # `dollars` as "spend everything not behind the cash floor" — the largest possible order
         # from the weakest possible instruction, and `shares` was never consulted on a buy at all.
         fill = px * (1 + slip)
-        want_dollars = float(o.get("dollars") or 0.0)
-        if want_dollars <= 0:
-            want_shares = float(o.get("shares") or 0.0)
-            if want_shares > 0:
-                # Budget at the FILL price, not the raw quote — costing 10 shares at `px` leaves
-                # slippage unfunded, so `spend / fill` lands just under 10 and floors to 9.
-                want_dollars = want_shares * fill
-            else:
-                _skip(o, "buy order specified neither dollars nor shares"); continue
-        headroom = min(available, cap_room, room, plan_room)
-        spend = min(want_dollars, headroom)
-        size_note: str | None = None
-        if is_crypto(sym):
-            shares = round_shares(sym, spend / fill)
+        if single_share:
+            shares = 1.0
+            spend = fill
+            size_note = "single-share accumulation: fixed 1.0 share"
+            if spend > available:
+                _skip(o, f"insufficient cash for 1 share (${fill:,.2f} > available ${available:,.2f})")
+                continue
         else:
-            # Rescue the last share — see ROUND_UP_MIN_SHARE. Rounding up is only ever safe when the
-            # UPSIZED cost still clears every limit, which is what `(shares + 1) * fill <= headroom`
-            # asserts; because `spend` collapses to `headroom` whenever a limit is the binding term,
-            # that test also fails automatically for any order a limit already cut. The rescue can
-            # therefore only fire when the analyst's own number was the constraint — the one case
-            # where honouring it cannot breach anything.
-            exact = spend / fill
-            shares = float(int(exact))
-            if exact - shares >= ROUND_UP_MIN_SHARE and (shares + 1) * fill <= headroom:
-                shares += 1
-                size_note = (f"analyst asked for {_usd(want_dollars)} ({exact:.3f} shares); "
-                             f"rounded up to {int(shares)} at ${fill:,.2f}")
+            want_dollars = float(o.get("dollars") or 0.0)
+            if want_dollars <= 0:
+                want_shares = float(o.get("shares") or 0.0)
+                if want_shares > 0:
+                    # Budget at the FILL price, not the raw quote — costing 10 shares at `px` leaves
+                    # slippage unfunded, so `spend / fill` lands just under 10 and floors to 9.
+                    want_dollars = want_shares * fill
+                else:
+                    _skip(o, "buy order specified neither dollars nor shares"); continue
+            headroom = min(available, cap_room, room, plan_room)
+            spend = min(want_dollars, headroom)
+            size_note: str | None = None
+            if is_crypto(sym):
+                shares = round_shares(sym, spend / fill)
+            else:
+                # Rescue the last share — see ROUND_UP_MIN_SHARE. Rounding up is only ever safe when the
+                # UPSIZED cost still clears every limit, which is what `(shares + 1) * fill <= headroom`
+                # asserts; because `spend` collapses to `headroom` whenever a limit is the binding term,
+                # that test also fails automatically for any order a limit already cut. The rescue can
+                # therefore only fire when the analyst's own number was the constraint — the one case
+                # where honouring it cannot breach anything.
+                exact = spend / fill
+                shares = float(int(exact))
+                if exact - shares >= ROUND_UP_MIN_SHARE and (shares + 1) * fill <= headroom:
+                    shares += 1
+                    size_note = (f"analyst asked for {_usd(want_dollars)} ({exact:.3f} shares); "
+                                 f"rounded up to {int(shares)} at ${fill:,.2f}")
         if shares <= 0:
             # Name the constraint that actually bound. "cash/cap/turnover" covered three unrelated
             # causes, so the blocked-trade log could not answer the one question it exists for —
