@@ -185,13 +185,18 @@ def test_a_case_citing_only_unmeasured_factors_is_no_pick():
     assert out["status"] == dp.STATUS_NONE
 
 
-def test_a_shut_gate_raises_the_floor_and_adds_itself_as_a_reason_against():
+def test_a_shut_gate_keeps_the_floor_and_adds_itself_as_a_reason_against():
+    """Until 2026-10-21 a shut gate raised the floor to 70. Over 42 live runs the gate never opened
+    and the analyst never scored above 64, so that was a hard no-pick; the gate now stays on the card
+    as a reason against and the floor is the same either way."""
     shut = {"available": True, "passed": False, "failing": ["Breadth > 55%"]}
-    low = dp.reconcile(_choice(conviction=65), candidates=_cands(gate=shut), gate=shut)
-    assert low["status"] == dp.STATUS_NONE and low["conviction_floor"] == 70
-    assert low["none_reason"] == "AAA scored 65/100; it needed 70 — the market is narrow"
-    assert low["none_detail"].startswith("The best candidate, AAA, scored 65 out of 100")
-    ok = dp.reconcile(_choice(conviction=74), candidates=_cands(gate=shut), gate=shut)
+    assert dp.CONVICTION_FLOOR_GATE_SHUT == dp.CONVICTION_FLOOR == 60
+    low = dp.reconcile(_choice(conviction=58), candidates=_cands(gate=shut), gate=shut)
+    assert low["status"] == dp.STATUS_NONE and low["conviction_floor"] == 60 and low["gate_shut"] is True
+    # The failed checks do not explain a bar they did not raise.
+    assert low["none_reason"] == "AAA scored 58/100; it needed 60"
+    assert low["none_detail"] == "The best candidate, AAA, scored 58 out of 100 for confidence; it needed 60"
+    ok = dp.reconcile(_choice(conviction=62), candidates=_cands(gate=shut), gate=shut)
     assert ok["status"] == dp.STATUS_PICK
     assert any(r["factor"] == "regime" and r["stance"] == "against" for r in ok["reasons"])
 

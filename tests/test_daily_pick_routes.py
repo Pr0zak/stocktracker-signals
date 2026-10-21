@@ -159,3 +159,28 @@ def test_the_card_carries_todays_recheck_beside_the_pick(env):
     body = c.get("/daily_pick").json()
     assert body["pick"]["symbol"] == "AAA"          # the morning pick is untouched
     assert body["recheck"]["pick"]["symbol"] == "BBB"
+
+
+def test_a_rejected_pick_is_remembered_under_its_own_origin(monkeypatch):
+    """A "none" day with a scored closest candidate records it (origin daily_pick_rejected) so the
+    floor can be graded; an off-list name or a day with no scored candidate records nothing."""
+    from app import main as M
+    from app import memory
+    seen: list[dict] = []
+    monkeypatch.setattr(M.memory, "record_verdict", lambda **kw: seen.append(kw) or 1)
+    cands = {"AAA": {"summary": {"price": 10.0, "as_of_date": "20261020"}, "price": 10.0}}
+    M._record_rejected_pick({"rejected_symbol": "AAA", "rejected_conviction": 58, "none_reason": "AAA scored 58/100; it needed 60"},
+                            cands, model="m", origin=memory.ORIGIN_DAILY_PICK_REJECTED)
+    assert len(seen) == 1 and seen[0]["symbol"] == "AAA" and seen[0]["origin"] == "daily_pick_rejected"
+    assert seen[0]["verdict"]["conviction"] == 58 and seen[0]["verdict"]["signal"] == "buy"
+    assert "it needed 60" in seen[0]["verdict"]["thesis"]
+    # Off the list, or never scored: nothing to grade.
+    M._record_rejected_pick({"rejected_symbol": "ZZZ", "rejected_conviction": 58}, cands, model="m",
+                            origin=memory.ORIGIN_DAILY_PICK_REJECTED)
+    M._record_rejected_pick({"rejected_symbol": "AAA", "rejected_conviction": None}, cands, model="m",
+                            origin=memory.ORIGIN_DAILY_PICK_REJECTED)
+    M._record_rejected_pick({"none_reason": "nothing convincing"}, cands, model="m",
+                            origin=memory.ORIGIN_DAILY_PICK_REJECTED)
+    assert len(seen) == 1
+    assert memory.ORIGIN_DAILY_PICK_REJECTED in memory.PICK_ORIGINS
+    assert memory.ORIGIN_DAILY_PICK_ETF_REJECTED in memory.PICK_ORIGINS

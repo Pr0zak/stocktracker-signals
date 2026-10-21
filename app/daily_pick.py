@@ -54,7 +54,13 @@ SHORTLIST_N = 8                       # what the analyst sees
 PREFETCH_N = 16                       # ranked names checked for earnings before trimming to 8
 EARNINGS_BLACKOUT_SESSIONS = 3        # a report inside this window is a coin flip, not a setup
 CONVICTION_FLOOR = 60
-CONVICTION_FLOOR_GATE_SHUT = 70       # a shut regime gate raises the bar rather than forbidding a pick
+# A shut regime gate used to raise the bar to 70. Measured over the feature's first 42 live runs
+# (2026-09-22 to 2026-10-21) the gate never opened, so the floor was 70 on every run, and the
+# analyst's best candidate never scored above 64: its own vocabulary puts an ordinary "buy" at 62 and
+# it has never written a buy above 72. The raised floor was a hard "no pick" in practice. The gate
+# now stays on the card as a reason against (reconcile adds it) and the floor is the same either way.
+# Kept as a named constant so the old behaviour is a one-line change, not a rewrite.
+CONVICTION_FLOOR_GATE_SHUT = CONVICTION_FLOOR
 MAX_ZONE_DISTANCE_PCT = 10.0          # an entry zone further than this from price is not a plan for today
 MAX_REASONS = 6
 MAX_RUNNERS_UP = 3
@@ -285,7 +291,10 @@ FACTOR_LABELS: dict[str, str] = {
     "earnings": "Earnings",
     "regime": "Market checks",
     "today_move": "Today so far",
-    # The ETF pick only (etf_pick.fund_factors): what the fund costs and how far it has fallen before.
+    # The ETF pick only (etf_pick.fund_factors): its 6- and 12-month gain, what the fund costs and
+    # how far it has fallen before.
+    "gain_6m": "6-month gain",
+    "gain_12m": "12-month gain",
     "fee": "Yearly cost",
     "worst_drop": "Worst drop",
 }
@@ -646,8 +655,10 @@ def reconcile(choice: dict, *, candidates: dict[str, dict], gate: dict | None) -
                     detail=f"the AI gave no reason against {sym}; a pick with no downside listed has not been "
                            f"thought through, so it was not shown", rejected_symbol=sym)
     if conviction < floor:
-        tail = (f" today because {gate_failing_words(gate)}" if gate_shut else "")
-        short_tail = f" — {gate_failing_words(gate)}" if gate_shut else ""
+        # The failed checks explain the bar only when they raised it.
+        raised = gate_shut and floor > CONVICTION_FLOOR
+        tail = (f" today because {gate_failing_words(gate)}" if raised else "")
+        short_tail = f" — {gate_failing_words(gate)}" if raised else ""
         return none(f"{sym} scored {conviction}/100; it needed {floor}{short_tail}",
                     detail=f"the best candidate, {sym}, scored {conviction} out of 100 for confidence; it needed "
                            f"{floor}{tail}", rejected_symbol=sym, rejected_conviction=conviction)

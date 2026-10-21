@@ -83,8 +83,13 @@ ORIGIN_DAILY_PICK_RULE = "daily_pick_rule"
 # The ETF pick (etf_pick.py), graded separately: a different thesis on a different universe.
 ORIGIN_DAILY_PICK_ETF = "daily_pick_etf"
 ORIGIN_DAILY_PICK_ETF_RULE = "daily_pick_etf_rule"
+# The analyst's closest candidate on a "none" day: what the card would have shown without the
+# conviction floor. Graded like a pick so the floor itself can be measured. Added 2026-10-21, when
+# 42 straight "none" runs had left the AI side of the scorecard with nothing to grade.
+ORIGIN_DAILY_PICK_REJECTED = "daily_pick_rejected"
+ORIGIN_DAILY_PICK_ETF_REJECTED = "daily_pick_etf_rejected"
 PICK_ORIGINS = (ORIGIN_DAILY_PICK, ORIGIN_DAILY_PICK_RULE, ORIGIN_DAILY_PICK_ETF,
-                ORIGIN_DAILY_PICK_ETF_RULE)
+                ORIGIN_DAILY_PICK_ETF_RULE, ORIGIN_DAILY_PICK_REJECTED, ORIGIN_DAILY_PICK_ETF_REJECTED)
 # Prose notes have no horizon to wait for; two years remains plenty.
 _NOTES_RETAIN_DAYS = 730
 
@@ -993,6 +998,10 @@ def stats() -> dict:
                 "daily_pick_rule": (ORIGIN_DAILY_PICK_RULE, BUY_SIGNALS, True),
                 "daily_etf_picks": (ORIGIN_DAILY_PICK_ETF, BUY_SIGNALS, True),
                 "daily_etf_pick_rule": (ORIGIN_DAILY_PICK_ETF_RULE, BUY_SIGNALS, True),
+                # The candidates the floor hid. If these beat the S&P as often as the shown picks,
+                # the floor is costing picks for nothing; if they lag, it is earning its keep.
+                "daily_picks_rejected": (ORIGIN_DAILY_PICK_REJECTED, BUY_SIGNALS, True),
+                "daily_etf_picks_rejected": (ORIGIN_DAILY_PICK_ETF_REJECTED, BUY_SIGNALS, True),
             }
             rows_20 = {label: _card(*spec, 20) for label, spec in cards.items()}
             # Long horizons on the ANALYST's cards only. The sandbox's own decisions are a handful

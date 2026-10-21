@@ -1736,6 +1736,8 @@ class PickFactor(str, Enum):
     today_move = "today_move"
     fee = "fee"
     worst_drop = "worst_drop"
+    gain_6m = "gain_6m"
+    gain_12m = "gain_12m"
 
 
 class PickStance(str, Enum):
@@ -1803,8 +1805,7 @@ cited as one, unless it broke one of those things. Do not tell the investor to w
 dip: buying a stock you want has measured better here than waiting for one. A `track_record` \
 block's vs_benchmark numbers are the measured history of similar setups — respect its n, and ignore \
 raw positive rates, which mostly reflect market drift.
-- conviction 0-100, calibrated: 70+ only for genuine confluence; a mixed picture is 40-55. The \
-investor's app hides any pick under 60 (70 when the market gate is shut).
+- conviction 0-100, calibrated: 70+ only for genuine confluence; a mixed picture is 40-55.
 - Price levels: entry_low/entry_high is the zone worth paying TODAY around the current price — not a \
 hoped-for dip (waiting for dips has measured worse than buying here). stop is the level where the \
 thesis has failed; size it against the candidate's atr14 (at least one atr14 below the zone). target \
@@ -1826,21 +1827,24 @@ zone, stop and target against the LIVE price. When today's move matters to the d
 price — not less; judge whether the fall broke anything before counting it against."""
 
 
-ETF_PICK_NOTE = """THIS IS THE ETF PICK, a second card beside the stock pick, and it has a different \
-thesis: A SOUND, LOW-COST FUND AT A BETTER PRICE. Every candidate is an index fund that a screen found \
-above its 200-day average (its long trend intact) and 5-25% below its 52-week high, with a known fee and \
-at least three years of history. Each carries a `fund` block (what it holds, its type, its fee, its \
-1/3/5-year return and worst drop) and two fund-only factors, `fee` and `worst_drop`.
+ETF_PICK_NOTE = """THIS IS THE ETF PICK, a second card beside the stock pick, with its own thesis: \
+THE SOUND, LOW-COST FUND WITH THE STRONGEST MOMENTUM. Every candidate is an index fund a screen found \
+above its 200-day average (its long trend intact) and UP over the last 6 months, with a known fee and \
+at least three years of history, ranked by its 6- and 12-month gain, its 6-month gain against the \
+S&P 500, its worst 3-year drop and its fee. Each carries a `fund` block (what it holds, its type, its \
+fee, its 1/3/5-year return and worst drop) and fund-only factors `gain_6m`, `gain_12m`, `fee` and \
+`worst_drop`.
 
-This REPLACES the base rule to weight relative strength and momentum most. For a fund, a pullback \
-toward its long-term trend is the setup, so a weak 3-month read is expected here and is not a reason \
-against by itself. Weigh, in order: how sound the fund is to hold for years (what it holds, how broad, \
-its worst drop), how good the price is (`range_52w`, `extension`, `long_cycle`), and its cost (`fee`). \
-Prefer a broad fund to a narrow theme at a similar discount. Never choose a fund for its past return. \
-A pullback that BREAKS something — close to the 200-day with the market checks failing, or a sector \
-under a named macro threat — is a reason against. The fund named is already the cheapest copy of its \
-index. Say what the fund holds in plain words in the headline, e.g. "Whole US market, 7% off its high". \
-Entry zone, stop and target work as for a stock: the stop below the 200-day average is the usual \
+The base rule applies in full here: weight momentum and relative strength most — that IS the thesis. \
+Read momentum over 6-12 months (`gain_6m`, `gain_12m`), not 3: a soft 3-month read or a 5-15% \
+pullback from the high on a fund whose 6-12 month gains are intact and which is still above its \
+200-day is a normal pause and a better entry on a leader, not a reason against, and never a reason to \
+tell the investor to wait. Reasons against that DO count: a break below the 200-day, a sector under a \
+named macro threat, a gain that all came in one month (fragile), a worst drop the investor could not \
+sit through, or a fee that eats the edge. Between two funds with similar momentum prefer the broader, \
+cheaper, calmer one. The fund named is already the cheapest copy of its index. Say what the fund \
+holds and its gain in plain words in the headline, e.g. "Chip makers, up 16% in 6 months". Entry \
+zone, stop and target work as for a stock: the stop below the 200-day average is the usual \
 invalidation."""
 
 

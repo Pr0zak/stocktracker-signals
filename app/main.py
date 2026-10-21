@@ -5348,6 +5348,23 @@ def _gate_brief(g: dict | None) -> dict:
     }
 
 
+def _record_rejected_pick(result: dict, candidates: dict, *, model: str | None, origin: str) -> None:
+    """On a "none" day, remember the analyst's closest candidate under its own origin so the floor can
+    be graded: did the picks the floor hid beat the S&P, or not? Only a candidate the analyst actually
+    scored is recorded — an off-list name or a "nothing convincing" day has no setup to grade."""
+    sym = result.get("rejected_symbol")
+    conv = result.get("rejected_conviction")
+    c = candidates.get(sym) if sym else None
+    if c is None or conv is None or not c.get("summary"):
+        return
+    why = str(result.get("none_reason") or "")
+    memory.record_verdict(
+        symbol=sym, summary=c["summary"],
+        verdict={"signal": "buy", "conviction": int(conv),
+                 "thesis": f"closest candidate on a no-pick day, under the floor: {why}"[:300]},
+        model=model, deep=True, origin=origin)
+
+
 async def _daily_pick_compute(today: str, now_et) -> dict:
     """One Daily Pick run. Always returns a record to persist, whatever happened — a failure is a
     record with status "failed" and the reason, never an absent row that reads as a quiet morning."""
@@ -5505,6 +5522,7 @@ async def _daily_pick_compute(today: str, now_et) -> dict:
         rec["pick"] = {"runners_up": result["runners_up"], "conviction_floor": result["conviction_floor"],
                        "rejected_symbol": result.get("rejected_symbol"),
                        "rejected_conviction": result.get("rejected_conviction")}
+        _record_rejected_pick(result, candidates, model=rec["model"], origin=memory.ORIGIN_DAILY_PICK_REJECTED)
         closest = result.get("rejected_symbol") or (result["runners_up"][0]["symbol"] if result["runners_up"] else None)
         if closest and closest in candidates:
             cc = candidates[closest]
@@ -5599,7 +5617,7 @@ async def _etf_pick_compute(today: str, now_et) -> dict:
         c["name"] = f.get("name")
         c["earnings"] = None
         c["factors"] = {**daily_pick.factors_for(c["row"], summary, gate=g, earnings=None),
-                        **etf_pick.fund_factors(f)}
+                        **etf_pick.fund_factors(f, c["row"])}
 
     candidates = {c["symbol"]: c for c in finalists if "summary" in c}
     rec["candidates"] = [
@@ -5662,6 +5680,7 @@ async def _etf_pick_compute(today: str, now_et) -> dict:
         rec["pick"] = {"runners_up": result["runners_up"], "conviction_floor": result["conviction_floor"],
                        "rejected_symbol": result.get("rejected_symbol"),
                        "rejected_conviction": result.get("rejected_conviction")}
+        _record_rejected_pick(result, candidates, model=rec["model"], origin=memory.ORIGIN_DAILY_PICK_ETF_REJECTED)
         closest = result.get("rejected_symbol") or (result["runners_up"][0]["symbol"] if result["runners_up"] else None)
         if closest and closest in candidates:
             cc = candidates[closest]
