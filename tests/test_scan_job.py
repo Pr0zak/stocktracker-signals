@@ -233,3 +233,71 @@ def test_an_empty_watchlist_is_not_a_total_failure():
 
     assert out["last_run_failed"] is False
     assert out["last_error"] is None
+
+
+# --------------------------------------------------------------- flip debounce (two-run confirmation)
+
+def _sig_row(symbol, signal):
+    return {"symbol": symbol, "signal": signal, "dip": None}
+
+
+def _carry(row):
+    """The per-symbol state the next run's `_prev_state()` hands back for this row."""
+    return {row["symbol"]: {k: row.get(k) for k in
+                            ("signal", "squeeze", "below_200wma", "dip", "stable_signal", "pending_signal")}}
+
+
+def test_a_one_run_change_is_not_a_flip_yet():
+    prev = {"XOM": {"signal": "hold", "stable_signal": "hold", "pending_signal": None}}
+    out = scan_job._diff_vs_prev(_sig_row("XOM", "sell"), prev)
+    assert out["flipped"] is False
+    assert out["stable_signal"] == "hold" and out["pending_signal"] == "sell"
+
+
+def test_the_same_change_on_the_next_run_confirms_the_flip():
+    prev = {"XOM": {"signal": "sell", "stable_signal": "hold", "pending_signal": "sell"}}
+    out = scan_job._diff_vs_prev(_sig_row("XOM", "sell"), prev)
+    assert out["flipped"] is True and out["flipped_from"] == "hold"
+    assert out["stable_signal"] == "sell" and out["pending_signal"] is None
+
+
+def test_hold_sell_hold_sell_churn_never_flips():
+    prev = {"CVX": {"signal": "hold", "stable_signal": "hold", "pending_signal": None}}
+    flips = []
+    for sig in ("sell", "hold", "sell", "hold", "sell"):
+        row = scan_job._diff_vs_prev(_sig_row("CVX", sig), prev)
+        flips.append(row["flipped"])
+        prev = _carry(row)
+    assert flips == [False] * 5
+    assert prev["CVX"]["stable_signal"] == "hold"
+
+
+def test_a_different_second_change_restarts_the_wait():
+    prev = {"CVX": {"signal": "sell", "stable_signal": "hold", "pending_signal": "sell"}}
+    out = scan_job._diff_vs_prev(_sig_row("CVX", "buy"), prev)
+    assert out["flipped"] is False
+    assert out["stable_signal"] == "hold" and out["pending_signal"] == "buy"
+
+
+def test_a_row_from_before_the_debounce_takes_its_last_signal_as_confirmed():
+    prev = {"AAPL": {"signal": "hold"}}  # an old payload: no stable/pending fields
+    same = scan_job._diff_vs_prev(_sig_row("AAPL", "hold"), prev)
+    assert same["flipped"] is False and same["stable_signal"] == "hold"
+    changed = scan_job._diff_vs_prev(_sig_row("AAPL", "buy"), prev)
+    assert changed["flipped"] is False and changed["pending_signal"] == "buy"
+
+
+def test_first_ever_sighting_is_not_a_flip():
+    out = scan_job._diff_vs_prev(_sig_row("NEW", "buy"), {})
+    assert out["flipped"] is False and out["stable_signal"] == "buy"
+
+
+def test_debounce_state_survives_into_last_measured():
+    row = scan_job._diff_vs_prev(_sig_row("XOM", "sell"),
+                                 {"XOM": {"signal": "hold", "stable_signal": "hold"}})
+    payload = scan_job._finalize_payload(
+        results=[row], dip_rejects={}, date_alerts=[], scored=0, seeded={}, prior_payload={},
+        dip_counts={"scanned": 1, "qualified": 0, "near_miss": 0, "nowhere_near": 1, "unmeasured": 0},
+    )
+    assert payload["last_measured"]["XOM"]["pending_signal"] == "sell"
+    assert payload["last_measured"]["XOM"]["stable_signal"] == "hold"

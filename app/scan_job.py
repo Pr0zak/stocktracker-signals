@@ -1,7 +1,8 @@
 """
 Nightly watchlist scan. Run standalone (`python -m app.scan_job`, wired to a systemd timer) or via
 POST /scan/run. Scores each configured symbol with the cheap scan model, flags "flips" (the signal
-changed vs. the previous run), and writes data/scan_latest.json for the app to poll.
+changed vs. the previous run, confirmed on two runs in a row), and writes data/scan_latest.json
+for the app to poll.
 
 Cost note: this runs the symbols concurrently through the same structured-output analyst path as
 /signal. The Anthropic Batch API (~50% cheaper) is a future optimization — for a personal-size
@@ -375,7 +376,9 @@ def _prev_state(payload: dict | None = None) -> dict[str, dict]:
     try:
         state = {
             r["symbol"]: {"signal": r.get("signal"), "squeeze": r.get("squeeze"),
-                          "below_200wma": r.get("below_200wma"), "dip": r.get("dip")}
+                          "below_200wma": r.get("below_200wma"), "dip": r.get("dip"),
+                          "stable_signal": r.get("stable_signal"),
+                          "pending_signal": r.get("pending_signal")}
             for r in (payload.get("results") or [])
             if "signal" in r
         }
@@ -396,7 +399,28 @@ def _diff_vs_prev(r: dict, prev: dict[str, dict]) -> dict:
     """
     p = prev.get(r["symbol"], {})
     r["prev_signal"] = p.get("signal")
-    r["flipped"] = r["prev_signal"] is not None and r["prev_signal"] != r["signal"]
+    # A flip must be seen on two runs in a row before it counts. The scan asks a cheap model for a
+    # fresh verdict every morning, and on unchanged bars it wanders between neighbouring answers
+    # (XOM read hold, then sell, on the same Friday close), so a one-run change is mostly noise.
+    # `stable_signal` is the last confirmed verdict; `pending_signal` is a change seen once and
+    # waiting for a second sighting. A row from before this field existed takes its last signal as
+    # the confirmed one, so the first run after the change neither replays nor invents a flip.
+    stable = p.get("stable_signal") or p.get("signal")
+    pending = p.get("pending_signal")
+    raw = r["signal"]
+    flipped = False
+    if stable is None or raw == stable:
+        stable, pending = raw, None
+    elif raw == pending:
+        flipped = True
+        stable, pending = raw, None
+    else:
+        pending = raw
+    r["flipped"] = flipped
+    r["stable_signal"] = stable
+    r["pending_signal"] = pending
+    # The confirmed verdict this run moved away from, which is what a flip is announced against.
+    r["flipped_from"] = (p.get("stable_signal") or p.get("signal")) if flipped else None
     # Squeeze-state transitions (quiet→fuel→ignition) are notification-worthy events too.
     r["prev_squeeze"] = p.get("squeeze")
     r["squeeze_changed"] = (
@@ -438,7 +462,9 @@ def _finalize_payload(
     """
     measured_now = {
         r["symbol"]: {"signal": r.get("signal"), "squeeze": r.get("squeeze"),
-                      "below_200wma": r.get("below_200wma"), "dip": r.get("dip")}
+                      "below_200wma": r.get("below_200wma"), "dip": r.get("dip"),
+                      "stable_signal": r.get("stable_signal"),
+                      "pending_signal": r.get("pending_signal")}
         for r in results if "signal" in r
     }
     last_measured = {**(prior_payload.get("last_measured") or {}), **measured_now}
@@ -775,6 +801,12 @@ async def run_scan() -> dict:
 
 
 if __name__ == "__main__":
+    # The timer is weekday-only; this also covers market holidays. A closed day has no new bars, so
+    # a scan would only re-ask the model about the last session and report its drift as news.
+    # POST /scan/run calls run_scan() directly and is not gated, so a manual run still works.
+    if not market_calendar.is_trading_day(dt.date.today()):
+        print(f"{dt.date.today().isoformat()} is not a trading day — scan skipped")
+        sys.exit(0)
     out = asyncio.run(run_scan())
     if out.get("last_run_failed"):
         # Non-zero exit so systemd records THIS run as a failure — "Deactivated successfully" for a
