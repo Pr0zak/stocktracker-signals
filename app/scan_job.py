@@ -469,14 +469,18 @@ def _finalize_payload(
     }
     last_measured = {**(prior_payload.get("last_measured") or {}), **measured_now}
 
-    # `scanned > 0` keeps a genuinely empty watchlist (a real, boring, successful run) from being
-    # misread as a failure — "0 of 0 measured" is not the same claim as "54 of 54 failed".
-    total_failure = dip_counts["scanned"] > 0 and dip_counts["unmeasured"] == dip_counts["scanned"]
+    # A non-empty check keeps a genuinely empty watchlist (a real, boring, successful run) from
+    # being misread as a failure — "0 of 0 measured" is not the same claim as "54 of 54 failed".
+    # Judged on the rows measured THIS run. A crypto-only run carries the stock rows forward, and
+    # counting those would hide a night on which every crypto fetch failed.
+    fresh_rows = [r for r in results if not r.get("carried_from")]
+    fresh_unmeasured = sum(1 for r in fresh_rows if classify_dip(r) == "unmeasured")
+    total_failure = len(fresh_rows) > 0 and fresh_unmeasured == len(fresh_rows)
     last_error = None
     if total_failure:
         errors = sorted({_scrub(r["error"]) for r in results if r.get("error")})
         last_error = (
-            f"every symbol failed to measure ({dip_counts['scanned']} scanned): "
+            f"every symbol failed to measure ({len(fresh_rows)} scanned): "
             + "; ".join(errors[:3])
         )
 
@@ -689,12 +693,42 @@ def _is_crypto_symbol(sym: str) -> bool:
     return "-" in sym and sym.rsplit("-", 1)[-1].upper() in ("USD", "USDT", "EUR", "GBP")
 
 
-async def run_scan() -> dict:
+def _carry_stock_rows(prior_payload: dict, stocks: list[str]) -> list[dict]:
+    """Last scan's stock rows, unchanged except that every "this changed" flag is cleared.
+
+    Used on a crypto-only run (weekend or market holiday). Carrying the rows keeps the app's
+    watchlist and dip radar showing the last session's stock read, and keeps it as the baseline the
+    next trading day diffs against. Dropping them instead would empty that baseline, and the next
+    full scan would then read every standing dip as new (the 2026-09-11 defect).
+    """
+    want = {s.upper() for s in stocks}
+    out = []
+    for r in prior_payload.get("results") or []:
+        sym = str(r.get("symbol") or "").upper()
+        if sym not in want or _is_crypto_symbol(sym):
+            continue
+        row = dict(r)
+        row.update(flipped=False, flipped_from=None, squeeze_changed=False,
+                   crossed_below_200wma=False, dip_new=False, cost_usd=0.0,
+                   # The scan that actually measured the row, kept across a run of closed days.
+                   carried_from=r.get("carried_from") or prior_payload.get("generated_at"))
+        out.append(row)
+    return out
+
+
+async def run_scan(crypto_only: bool = False) -> dict:
+    """Score the watchlist and publish data/scan_latest.json.
+
+    `crypto_only` is for a day the stock market is shut: only crypto is scored, and the stock rows
+    from the last scan are carried forward with no change flags (see `_carry_stock_rows`).
+    """
     cfg = settings_store.get()
     stocks = cfg.get("watchlist", [])
     cryptos = cfg.get("crypto_watchlist", [])
     prior_payload = _load_previous_payload()
     prev = _prev_state(prior_payload)
+    carried: list[dict] = _carry_stock_rows(prior_payload, stocks) if crypto_only else []
+    scored_stocks = [] if crypto_only else stocks
 
     async with httpx.AsyncClient() as client:
         # MB-19: the curated universe expires after a week and nothing else rebuilds it. Without
@@ -724,7 +758,7 @@ async def run_scan() -> dict:
             log.warning("universe rebuild skipped: %s", e)
 
         bench: list[float] | None = None
-        if stocks:
+        if scored_stocks:
             try:
                 bench = (await fetch_series(client, "^GSPC")).closes
             except Exception:  # noqa: BLE001 — relative strength just gets skipped
@@ -738,9 +772,9 @@ async def run_scan() -> dict:
             return _diff_vs_prev(r, prev)
 
         results = list(await asyncio.gather(
-            *[one(s, False) for s in stocks],
+            *[one(s, False) for s in scored_stocks],
             *[one(s, True) for s in cryptos],
-        ))
+        )) + carried
 
     # Grade past verdicts against what price actually did. The scan is the natural home for this:
     # it already runs once a day and the horizons are measured in days, so nothing is gained by
@@ -757,7 +791,7 @@ async def run_scan() -> dict:
     # dozen names at once spreads the fetches over a few nights instead of hammering Yahoo.
     seeded: dict = {}
     try:
-        fresh = memory.symbols_missing_baseline(stocks + cryptos)[:_BACKFILL_PER_RUN]
+        fresh = memory.symbols_missing_baseline(scored_stocks + cryptos)[:_BACKFILL_PER_RUN]
         if fresh:
             log.info("memory: seeding base rates for %s", fresh)
             seeded = await backfill_memory(fresh)
@@ -787,6 +821,9 @@ async def run_scan() -> dict:
         results=results, dip_rejects=dip_rejects, dip_counts=dip_counts, date_alerts=date_alerts,
         scored=scored, seeded=seeded, prior_payload=prior_payload,
     )
+    # Tells consumers which rows were measured today: on a crypto-only run the stock rows are the
+    # last session's, carried (each also says so with `carried_from`).
+    payload["crypto_only"] = crypto_only
 
     if payload["last_run_failed"] and not prior_payload:
         # First run ever (or the file was otherwise absent) and it failed completely. There is no
@@ -801,13 +838,13 @@ async def run_scan() -> dict:
 
 
 if __name__ == "__main__":
-    # The timer is weekday-only; this also covers market holidays. A closed day has no new bars, so
-    # a scan would only re-ask the model about the last session and report its drift as news.
-    # POST /scan/run calls run_scan() directly and is not gated, so a manual run still works.
-    if not market_calendar.is_trading_day(dt.date.today()):
-        print(f"{dt.date.today().isoformat()} is not a trading day — scan skipped")
-        sys.exit(0)
-    out = asyncio.run(run_scan())
+    # On a weekend or market holiday stocks have no new bars: re-asking the model about the last
+    # close only reports its drift as news. Crypto trades every day, so it is still scanned.
+    # POST /scan/run calls run_scan() directly and always does a full scan.
+    closed = not market_calendar.is_trading_day(dt.date.today())
+    if closed:
+        print(f"{dt.date.today().isoformat()} is not a trading day — crypto only, stock rows carried")
+    out = asyncio.run(run_scan(crypto_only=closed))
     if out.get("last_run_failed"):
         # Non-zero exit so systemd records THIS run as a failure — "Deactivated successfully" for a
         # night that measured nothing is the other half of the 2026-09-10 incident.

@@ -1,11 +1,11 @@
 [Unit]
-Description=Run the StockTracker Signals scan on weekday mornings
+Description=Run the StockTracker Signals scan each morning (crypto only on closed days)
 
 [Timer]
-# Weekdays only. The scan re-asks the model about Friday's unchanged bars on a weekend, and its
-# answers drift between runs, so weekend runs produced "signals changed overnight" alerts while the
-# market was shut. Holidays are skipped inside scan_job itself.
-OnCalendar=Mon-Fri 06:30:00
+# Every day. On a weekend or market holiday scan_job scores crypto only (it trades every day) and
+# carries the stock rows forward unchanged: re-asking the model about the last close's unchanged
+# bars just reports its drift as "signals changed overnight".
+OnCalendar=*-*-* 06:30:00
 Persistent=true
 
 [Install]

@@ -301,3 +301,54 @@ def test_debounce_state_survives_into_last_measured():
     )
     assert payload["last_measured"]["XOM"]["pending_signal"] == "sell"
     assert payload["last_measured"]["XOM"]["stable_signal"] == "hold"
+
+
+# --------------------------------------------------------------- crypto-only runs on closed days
+
+def _prior_with(rows, generated_at=1000.0):
+    return {"generated_at": generated_at, "results": rows}
+
+
+def test_carried_stock_rows_keep_their_read_and_lose_every_change_flag():
+    prior = _prior_with([
+        {"symbol": "XOM", "signal": "sell", "flipped": True, "dip": "pullback_10", "dip_new": True,
+         "squeeze_changed": True, "crossed_below_200wma": True, "cost_usd": 0.01,
+         "stable_signal": "sell"},
+        {"symbol": "ETH-USD", "signal": "hold", "flipped": True},
+        {"symbol": "GONE", "signal": "buy", "flipped": True},
+    ])
+    out = scan_job._carry_stock_rows(prior, ["XOM", "AAPL"])
+    assert [r["symbol"] for r in out] == ["XOM"]  # crypto is re-scored; delisted names drop out
+    xom = out[0]
+    assert xom["signal"] == "sell" and xom["dip"] == "pullback_10" and xom["stable_signal"] == "sell"
+    assert not any(xom[k] for k in ("flipped", "dip_new", "squeeze_changed", "crossed_below_200wma"))
+    assert xom["cost_usd"] == 0.0 and xom["carried_from"] == 1000.0
+
+
+def test_a_second_closed_day_keeps_the_scan_that_really_measured_the_row():
+    prior = _prior_with([{"symbol": "XOM", "signal": "sell", "carried_from": 900.0}], generated_at=1000.0)
+    assert scan_job._carry_stock_rows(prior, ["XOM"])[0]["carried_from"] == 900.0
+
+
+def test_carried_rows_do_not_mask_a_night_every_crypto_fetch_failed():
+    results = [
+        {"symbol": "XOM", "signal": "sell", "dip_measured": True, "carried_from": 1000.0},
+        {"symbol": "ETH-USD", "error": "boom"},
+    ]
+    _, counts = scan_job.dip_verdicts(results)
+    payload = scan_job._finalize_payload(
+        results=results, dip_rejects={}, dip_counts=counts, date_alerts=[], scored=0, seeded={},
+        prior_payload={"generated_at": 1000.0, "results": [{"symbol": "XOM", "signal": "sell"}]},
+    )
+    assert payload["last_run_failed"] is True
+
+
+def test_monday_diffs_against_the_carried_rows_not_an_empty_baseline():
+    """A standing dip carried over the weekend must not read as new on Monday's full scan."""
+    carried = scan_job._carry_stock_rows(
+        _prior_with([{"symbol": "XOM", "signal": "hold", "dip": "pullback_10", "stable_signal": "hold"}]),
+        ["XOM"],
+    )
+    prev = scan_job._prev_state({"results": carried})
+    monday = scan_job._diff_vs_prev({"symbol": "XOM", "signal": "hold", "dip": "pullback_10"}, prev)
+    assert monday["dip_new"] is False and monday["flipped"] is False
