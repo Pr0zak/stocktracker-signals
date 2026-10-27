@@ -3830,10 +3830,8 @@ async def _run_extra_arm(
             _sym = _jit_buy["symbol"].upper()
             _px = price_of(_sym)
             if _px and _px > 0:
-                _slip = float(settings.get("slippage_bps", 5)) / 10_000.0
-                _fill_est = round(_px * (1 + _slip), 2)
-                _cash_now = float(blob.get("cash", 0.0))
-                _needed = round(_fill_est - _cash_now, 2)
+                _needed = sandbox_job.jit_amount_needed(
+                    _px, float(settings.get("slippage_bps", 5)), float(blob.get("cash", 0.0)))
                 if _needed > 0:
                     if spy_price and spy_price > 0:
                         _jit_trade = sandbox_job.apply_jit_deposit(

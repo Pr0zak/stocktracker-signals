@@ -1161,6 +1161,22 @@ def apply_recurring_deposit(
     }
 
 
+def jit_amount_needed(price: float, slippage_bps: float, cash: float) -> float:
+    """Cash to add so `cash` covers one share at `price` plus slippage, in whole cents, rounded UP.
+
+    validate_and_fill compares the UNROUNDED fill (`price * (1 + slip)`) against cash, so the top-up
+    must never land below it. Rounding the fill to the nearest cent did exactly that whenever the
+    third decimal was under 5: on 2026-10-27 SCHD's fill was a fraction of a cent over $35.12, the
+    arm was topped up to $35.12, and the buy was refused as "$35.12 > available $35.12". Returns 0.0
+    when cash already covers the share.
+    """
+    fill = price * (1 + float(slippage_bps) / 10_000.0)
+    # The epsilon keeps a fill that is a whole number of cents up to float noise (35.12 stored as
+    # 35.1200000001) from costing an extra cent; anything over it still rounds up.
+    need = math.ceil(round((fill - cash) * 100, 6)) / 100.0
+    return need if need > 0 else 0.0
+
+
 def apply_jit_deposit(
     blob: dict, *, amount: float, spy_price: float, symbol: str,
     now: dt.datetime | None = None, ts: float | None = None,

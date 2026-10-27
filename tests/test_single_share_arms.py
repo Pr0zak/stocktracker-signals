@@ -119,6 +119,33 @@ def test_apply_jit_deposit():
     assert "NVDA" in trade["reason"]
 
 
+@pytest.mark.parametrize("price", [35.1, 35.1049, 34.99, 162.4449, 79.59, 104.8246])
+def test_jit_amount_always_covers_the_fill_validate_and_fill_charges(price):
+    # 2026-10-27: SCHD at $35.1049 with 5 bps slippage fills at $35.1224; the old top-up rounded that
+    # to $35.12 and validate_and_fill refused the buy. Whatever the price, cash after the top-up must
+    # buy the share.
+    cash = 0.0
+    need = sandbox_job.jit_amount_needed(price, 5, cash)
+    blob = {
+        "cash": round(cash + need, 2),
+        "funded_total": round(cash + need, 2),
+        "positions": [],
+        "settings": {"single_share": True, "funding_mode": "jit", "allow_sells": False,
+                     "cash_floor_pct": 0.0, "slippage_bps": 5},
+    }
+    orders = [{"symbol": "SCHD", "side": "buy", "conviction": 75, "shares": 1.0}]
+    _, filled, skipped = sandbox_job.validate_and_fill(
+        blob, orders, price_of=lambda s: price, group_of=lambda s: "US")
+    assert skipped == [] and len(filled) == 1, skipped
+    assert need - price * 1.0005 < 0.01  # never more than a cent over
+
+
+def test_jit_amount_is_zero_when_cash_already_covers_the_share():
+    assert sandbox_job.jit_amount_needed(35.10, 5, 40.0) == 0.0
+    assert sandbox_job.jit_amount_needed(35.0, 0, 35.0) == 0.0
+    assert sandbox_job.jit_amount_needed(35.0, 0, 34.0) == 1.0
+
+
 def test_validate_and_fill_single_share_buys_fixed_one_share_and_uncapped():
     # Account has $2,000 cash. Stock is $1,800.
     # Normal cap of 20% would allow only $400, but single_share is uncapped.
