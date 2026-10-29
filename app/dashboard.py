@@ -252,6 +252,39 @@ PAGE = """<!doctype html>
   .arm-edit[hidden] { display: none; }
   .note { font-size: .78rem; color: var(--muted); border-left: 2px solid var(--line);
           padding-left: .6rem; margin: .6rem 0 0; }
+
+  /* ticker detail drawer */
+  .drawer-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45); opacity: 0;
+                     pointer-events: none; transition: opacity .22s ease; z-index: 900; }
+  .drawer-backdrop.open { opacity: 1; pointer-events: auto; }
+  .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 100vw);
+            background: var(--card); border-left: 1px solid var(--line);
+            box-shadow: -4px 0 24px rgba(0,0,0,.25); transform: translateX(100%);
+            transition: transform .22s cubic-bezier(0.16, 1, 0.3, 1); z-index: 1000;
+            display: flex; flex-direction: column; overflow: hidden; }
+  .drawer.open { transform: translateX(0); }
+  .drawer-header { padding: 1rem 1.1rem .8rem; border-bottom: 1px solid var(--line); background: var(--card); flex-shrink: 0; }
+  .dr-head-top { display: flex; justify-content: space-between; align-items: flex-start; gap: .5rem; }
+  .dr-sym { font-size: 1.4rem; font-weight: 700; margin: 0; letter-spacing: -.02em; display: flex; align-items: baseline; gap: .4rem; }
+  .dr-name { font-size: .84rem; color: var(--muted); margin-top: .1rem; }
+  .dr-close { background: none; border: 0; color: var(--muted); font-size: 1.3rem; padding: .1rem .4rem;
+              cursor: pointer; border-radius: .3rem; line-height: 1; }
+  .dr-close:hover { color: var(--ink); background: #8882; }
+  .dr-price-row { display: flex; align-items: baseline; gap: .6rem; margin-top: .6rem; flex-wrap: wrap; }
+  .dr-price { font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .dr-change { font-size: .9rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .drawer-body { padding: 1rem 1.1rem 2rem; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 1.1rem; }
+  .dr-sec-title { font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+                  color: var(--muted); margin-bottom: .5rem; display: flex; align-items: center; justify-content: space-between; }
+  .dr-pill-row { display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: .5rem; }
+  .dr-pill { font-size: .72rem; padding: .12rem .5rem; border-radius: .8rem; background: #8882; color: var(--muted); font-weight: 500; }
+  .dr-lead { font-size: .88rem; line-height: 1.45; margin: 0 0 .4rem; }
+  .dr-range-selector { display: flex; gap: .2rem; background: #8882; padding: .15rem; border-radius: .4rem; }
+  .dr-range-btn { padding: .18rem .55rem; font-size: .75rem; font-weight: 600; border-radius: .3rem;
+                  background: none; border: 0; color: var(--muted); cursor: pointer; }
+  .dr-range-btn.sel { background: var(--card); color: var(--accent); box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+  .ticker-link { cursor: pointer; color: var(--accent); text-decoration: none; font-weight: 600; }
+  .ticker-link:hover { text-decoration: underline; }
 </style></head>
 <body>
 <header>
@@ -406,6 +439,33 @@ PAGE = """<!doctype html>
           cannot be deleted — create a separate arm for that.
         </p>
       </div>
+
+      <!-- Selected arm's holdings & today's activity -->
+      <div class="arm-edit" id="arm-details" hidden>
+        <h2 style="margin-bottom:.5rem">Positions &amp; Activity <span class="hint" id="arm-positions-count"></span></h2>
+        
+        <!-- Today's Orders / Skips -->
+        <div id="arm-today-box" style="margin-bottom:.9rem">
+          <div class="hint" style="font-weight:600;margin-bottom:.3rem">TODAY'S ACTIVITY</div>
+          <div id="arm-today-orders" class="hint">loading…</div>
+        </div>
+
+        <!-- Strategy Note -->
+        <div id="arm-note-box" style="margin-bottom:.9rem" hidden>
+          <div class="hint" style="font-weight:600;margin-bottom:.3rem">LATEST STRATEGY NOTE</div>
+          <p class="note" id="arm-note-text" style="margin:0"></p>
+        </div>
+
+        <!-- Holdings Table -->
+        <div class="hint" style="font-weight:600;margin-bottom:.3rem">CURRENT HOLDINGS</div>
+        <div class="scroll"><table class="tbl" id="arm-pos-tbl">
+          <thead><tr>
+            <th>Symbol</th><th class="num">Shares</th><th class="num">Avg Cost</th>
+            <th class="num">Last Price</th><th class="num">Value</th><th class="num">Unrealized</th>
+          </tr></thead>
+          <tbody id="arm-pos-body"><tr><td colspan="6" class="loading">loading…</td></tr></tbody>
+        </table></div>
+      </div>
     </div>
 
     <div class="card">
@@ -553,6 +613,82 @@ PAGE = """<!doctype html>
 </section>
 
 </div>
+
+<!-- =========================== TICKER DRAWER =========================== -->
+<div id="ticker-drawer-backdrop" class="drawer-backdrop" onclick="closeTickerDrawer()"></div>
+<aside id="ticker-drawer" class="drawer" aria-hidden="true">
+  <div class="drawer-header">
+    <div class="dr-head-top">
+      <div>
+        <h2 id="dr-symbol" class="dr-sym">---</h2>
+        <div id="dr-name" class="dr-name">---</div>
+      </div>
+      <button type="button" class="dr-close" onclick="closeTickerDrawer()" aria-label="Close">✕</button>
+    </div>
+    <div class="dr-price-row">
+      <span id="dr-price" class="dr-price">---</span>
+      <span id="dr-change" class="dr-change">---</span>
+      <span id="dr-signal-badge" class="badge">---</span>
+      <span id="dr-etf-badge" class="badge" style="display:none">ETF</span>
+    </div>
+  </div>
+
+  <div class="drawer-body">
+    <!-- What it is -->
+    <div class="card" id="dr-what-card" style="padding:.85rem">
+      <div class="dr-sec-title">
+        <span>WHAT IT IS</span>
+        <span id="dr-ai-badge" class="badge ok" style="display:none">AI SUMMARY</span>
+      </div>
+      <div class="dr-pill-row" id="dr-tags"></div>
+      <p id="dr-lead" class="dr-lead"></p>
+      <div id="dr-cust" class="hint" style="margin-top:.4rem"></div>
+      <details id="dr-summary-details" style="margin-top:.5rem">
+        <summary class="hint" style="cursor:pointer;color:var(--accent)">Read full description</summary>
+        <p id="dr-full-summary" class="hint" style="margin-top:.4rem;line-height:1.45;white-space:pre-line"></p>
+      </details>
+    </div>
+
+    <!-- Price History -->
+    <div class="card" id="dr-chart-card" style="padding:.85rem">
+      <div class="dr-sec-title">
+        <span>PRICE HISTORY</span>
+        <div class="dr-range-selector">
+          <button type="button" class="dr-range-btn" data-r="1D" onclick="setDrawerRange('1D')">1D</button>
+          <button type="button" class="dr-range-btn sel" data-r="1W" onclick="setDrawerRange('1W')">1W</button>
+          <button type="button" class="dr-range-btn" data-r="1M" onclick="setDrawerRange('1M')">1M</button>
+          <button type="button" class="dr-range-btn" data-r="1Y" onclick="setDrawerRange('1Y')">1Y</button>
+        </div>
+      </div>
+      <div id="dr-period-change" class="hint" style="margin:.1rem 0 .4rem;font-weight:600"></div>
+      <div id="dr-chart-box" style="width:100%;height:150px;position:relative;">
+        <svg id="dr-chart-svg" viewBox="0 0 380 150" style="width:100%;height:100%;display:block;"></svg>
+      </div>
+    </div>
+
+    <!-- Details -->
+    <div class="card" id="dr-details-card" style="padding:.85rem">
+      <div class="dr-sec-title">DETAILS</div>
+      <table class="tbl" id="dr-details-tbl" style="margin-top:0">
+        <tbody>
+          <tr><td>Market cap</td><td class="num" id="dr-mcap">—</td></tr>
+          <tr><td>P/E ratio</td><td class="num" id="dr-pe">—</td></tr>
+          <tr><td>52-week range</td><td class="num" id="dr-52w">—</td></tr>
+          <tr><td>Day range</td><td class="num" id="dr-dayrange">—</td></tr>
+          <tr><td>Volume</td><td class="num" id="dr-vol">—</td></tr>
+          <tr><td>Dividend yield</td><td class="num" id="dr-div">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Sandbox Position / Posture -->
+    <div class="card" id="dr-sandbox-card" style="padding:.85rem;display:none">
+      <div class="dr-sec-title">SANDBOX POSITION</div>
+      <div id="dr-sandbox-content"></div>
+    </div>
+  </div>
+</aside>
+
 <script>
 
 
@@ -597,6 +733,8 @@ PAGE = """<!doctype html>
     syms.forEach((sym) => {
       const chip = document.createElement("span");
       chip.className = "chip";
+      chip.style.cursor = "pointer";
+      chip.onclick = () => openTickerDrawer(sym);
       const b = document.createElement("b"); b.textContent = sym; chip.appendChild(b);
       box.appendChild(chip);
     });
@@ -767,7 +905,7 @@ PAGE = """<!doctype html>
     if (!keys.length) { box.innerHTML = '<span class="empty">no IV history yet — the nightly scan logs one point per stock</span>'; return; }
     box.innerHTML = keys.map((k) => {
       const n = syms[k]; const done = n >= target;
-      return '<span class="pill' + (done ? " done" : "") + '">' + esc(k) + " " + (done ? "✓ " + n : n + "/" + target) + "</span>";
+      return '<span class="pill' + (done ? " done" : "") + '" style="cursor:pointer" onclick="openTickerDrawer(\'' + esc(k) + '\')">' + esc(k) + " " + (done ? "✓ " + n : n + "/" + target) + "</span>";
     }).join("");
   }
   function renderStatus(s) {
@@ -885,13 +1023,13 @@ PAGE = """<!doctype html>
       const changed = r.flipped || r.dip_new || r.crossed_below_200wma;
       const th = esc(r.thesis || "");
       return '<tr class="' + (changed ? "changed" : "") + '">' +
-        "<td><b>" + esc(r.symbol) + "</b>" + scanBadges(r) + "</td>" +
+        '<td><b class="ticker-link" onclick="openTickerDrawer(\'' + esc(r.symbol) + '\')">' + esc(r.symbol) + "</b>" + scanBadges(r) + "</td>" +
         '<td class="' + sigClass(r.signal) + '">' + esc(r.signal) + "</td>" +
         '<td class="num">' + (r.conviction != null ? esc(r.conviction) : "–") + "</td>" +
         "<td>" + esc(r.dip || "–") + "</td>" +
         "<td>" + esc(r.squeeze || "–") + "</td>" +
         "<td>" + (r.below_200wma ? "yes" : "–") + "</td>" +
-        '<td class="thesis" title="' + th + '">' + th + "</td></tr>";
+        '<td class="thesis" title="' + th + '">' + linkifyTickers(r.thesis || "") + "</td></tr>";
     }).join("");
   }
 
@@ -1053,6 +1191,318 @@ PAGE = """<!doctype html>
   showTab(tabs.some(t => t.dataset.panel === location.hash.slice(1))
           ? location.hash.slice(1) : "p-overview");
 
+  // ---------------------------------------------------------------- ticker drawer & links
+  const COMMON_WORDS = new Set(["A", "I", "AND", "OR", "THE", "NOT", "FOR", "IN", "ON", "AT", "TO", "IS", "ARE", "OF", "BY", "BUT", "BE", "SO", "DO", "IF", "NO", "WE", "MY", "HE", "UP", "AS", "IT", "AN", "ALL", "NEW", "MAX", "MIN", "NOW", "OFF", "SET", "GET", "PUT", "RUN", "DAY", "TOP", "LOW", "DIP", "BUY", "OUT"]);
+  function linkifyTickers(text) {
+    if (!text) return "";
+    return esc(text).replace(/\b([A-Z]{1,5})\b/g, (match) => {
+      if (COMMON_WORDS.has(match)) return match;
+      return '<span class="ticker-link" onclick="openTickerDrawer(\'' + match + '\')">' + match + '</span>';
+    });
+  }
+
+  let currentDrawerSym = null;
+  let currentDrawerBars = [];
+  let currentDrawerRange = "1W";
+
+  function openTickerDrawer(sym) {
+    if (!sym) return;
+    sym = sym.toUpperCase();
+    currentDrawerSym = sym;
+    $("ticker-drawer-backdrop").classList.add("open");
+    $("ticker-drawer").classList.add("open");
+    $("ticker-drawer").setAttribute("aria-hidden", "false");
+
+    $("dr-symbol").textContent = sym;
+    $("dr-name").textContent = "loading profile…";
+    $("dr-price").textContent = "—";
+    $("dr-change").textContent = "";
+    $("dr-change").className = "dr-change";
+    $("dr-signal-badge").style.display = "none";
+    $("dr-etf-badge").style.display = "none";
+    $("dr-tags").innerHTML = "";
+    $("dr-lead").textContent = "";
+    $("dr-cust").textContent = "";
+    $("dr-ai-badge").style.display = "none";
+    $("dr-full-summary").textContent = "";
+    $("dr-summary-details").open = false;
+    $("dr-mcap").textContent = "—";
+    $("dr-pe").textContent = "—";
+    $("dr-52w").textContent = "—";
+    $("dr-dayrange").textContent = "—";
+    $("dr-vol").textContent = "—";
+    $("dr-div").textContent = "—";
+    $("dr-sandbox-card").style.display = "none";
+    $("dr-period-change").textContent = "loading price history…";
+    $("dr-chart-svg").innerHTML = "";
+    currentDrawerBars = [];
+
+    loadDrawerProfile(sym);
+    loadDrawerHistory(sym);
+    loadDrawerSandboxHolding(sym);
+  }
+
+  function closeTickerDrawer() {
+    $("ticker-drawer-backdrop").classList.remove("open");
+    $("ticker-drawer").classList.remove("open");
+    $("ticker-drawer").setAttribute("aria-hidden", "true");
+    currentDrawerSym = null;
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && currentDrawerSym) closeTickerDrawer();
+  });
+
+  async function loadDrawerProfile(sym) {
+    try {
+      const p = await (await afetch("/profile/" + encodeURIComponent(sym) + "?plain=true")).json();
+      if (currentDrawerSym !== sym) return;
+      $("dr-name").textContent = p.name || p.long_name || "";
+      if (p.is_etf) $("dr-etf-badge").style.display = "inline-block";
+
+      const tags = [];
+      if (p.sector) tags.push(p.sector);
+      if (p.industry) tags.push(p.industry);
+      $("dr-tags").innerHTML = tags.map(t => '<span class="dr-pill">' + esc(t) + '</span>').join("");
+
+      if (p.what_it_does) {
+        $("dr-lead").textContent = p.what_it_does;
+        $("dr-ai-badge").style.display = "inline-block";
+      } else if (p.summary) {
+        const dotIdx = p.summary.indexOf(". ");
+        $("dr-lead").textContent = dotIdx > 0 ? p.summary.slice(0, dotIdx + 1) : p.summary;
+      }
+      if (p.customers) {
+        $("dr-cust").textContent = "Customers: " + p.customers;
+      }
+      if (p.summary) {
+        $("dr-full-summary").textContent = p.summary;
+      }
+
+      if (p.market_cap) {
+        const mc = p.market_cap;
+        $("dr-mcap").textContent = "$" + (mc >= 1e12 ? (mc/1e12).toFixed(2) + "T" : mc >= 1e9 ? (mc/1e9).toFixed(2) + "B" : (mc/1e6).toFixed(1) + "M");
+      }
+      $("dr-pe").textContent = p.pe_ratio != null ? p.pe_ratio.toFixed(1) : (p.forward_pe != null ? p.forward_pe.toFixed(1) + " (fwd)" : "—");
+      if (p.week52_low != null && p.week52_high != null) {
+        $("dr-52w").textContent = money(p.week52_low) + " – " + money(p.week52_high);
+      }
+      if (p.day_low != null && p.day_high != null) {
+        $("dr-dayrange").textContent = money(p.day_low) + " – " + money(p.day_high);
+      }
+      if (p.volume) $("dr-vol").textContent = Number(p.volume).toLocaleString();
+      if (p.dividend_yield_pct != null) $("dr-div").textContent = p.dividend_yield_pct.toFixed(2) + "%";
+
+    } catch (e) {
+      if (currentDrawerSym === sym) $("dr-name").textContent = "profile unavailable";
+    }
+  }
+
+  async function loadDrawerHistory(sym) {
+    try {
+      const [hData, sData] = await Promise.all([
+        (await afetch("/history/" + encodeURIComponent(sym))).json().catch(() => null),
+        (await afetch("/signal/" + encodeURIComponent(sym))).json().catch(() => null),
+      ]);
+      if (currentDrawerSym !== sym) return;
+
+      if (sData) {
+        if (sData.price != null) $("dr-price").textContent = money(sData.price);
+        if (sData.change != null) {
+          const chg = sData.change;
+          const pct = sData.change_pct;
+          const up = chg >= 0;
+          $("dr-change").textContent = (up ? "+" : "") + money(chg) + (pct != null ? " (" + (up ? "+" : "") + pct.toFixed(2) + "%)" : "");
+          $("dr-change").className = "dr-change " + (up ? "pos" : "neg");
+        }
+        if (sData.signal) {
+          $("dr-signal-badge").textContent = sData.signal.toUpperCase() + (sData.conviction != null ? " " + sData.conviction + "%" : "");
+          $("dr-signal-badge").className = "badge " + (sData.signal.indexOf("buy") >= 0 ? "on" : sData.signal.indexOf("sell") >= 0 ? "cross" : "eng");
+          $("dr-signal-badge").style.display = "inline-block";
+        }
+      }
+
+      if (hData && hData.bars && hData.bars.length) {
+        currentDrawerBars = hData.bars;
+        renderDrawerChart();
+      } else {
+        $("dr-period-change").textContent = "no price history available";
+      }
+    } catch (e) {
+      if (currentDrawerSym === sym) $("dr-period-change").textContent = "history unavailable";
+    }
+  }
+
+  function setDrawerRange(r) {
+    currentDrawerRange = r;
+    document.querySelectorAll(".dr-range-btn").forEach(b => {
+      b.classList.toggle("sel", b.dataset.r === r);
+    });
+    renderDrawerChart();
+  }
+
+  function renderDrawerChart() {
+    if (!currentDrawerBars || currentDrawerBars.length < 2) return;
+    const now = Date.now();
+    let cutoff = 0;
+    if (currentDrawerRange === "1D") cutoff = now - 2 * 86400 * 1000;
+    else if (currentDrawerRange === "1W") cutoff = now - 7 * 86400 * 1000;
+    else if (currentDrawerRange === "1M") cutoff = now - 32 * 86400 * 1000;
+    else if (currentDrawerRange === "1Y") cutoff = now - 366 * 86400 * 1000;
+
+    let pts = currentDrawerBars.filter(b => b.t >= cutoff);
+    if (pts.length < 2) pts = currentDrawerBars.slice(-10);
+    if (pts.length < 2) return;
+
+    const first = pts[0].c;
+    const last = pts[pts.length - 1].c;
+    const up = last >= first;
+    const pct = first > 0 ? ((last / first - 1) * 100) : 0;
+    $("dr-period-change").textContent = (up ? "+" : "") + pct.toFixed(2) + "% over " + currentDrawerRange;
+    $("dr-period-change").className = "hint " + (up ? "pos" : "neg");
+
+    const W = 380, H = 150, padT = 12, padB = 20, padL = 10, padR = 10;
+    const minPrice = Math.min(...pts.map(p => p.c));
+    const maxPrice = Math.max(...pts.map(p => p.c));
+    const priceSpan = (maxPrice - minPrice) || 1;
+
+    const coords = pts.map((p, i) => {
+      const x = padL + (i / (pts.length - 1)) * (W - padL - padR);
+      const y = padT + (1 - (p.c - minPrice) / priceSpan) * (H - padT - padB);
+      return {x, y, p};
+    });
+
+    const pathD = coords.reduce((acc, pt, i) => acc + (i === 0 ? "M " : " L ") + pt.x.toFixed(1) + " " + pt.y.toFixed(1), "");
+    const areaD = pathD + " L " + coords[coords.length - 1].x.toFixed(1) + " " + (H - padB) + " L " + coords[0].x.toFixed(1) + " " + (H - padB) + " Z";
+    const strokeColor = up ? "var(--ok)" : "var(--err)";
+    const fillColor = up ? "rgba(22,163,74,.15)" : "rgba(220,38,38,.15)";
+
+    const firstDate = new Date(pts[0].t).toLocaleDateString(undefined, {month: "short", day: "numeric"});
+    const lastDate = new Date(pts[pts.length - 1].t).toLocaleDateString(undefined, {month: "short", day: "numeric"});
+
+    let svg = '<path d="' + areaD + '" fill="' + fillColor + '" />' +
+              '<path d="' + pathD + '" fill="none" stroke="' + strokeColor + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />' +
+              '<text x="' + padL + '" y="' + (H - 4) + '" fill="var(--muted)" font-size="10">' + firstDate + '</text>' +
+              '<text x="' + (W - padR) + '" y="' + (H - 4) + '" fill="var(--muted)" font-size="10" text-anchor="end">' + lastDate + '</text>' +
+              '<text x="' + (W - padR) + '" y="' + (padT + 10) + '" fill="var(--muted)" font-size="10" text-anchor="end">High ' + money(maxPrice) + '</text>' +
+              '<text x="' + (W - padR) + '" y="' + (H - padB - 4) + '" fill="var(--muted)" font-size="10" text-anchor="end">Low ' + money(minPrice) + '</text>';
+
+    $("dr-chart-svg").innerHTML = svg;
+  }
+
+  async function loadDrawerSandboxHolding(sym) {
+    try {
+      const holdings = [];
+      await Promise.all(ARMS.map(async a => {
+        try {
+          const st = await (await afetch("/sandbox/state?arm=" + encodeURIComponent(a.arm))).json();
+          const pos = (st.positions || []).find(p => p.symbol.toUpperCase() === sym);
+          if (pos) {
+            holdings.push({arm: a.arm, label: a.label || a.arm, ...pos});
+          }
+        } catch (e) {}
+      }));
+      if (currentDrawerSym !== sym) return;
+
+      if (holdings.length) {
+        $("dr-sandbox-card").style.display = "block";
+        $("dr-sandbox-content").innerHTML = holdings.map(h => {
+          const basis = h.shares * h.avg_cost;
+          const val = h.value || (h.price ? h.shares * h.price : basis);
+          const pnl = val - basis;
+          const up = pnl >= 0;
+          return '<div style="margin-bottom:.5rem;padding-bottom:.5rem;border-bottom:1px solid var(--line)">' +
+            '<div style="font-weight:600;font-size:.85rem;margin-bottom:.2rem">' + esc(h.label) + '</div>' +
+            '<div style="display:flex;justify-content:space-between;font-size:.8rem">' +
+              '<span>' + h.shares + ' sh @ ' + money(h.avg_cost) + '</span>' +
+              '<span class="' + (up ? 'pos' : 'neg') + '">' + (up ? '+' : '') + money(pnl) + (h.unrealized_pct != null ? ' (' + (up ? '+' : '') + h.unrealized_pct.toFixed(2) + '%)' : '') + '</span>' +
+            '</div>' +
+            '<div class="hint" style="font-size:.75rem">Value: ' + money(val) + (h.price ? ' · Last: ' + money(h.price) : '') + '</div>' +
+          '</div>';
+        }).join("");
+      } else {
+        $("dr-sandbox-card").style.display = "none";
+      }
+    } catch (e) {
+      $("dr-sandbox-card").style.display = "none";
+    }
+  }
+
+  async function loadArmDetails(id) {
+    const det = $("arm-details");
+    if (!det) return;
+    det.hidden = false;
+    $("arm-today-orders").innerHTML = '<span class="loading">loading today’s activity…</span>';
+    $("arm-pos-body").innerHTML = '<tr><td colspan="6" class="loading">loading positions…</td></tr>';
+    $("arm-note-box").hidden = true;
+
+    try {
+      const [st, td] = await Promise.all([
+        (await afetch("/sandbox/state?arm=" + encodeURIComponent(id))).json(),
+        (await afetch("/sandbox/today?arm=" + encodeURIComponent(id))).json().catch(() => ({orders: [], skipped: []})),
+      ]);
+
+      if (st.note && (st.note.notes || st.note.themes)) {
+        $("arm-note-box").hidden = false;
+        let txt = st.note.notes || "";
+        if (st.note.themes) txt += (txt ? " · " : "") + "Themes: " + st.note.themes;
+        $("arm-note-text").innerHTML = linkifyTickers(txt);
+      }
+
+      const orders = td.orders || [];
+      const skipped = td.skipped || [];
+      if (!orders.length && !skipped.length) {
+        $("arm-today-orders").innerHTML = '<span class="empty">No orders or skips recorded today</span>';
+      } else {
+        let html = "";
+        if (orders.length) {
+          html += orders.map(o => {
+            const isBuy = o.action === "BUY";
+            return '<div style="padding:.2rem 0;border-bottom:1px solid #8882">' +
+              '<span class="badge ' + (isBuy ? 'on' : 'cross') + '">' + esc(o.action) + '</span> ' +
+              '<b class="ticker-link" onclick="openTickerDrawer(\'' + esc(o.symbol) + '\')">' + esc(o.symbol) + '</b> ' +
+              o.shares + ' sh @ ' + money(o.price) +
+              (o.reason ? ' <span class="hint">— ' + linkifyTickers(o.reason) + '</span>' : '') +
+            '</div>';
+          }).join("");
+        }
+        if (skipped.length) {
+          html += skipped.map(s => {
+            return '<div style="padding:.2rem 0;color:var(--muted)">' +
+              '<span class="badge eng">SKIP ' + esc(s.action || "") + '</span> ' +
+              '<b class="ticker-link" onclick="openTickerDrawer(\'' + esc(s.symbol) + '\')">' + esc(s.symbol) + '</b>' +
+              (s.reason ? ' <span class="hint">— ' + linkifyTickers(s.reason) + '</span>' : '') +
+            '</div>';
+          }).join("");
+        }
+        $("arm-today-orders").innerHTML = html;
+      }
+
+      const pos = st.positions || [];
+      $("arm-positions-count").textContent = "· " + pos.length + " position" + (pos.length === 1 ? "" : "s");
+      if (!pos.length) {
+        $("arm-pos-body").innerHTML = '<tr><td colspan="6" class="empty">no positions currently held</td></tr>';
+      } else {
+        $("arm-pos-body").innerHTML = pos.map(p => {
+          const basis = p.shares * p.avg_cost;
+          const val = p.value || (p.price ? p.shares * p.price : basis);
+          const pnl = val - basis;
+          const up = pnl >= 0;
+          return '<tr>' +
+            '<td><b class="ticker-link" onclick="openTickerDrawer(\'' + esc(p.symbol) + '\')">' + esc(p.symbol) + '</b></td>' +
+            '<td class="num">' + p.shares + '</td>' +
+            '<td class="num">' + money(p.avg_cost) + '</td>' +
+            '<td class="num">' + money(p.price) + '</td>' +
+            '<td class="num">' + money(val) + '</td>' +
+            '<td class="num ' + (up ? 'pos' : 'neg') + '">' + (up ? '+' : '') + money(pnl) + (p.unrealized_pct != null ? ' (' + (up ? '+' : '') + p.unrealized_pct.toFixed(2) + '%)' : '') + '</td>' +
+          '</tr>';
+        }).join("");
+      }
+    } catch (e) {
+      $("arm-pos-body").innerHTML = '<tr><td colspan="6" class="err-t">could not load positions: ' + esc(e.message) + '</td></tr>';
+    }
+  }
+
   // ---------------------------------------------------------------- arms
   let ARMS = [], selArm = null;
 
@@ -1140,7 +1590,12 @@ PAGE = """<!doctype html>
     if (selArm && !ARMS.some(a => a.arm === selArm)) closeArmEditor();
   }
 
-  function closeArmEditor() { selArm = null; $("arm-edit").hidden = true; loadArms(); }
+  function closeArmEditor() {
+    selArm = null;
+    $("arm-edit").hidden = true;
+    if ($("arm-details")) $("arm-details").hidden = true;
+    loadArms();
+  }
 
   function selectArm(id) {
     const a = ARMS.find(x => x.arm === id); if (!a) return;
@@ -1167,6 +1622,7 @@ PAGE = """<!doctype html>
     $("a-mainnote").hidden = !isMain;
     $("a-status").textContent = "";
     loadArms();
+    loadArmDetails(id);
     $("arm-edit").scrollIntoView({behavior: "smooth", block: "nearest"});
   }
 
