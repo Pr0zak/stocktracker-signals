@@ -1346,6 +1346,12 @@ true the read is old — weight it down and don't treat it as today's news. The 
 block means the backdrop is UNKNOWN, not calm: carry on with the technicals and claim nothing about \
 news either way.
 
+`cash_today.spendable_now_usd` is what today's buys can actually spend — cash after unsettled sale \
+proceeds and the cash floor. A buy larger than it is not filled. `cash_today.next_deposit` says when \
+the next recurring deposit arrives and how much: money that has not arrived cannot fund today's \
+orders. When spendable cash is below one share of what you want, place nothing for it and say the \
+deposit on that date will close the gap.
+
 Bias by `risk_tolerance` (conservative = more cash, defensives, broad diversification, smaller positions; \
 aggressive = more concentrated, higher-beta, fully invested) and by the GLIDEPATH: as `retirement_date` \
 or `exit_date` approaches, shift progressively toward cash/defensives; if past/at `exit_date`, sell \
@@ -1389,6 +1395,11 @@ Do NOT reject for being conservative. An empty order list is a valid decision an
 Do not reject because you would have picked something different — you are checking for a defect, not \
 substituting your judgement.
 
+A `macro` block, when present, is the same news backdrop the trader was given: a news claim in a \
+reason that matches it is grounded. When no `macro` block is present the backdrop is unknown to you, \
+so do not call a news claim invented on that ground alone — judge it on whether the order still \
+stands without it.
+
 Prefer `drop_symbols` over a blanket rejection: if three orders are sound and one is not, dropping \
 the one is the proportionate answer. Reserve approve=false for a decision that is wrong as a whole.
 
@@ -1398,7 +1409,7 @@ Return the verdict. `concerns` is what you would tell the account owner; keep ea
 async def review_decision(
     decision: SandboxDecision, book: dict, candidates: list[dict], *, cash: float,
     settings: dict, strategy_note: dict | None, deep: bool = True,
-    model: str | None = None, extra_system: str | None = None,
+    model: str | None = None, extra_system: str | None = None, macro: dict | None = None,
 ) -> tuple[ReviewVerdict, dict]:
     """A second model reads the proposed orders before they reach the ledger.
 
@@ -1423,6 +1434,12 @@ async def review_decision(
         "settings": settings,
         "strategy_note": strategy_note,
     }
+    # The same macro block the trader saw. Without it the reviewer flagged real catalysts as invented
+    # (2026-10-30: "the macro specifics cited ... do not appear anywhere in the data provided" about a
+    # Hormuz read that was in the trader's payload) — and "cites a number not in the data" is one of
+    # its drop rules, so a sound news-aware order could be dropped for a gap in the reviewer's input.
+    if macro:
+        payload["macro"] = macro
     prompt = (
         "Review these proposed orders before they reach the ledger.\n"
         + json.dumps(payload, indent=2, default=str)
@@ -1438,7 +1455,7 @@ async def sandbox_decision(
     strategy_note: dict | None, macro: dict | None = None, deep: bool = False,
     model: str | None = None, gaps: list[dict] | None = None,
     recent_activity: list[dict] | None = None, ledger_cost: dict | None = None,
-    wash_sale_windows: list[dict] | None = None,
+    wash_sale_windows: list[dict] | None = None, cash_today: dict | None = None,
     extra_system: str | None = None, extra_payload: dict | None = None,
 ) -> tuple[SandboxDecision, dict]:
     """The daily sandbox decision (Haiku by default): a unified order list to steer the book toward the
@@ -1470,6 +1487,10 @@ async def sandbox_decision(
     # Names this book may not rebuy yet. Omitted when none are open, same rule as above.
     if wash_sale_windows:
         payload["open_wash_sale_windows"] = wash_sale_windows
+    # Spendable cash and the next deposit date. Omitted on a just-in-time funded arm (see
+    # sandbox_job.cash_for_prompt), where neither figure describes what it can buy.
+    if cash_today:
+        payload["cash_today"] = cash_today
     # Omitted entirely when there's no usable read — an empty macro block would assert a calm
     # backdrop on exactly the days the news pipeline is broken.
     if macro:

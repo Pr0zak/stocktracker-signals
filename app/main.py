@@ -3757,6 +3757,9 @@ async def _run_extra_arm(
                 wash_sale_windows=sandbox_job.wash_sale_windows(
                     blob.get("recent_loss_sales"), now_ts=time.time(),
                     enabled=bool(settings.get("avoid_wash_sales", True))),
+                cash_today=sandbox_job.cash_for_prompt(
+                    blob, equity=book.get("total_value"),
+                    now=now),
                 extra_system=SINGLE_SHARE_DAILY_NOTE if settings.get("single_share") else (ETF_DAILY_NOTE if etf else None),
                 extra_payload=_extra_payload)
             usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
@@ -3769,7 +3772,7 @@ async def _run_extra_arm(
                     verdict, rusage = await review_decision(
                         decision, book, arm_candidates, cash=blob["cash"],
                         settings=sandbox_job.settings_for_prompt(settings),
-                        strategy_note=plan, deep=True,
+                        strategy_note=plan, deep=True, macro=macro_block,
                         extra_system=ETF_REVIEW_NOTE if etf else None)
                     usage_store.record(rusage, symbol=f"SANDBOX:{arm}", kind="sandbox_review")
                     _v = verdict.model_dump()
@@ -4250,7 +4253,9 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                     ledger_cost=ledger_cost,
                     wash_sale_windows=sandbox_job.wash_sale_windows(
                         blob.get("recent_loss_sales"), now_ts=time.time(),
-                        enabled=bool(settings.get("avoid_wash_sales", True))))
+                        enabled=bool(settings.get("avoid_wash_sales", True))),
+                    cash_today=sandbox_job.cash_for_prompt(
+                        blob, equity=book.get("total_value")))
                 usage_store.record(usage, symbol="SANDBOX", kind="sandbox_tick")
                 orders = [o.model_dump() for o in decision.orders]
                 posture = decision.posture
@@ -4264,7 +4269,8 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                         verdict, rusage = await review_decision(
                             decision, book, candidates, cash=blob["cash"],
                             settings=sandbox_job.settings_for_prompt(settings),
-                            strategy_note=blob.get("last_strategy_note"), deep=True)
+                            strategy_note=blob.get("last_strategy_note"), deep=True,
+                            macro=macro_block)
                         usage_store.record(rusage, symbol="SANDBOX", kind="sandbox_review")
                         _pre = list(orders)
                         _v = verdict.model_dump()

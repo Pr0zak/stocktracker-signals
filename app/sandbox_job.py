@@ -1208,6 +1208,69 @@ def monthly_deposit_total(settings: dict) -> float:
     return amount * (2 if deposit_frequency(settings) == "semimonthly" else 1)
 
 
+def next_deposit(blob: dict, *, now: dt.datetime | None = None) -> dict | None:
+    """When the next recurring instalment lands and how much it is, or None when none is set.
+
+    Read from the deposit cursor, not the calendar alone. A window that is open but unpaid — the tick
+    deferred it for want of a benchmark quote, or it is a weekend after the 1st — lands on the next
+    tick, which is the next trading day. Otherwise it is the next window: deposits are paid on the
+    first tick on or after the 1st (or the 15th), and ticks run on trading days only.
+    """
+    settings = blob.get("settings") or {}
+    amount = float(settings.get("monthly_deposit") or 0.0)
+    if amount <= 0.0:
+        return None
+    now = now or now_et()
+    today = now.date()
+    if due_deposit_periods(blob, now=now):
+        d = next_trading_day_on_or_after(today + dt.timedelta(days=1))
+    else:
+        first_next = (today.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
+        if deposit_frequency(settings) == "semimonthly" and today.day < SEMI_MONTHLY_SECOND_DAY:
+            opens = today.replace(day=SEMI_MONTHLY_SECOND_DAY)
+        else:
+            opens = first_next
+        d = next_trading_day_on_or_after(opens)
+    return {"date": d.isoformat(), "dollars": round(amount, 2)}
+
+
+def next_trading_day_on_or_after(d: dt.date) -> dt.date:
+    return d if market_calendar.is_trading_day(d) else market_calendar.next_trading_day(d)
+
+
+def cash_for_prompt(blob: dict, *, equity: float | None, now: dt.datetime | None = None) -> dict | None:
+    """What the book can actually spend TODAY, and when more money arrives.
+
+    Measured 2026-10-30: in October the LLM arms proposed buys they could not pay for far more often
+    than they filled one (picky 25 skips for cash against 5 fills, reviewed 19 against 4), with
+    postures like "deploy the semimonthly deposit" on days the deposit had already been paid. The
+    model was shown `cash` and a per-month deposit figure but never WHEN the money comes, so it
+    planned against cash that did not exist. The validator skipped every such order, so no money
+    moved, but the log filled with dead orders and the reasoning rested on a false premise.
+
+    Mirrors validate_and_fill's buying power: cash minus unsettled sale proceeds (cash accounts) minus
+    the cash floor. None on a just-in-time funded arm, where cash is topped up per order and a
+    spendable figure of ~$0 would be true and misleading.
+    """
+    today = (now or now_et()).date()
+    s = blob.get("settings") or {}
+    if str(s.get("funding_mode", "cash")).lower() == "jit":
+        return None
+    cash = float(blob.get("cash") or 0.0)
+    unsettled = 0.0
+    if str(s.get("account_type", "cash")).lower() != "margin":
+        unsettled = sum(float(u.get("amount") or 0.0) for u in (blob.get("unsettled") or [])
+                        if str(u.get("settles_on") or "") > today.isoformat())
+    floor = 0.0 if s.get("single_share") else float(s.get("cash_floor_pct", 10.0)) / 100.0 * float(equity or 0.0)
+    out: dict = {"spendable_now_usd": round(max(0.0, cash - unsettled - floor), 2)}
+    if unsettled > 0:
+        out["unsettled_usd"] = round(unsettled, 2)
+    nxt = next_deposit(blob, now=now)
+    if nxt:
+        out["next_deposit"] = nxt
+    return out
+
+
 # How far the weekly targets may fall short of (100 - cash_target) before it counts as a real hole
 # rather than rounding. A point or two is noise; ten is a policy decision nobody made.
 ALLOCATION_SLACK_PCT = 3.0
