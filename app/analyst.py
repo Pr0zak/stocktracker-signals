@@ -1883,3 +1883,72 @@ async def daily_pick(context: dict, *, deep: bool = True) -> tuple[DailyPickChoi
     choice, usage = await _parse(system, prompt, DailyPickChoice, deep=deep, max_tokens=4096)
     choice.conviction = max(0, min(100, choice.conviction))
     return choice, usage
+
+
+class AskIdea(BaseModel):
+    symbol: str
+    kind: str                        # "etf" | "stock"
+    headline: str                    # at most 10 words — what the card shows first
+    why: str                         # at most 25 words, citing numbers from the context
+    watch_out: str                   # at most 15 words — the main thing against it
+    entry_low: float | None = None
+    entry_high: float | None = None
+
+
+class AskAnswer(BaseModel):
+    answer: str                      # the direct answer, at most 60 words
+    ideas: list[AskIdea] = []        # 0-3, only symbols present in the context
+    none_reason: str | None = None   # when ideas is empty and the question asked for one: <= 20 words
+
+
+ASK_SYSTEM = """You answer ONE question from a retail investor about what to buy, using ONLY the \
+data in the JSON you are given. The investor holds for the long term and reads this on a phone.
+
+The data:
+- `market`: today's live move for the biggest US names, the session, advancing/declining counts.
+- `gate`: a five-leg market regime check (trend, breadth, VIX, momentum). Closed means the broad \
+market is weak; it is context, not a ban on buying.
+- `macro`: the current news backdrop (wars, energy, rates), graded by severity. Absent = unknown.
+- `etfs`: every index fund the app tracks, ONE row per index (already the cheapest copy), with \
+`today_pct`, `pct_off_52w_high`, `pct_vs_50_day`, `pct_vs_200_day`, `above_200_day`, \
+`gain_6m_pct`, `return_1y_pct`, `worst_drop_3y_pct`, `fee_pct`, and `dip` (true = long trend \
+intact AND at least 4% under its 52-week high).
+- `stock_dips`: liquid stocks still above their 200-day that have pulled back from their high, \
+with today's move. From last night's full-market scan.
+- `watchlist`: the investor's own watchlist from the nightly scan (signal, conviction, dip tier).
+- `stock_pick` / `etf_pick`: today's daily pick cards (may be "none" with a reason).
+- `holdings`: the investor's real portfolio, each holding's weight measured at cost (what was \
+paid), when the app sent them. Use it for what they own and roughly how much, not for gains.
+- `missing`: blocks that could not be built. Say so if the answer depends on one.
+
+Rules:
+- Use only numbers present in the data. Never invent a price, a return or a news item. Suggest ONLY \
+symbols that appear in the data; anything else is deleted before the investor sees it.
+- A PULLBACK ON A SOUND NAME IS A BUYING CHANCE, not a reason against. "Sound" means above its \
+200-day, with solid 1-year and longer returns. A fall counts against only when it BREAKS something: \
+below the 200-day, or tied to news that changes the case. Do not tell the investor to wait for a \
+further dip — waiting has measured worse than buying here.
+- Distinguish TODAY'S move (`today_pct`) from a PULLBACK (`pct_off_52w_high`). A fund down 2% \
+today but up 60% in a year on a news spike is not "on sale"; a fund 9% under its high with its \
+200-day intact is. Say which kind you mean.
+- Prefer broad, cheap funds over narrow, expensive ones when the dips are similar. Never suggest two \
+funds that hold the same thing. If `holdings` is present, favour what fills a gap or adds to a \
+holding at a better price, and say how it relates to what they own; never suggest selling.
+- Crypto funds swing 30% routinely; if you mention one, say so in `watch_out`.
+- If nothing in the data fits the question, return no ideas and say why in `none_reason`. Never \
+force a suggestion. If the question is not about investing, answer briefly in `answer` and return \
+no ideas.
+- `entry_low`/`entry_high`: a zone around TODAY'S price worth paying, or null. Not a hoped-for dip.
+- BE BRIEF. `answer` at most 60 words, `headline` at most 10, `why` at most 25, `watch_out` at most \
+15. At most 3 ideas, best first. Plain text, no markdown, no disclaimer (the app adds one). \
+Decision support, not advice."""
+
+
+async def ask(question: str, context: dict, *, deep: bool = True) -> tuple[AskAnswer, dict]:
+    """Ask AI: answer one investor question from `context` (built by main._ask_context)."""
+    prompt = (
+        "The investor asks: " + json.dumps(question) + "\n\nToday's data:\n"
+        + json.dumps(context, indent=1, default=str)
+        + "\n\nReturn the AskAnswer."
+    )
+    return await _parse(ASK_SYSTEM, prompt, AskAnswer, deep=deep, max_tokens=2048)

@@ -6166,3 +6166,190 @@ async def report_run_endpoint(kind: str = "auto", end: str | None = None, force:
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
     return {"results": results}
+
+
+# ------------------------------------------------------------------------------------------ Ask AI
+from . import ask as ask_mod  # noqa: E402 — grouped with the feature it serves
+from .analyst import ask as analyst_ask  # noqa: E402
+
+# The ETF histories behind the board cost ~100 chart fetches; a question every few minutes must not
+# repeat them. Their trend fields (50/200-day, 52-week high) move once a day, so 20 minutes is
+# generous — TODAY'S move comes from a fresh batched quote on every question regardless.
+_ASK_ETF_TTL = 20 * 60
+_ask_etf_cache: dict = {"at": 0.0, "build": None, "pool": [], "rows": {}}
+# A runaway client (or a stuck retry loop) on the deep model is the cost risk here, not abuse —
+# this is a single-user service behind a bearer token. Counted per ET day, in memory.
+ASK_DAILY_MAX = 60
+_ask_count: dict = {"day": None, "n": 0}
+
+
+class AskHolding(BaseModel):
+    symbol: str
+    weight_pct: float | None = None
+
+
+class AskRequest(BaseModel):
+    question: str
+    holdings: list[AskHolding] = []
+
+
+async def _ask_etf_rows() -> tuple[dict | None, list[str], dict]:
+    """(fund catalogue, one-per-index pool, {symbol: tech_row}) — the ETF pick's own reading, cached."""
+    now = time.time()
+    c = _ask_etf_cache
+    if c["build"] and now - c["at"] < _ASK_ETF_TTL:
+        return c["build"], c["pool"], c["rows"]
+    build = await fund_catalog.explore(_http, saved=_EXPENSE_RATIO_PCT, saved_as_of=_EXPENSE_RATIO_AS_OF)
+    if not build or not build.get("measured"):
+        return None, [], {}
+    pool = etf_arm.pool_symbols(build)
+    try:
+        bench = (await fetch_series(_http, "^GSPC")).closes
+    except Exception:  # noqa: BLE001 — relative strength goes unmeasured, nothing else does
+        bench = None
+
+    async def _read(sym: str):
+        async with _SANDBOX_CAND_SEM:
+            try:
+                s = await fetch_series(_http, sym)
+                summ = summarize(s, bench)
+            except Exception:  # noqa: BLE001 — unmeasured, shown with null trend fields
+                return sym, None
+            return sym, etf_pick.tech_row(s.closes, bench_closes=bench, rsi14=summ.get("rsi14"),
+                                          high_52w=summ.get("fifty_two_week_high"))
+    rows = dict(await asyncio.gather(*[_read(x) for x in pool]))
+    c.update(at=now, build=build, pool=pool, rows=rows)
+    return build, pool, rows
+
+
+async def _quotes(symbols: list[str]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for i in range(0, len(symbols), 60):
+        try:
+            out.update(await market_now.fetch_quotes(_http, symbols[i:i + 60]))
+        except Exception:  # noqa: BLE001 — today's move goes null for this batch, never zero
+            _log.warning("ask: quote batch failed", exc_info=True)
+    return out
+
+
+async def _ask_context(holdings: list[dict]) -> dict:
+    """Everything an investor question about today can be answered from. Each block is built
+    independently; one that fails is named in `missing` and left out, never sent empty."""
+    ctx: dict = {"today": _et_now().date().isoformat(), "missing": []}
+
+    async def _block(name: str, coro):
+        try:
+            return await coro
+        except Exception:  # noqa: BLE001 — enrichment: one block failing must not sink the answer
+            _log.warning("ask: %s block failed", name, exc_info=True)
+            ctx["missing"].append(name)
+            return None
+
+    hm = await _block("market", heatmap_endpoint(mode="market", limit=40))
+    if hm:
+        ctx["market"] = {"session": hm.get("session"), "advancing": hm.get("advancing"),
+                         "declining": hm.get("declining"),
+                         "biggest_names": [{"symbol": t.get("symbol"), "today_pct": t.get("value"),
+                                            "sector": t.get("sector")} for t in hm.get("tiles") or []]}
+    g = await _block("gate", gate_endpoint())
+    if g:
+        b = _gate_brief(g)
+        ctx["gate"] = {k: b[k] for k in ("passed", "market_score", "failing", "note")}
+    try:
+        mac = macro.compact(macro.load_state())
+    except Exception:  # noqa: BLE001
+        mac = None
+    if mac:
+        ctx["macro"] = mac
+    else:
+        ctx["missing"].append("macro")
+
+    etf = await _block("etfs", _ask_etf_rows())
+    build, pool, rows = etf if etf else (None, [], {})
+
+    night = await asyncio.to_thread(scan_store.latest_date)
+    dip_rows = []
+    if night:
+        dip_rows = await asyncio.to_thread(
+            scan_store.top, night, sort="-pct_off_52w_high", limit=25,
+            above_sma200=True, min_dollar_volume_20d=100_000_000.0,
+            max_pct_off_52w_high=-6.0, min_pct_off_52w_high=-30.0)
+    if not dip_rows:
+        ctx["missing"].append("stock_dips")
+
+    quotes = await _quotes(list(pool) + [r["symbol"] for r in dip_rows])
+    if pool:
+        ctx["etfs"] = ask_mod.etf_board(build, rows, quotes, pool)
+        ctx["etf_history_as_of"] = (build or {}).get("aligned_to")
+    elif "etfs" not in ctx["missing"]:
+        ctx["missing"].append("etfs")
+    if dip_rows:
+        ctx["stock_dips"] = ask_mod.stock_dips(dip_rows, quotes)
+        ctx["stock_scan_night"] = night
+
+    try:
+        scan = json.loads(LATEST.read_text()) if LATEST.exists() else None
+    except Exception:  # noqa: BLE001
+        scan = None
+    wl = ask_mod.watchlist_rows(scan)
+    if wl:
+        ctx["watchlist"] = wl
+        ctx["watchlist_scanned_at"] = (scan or {}).get("generated_at")
+    else:
+        ctx["missing"].append("watchlist")
+
+    for kind in ("stock", "etf"):
+        card = await _block(f"{kind}_pick", daily_pick_endpoint(kind=kind))
+        brief = ask_mod.pick_brief(card)
+        if brief:
+            ctx[f"{kind}_pick"] = brief
+    if holdings:
+        ctx["holdings"] = ask_mod.holdings_rows(holdings)
+    return ctx
+
+
+@app.get("/ask/examples")
+async def ask_examples() -> dict:
+    return {"examples": list(ask_mod.EXAMPLES), "max_chars": ask_mod.MAX_QUESTION_CHARS}
+
+
+@app.post("/ask", dependencies=[Depends(require_api_token)])
+async def ask_endpoint(req: AskRequest) -> dict:
+    """Ask AI: one investor question, answered by the deep model from today's data on this service.
+
+    The answer's `ideas` are checked against the context: only symbols it carried numbers for
+    survive, each re-stamped with the live price, today's move and its distance from the high, so
+    the card shows data rather than the model's restatement of it. `dropped` lists anything removed.
+    """
+    q = ask_mod.clean_question(req.question)
+    if not q:
+        raise HTTPException(status_code=422, detail="ask a question")
+    today = _et_now().date().isoformat()
+    if _ask_count["day"] != today:
+        _ask_count.update(day=today, n=0)
+    if _ask_count["n"] >= ASK_DAILY_MAX:
+        raise HTTPException(status_code=429, detail=f"daily limit of {ASK_DAILY_MAX} questions reached")
+    _ask_count["n"] += 1
+
+    ctx = await _ask_context([h.model_dump() for h in req.holdings])
+    try:
+        ans, usage = await analyst_ask(q, ctx, deep=True)
+    except Exception as e:  # noqa: BLE001
+        _log.warning("ask failed: %s", e)
+        raise HTTPException(status_code=502, detail="the analyst could not answer — try again") from e
+    usage_store.record(usage, symbol="", kind="ask")
+    ideas, dropped = ask_mod.check_ideas([i.model_dump() for i in ans.ideas], ctx)
+    return {
+        "question": q,
+        "answer": ans.answer,
+        "ideas": ideas,
+        "none_reason": ans.none_reason if not ideas else None,
+        "dropped": dropped,
+        "missing": ctx["missing"],
+        "as_of": {"today": ctx["today"], "stock_scan_night": ctx.get("stock_scan_night"),
+                  "etf_history": ctx.get("etf_history_as_of"),
+                  "session": (ctx.get("market") or {}).get("session")},
+        "gate_passed": (ctx.get("gate") or {}).get("passed"),
+        "model": usage.get("model"),
+        "cost_usd": usage.get("cost_usd"),
+    }
