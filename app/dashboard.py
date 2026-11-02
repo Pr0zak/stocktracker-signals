@@ -905,7 +905,7 @@ PAGE = """<!doctype html>
     if (!keys.length) { box.innerHTML = '<span class="empty">no IV history yet — the nightly scan logs one point per stock</span>'; return; }
     box.innerHTML = keys.map((k) => {
       const n = syms[k]; const done = n >= target;
-      return '<span class="pill' + (done ? " done" : "") + '" style="cursor:pointer" onclick="openTickerDrawer(\'' + esc(k) + '\')">' + esc(k) + " " + (done ? "✓ " + n : n + "/" + target) + "</span>";
+      return '<span class="pill' + (done ? " done" : "") + '" style="cursor:pointer" onclick="openTickerDrawer(\\'' + esc(k) + '\\')">' + esc(k) + " " + (done ? "✓ " + n : n + "/" + target) + "</span>";
     }).join("");
   }
   function renderStatus(s) {
@@ -1023,7 +1023,7 @@ PAGE = """<!doctype html>
       const changed = r.flipped || r.dip_new || r.crossed_below_200wma;
       const th = esc(r.thesis || "");
       return '<tr class="' + (changed ? "changed" : "") + '">' +
-        '<td><b class="ticker-link" onclick="openTickerDrawer(\'' + esc(r.symbol) + '\')">' + esc(r.symbol) + "</b>" + scanBadges(r) + "</td>" +
+        '<td><b class="ticker-link" onclick="openTickerDrawer(\\'' + esc(r.symbol) + '\\')">' + esc(r.symbol) + "</b>" + scanBadges(r) + "</td>" +
         '<td class="' + sigClass(r.signal) + '">' + esc(r.signal) + "</td>" +
         '<td class="num">' + (r.conviction != null ? esc(r.conviction) : "–") + "</td>" +
         "<td>" + esc(r.dip || "–") + "</td>" +
@@ -1195,9 +1195,9 @@ PAGE = """<!doctype html>
   const COMMON_WORDS = new Set(["A", "I", "AND", "OR", "THE", "NOT", "FOR", "IN", "ON", "AT", "TO", "IS", "ARE", "OF", "BY", "BUT", "BE", "SO", "DO", "IF", "NO", "WE", "MY", "HE", "UP", "AS", "IT", "AN", "ALL", "NEW", "MAX", "MIN", "NOW", "OFF", "SET", "GET", "PUT", "RUN", "DAY", "TOP", "LOW", "DIP", "BUY", "OUT"]);
   function linkifyTickers(text) {
     if (!text) return "";
-    return esc(text).replace(/\b([A-Z]{1,5})\b/g, (match) => {
+    return esc(text).replace(/\\b([A-Z]{1,5})\\b/g, (match) => {
       if (COMMON_WORDS.has(match)) return match;
-      return '<span class="ticker-link" onclick="openTickerDrawer(\'' + match + '\')">' + match + '</span>';
+      return '<span class="ticker-link" onclick="openTickerDrawer(\\'' + match + '\\')">' + match + '</span>';
     });
   }
 
@@ -1460,7 +1460,7 @@ PAGE = """<!doctype html>
             const isBuy = o.action === "BUY";
             return '<div style="padding:.2rem 0;border-bottom:1px solid #8882">' +
               '<span class="badge ' + (isBuy ? 'on' : 'cross') + '">' + esc(o.action) + '</span> ' +
-              '<b class="ticker-link" onclick="openTickerDrawer(\'' + esc(o.symbol) + '\')">' + esc(o.symbol) + '</b> ' +
+              '<b class="ticker-link" onclick="openTickerDrawer(\\'' + esc(o.symbol) + '\\')">' + esc(o.symbol) + '</b> ' +
               o.shares + ' sh @ ' + money(o.price) +
               (o.reason ? ' <span class="hint">— ' + linkifyTickers(o.reason) + '</span>' : '') +
             '</div>';
@@ -1470,7 +1470,7 @@ PAGE = """<!doctype html>
           html += skipped.map(s => {
             return '<div style="padding:.2rem 0;color:var(--muted)">' +
               '<span class="badge eng">SKIP ' + esc(s.action || "") + '</span> ' +
-              '<b class="ticker-link" onclick="openTickerDrawer(\'' + esc(s.symbol) + '\')">' + esc(s.symbol) + '</b>' +
+              '<b class="ticker-link" onclick="openTickerDrawer(\\'' + esc(s.symbol) + '\\')">' + esc(s.symbol) + '</b>' +
               (s.reason ? ' <span class="hint">— ' + linkifyTickers(s.reason) + '</span>' : '') +
             '</div>';
           }).join("");
@@ -1489,7 +1489,7 @@ PAGE = """<!doctype html>
           const pnl = val - basis;
           const up = pnl >= 0;
           return '<tr>' +
-            '<td><b class="ticker-link" onclick="openTickerDrawer(\'' + esc(p.symbol) + '\')">' + esc(p.symbol) + '</b></td>' +
+            '<td><b class="ticker-link" onclick="openTickerDrawer(\\'' + esc(p.symbol) + '\\')">' + esc(p.symbol) + '</b></td>' +
             '<td class="num">' + p.shares + '</td>' +
             '<td class="num">' + money(p.avg_cost) + '</td>' +
             '<td class="num">' + money(p.price) + '</td>' +
