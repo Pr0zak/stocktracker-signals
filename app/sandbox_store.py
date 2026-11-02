@@ -479,7 +479,8 @@ def delete_arm(arm: str) -> None:
 
 
 def ensure_single_share_arms() -> None:
-    """Ensure the two comparison single-share arms exist."""
+    """Ensure the single-share arms exist: one share of one stock or ETF a day (analyst and rules),
+    and `oneetf`, one share of one ETF a day chosen by the analyst from the ETF-only universe."""
     existing = set(list_arms())
     if "oneshare" not in existing:
         try:
@@ -501,6 +502,21 @@ def ensure_single_share_arms() -> None:
                 "funding_mode": "jit",
                 "allow_sells": False,
                 "max_position_pct": 100.0,
+                "cash_floor_pct": 0.0,
+                "max_trades_per_tick": 1,
+                "master_enabled": True,
+            })
+        except ArmError:
+            pass
+    if "oneetf" not in existing:
+        try:
+            create_arm("oneetf", engine="llm", label="One ETF Daily (Analyst)", settings={
+                "single_share": True,
+                "funding_mode": "jit",
+                "allow_sells": False,
+                "universe": "etf",
+                "max_position_pct": 100.0,
+                "broad_position_pct": 100.0,
                 "cash_floor_pct": 0.0,
                 "max_trades_per_tick": 1,
                 "master_enabled": True,

@@ -1728,6 +1728,22 @@ SINGLE_SHARE_DAILY_NOTE = """ARM INSTRUCTION: SINGLE-SHARE DAILY ACCUMULATOR
 - Rule 3: Pick your single highest-conviction ticker for long-term compounding from the candidates.
 - Rule 4: There are NO position caps, NO cash floor, and Just-In-Time funding covers your purchase. Focus entirely on picking the best asset."""
 
+# The one-share arm on the ETF-only universe ("oneetf"). Replaces BOTH notes above: the single-share
+# note says "no caps", the ETF note explains group caps and plan cuts, and sent together they
+# contradict each other on the one rule the model needs to get right.
+ONE_ETF_DAILY_NOTE = """ARM INSTRUCTION: ONE ETF A DAY
+- This account buys EXACTLY 1 share of ONE ETF each trading day and never sells.
+- Rule 1: Propose AT MOST ONE (1) buy order for EXACTLY 1 share (shares=1.0). No sell orders.
+- Rule 2: Every candidate is a fund; the ledger refuses anything not on its fund list.
+- Rule 3: There are NO position or group caps, NO cash floor, and Just-In-Time funding covers the \
+purchase. Price per share does not matter; pick the fund that best builds this book over decades.
+- Rule 4: Prefer filling what the book lacks (the plan's `allocation_gaps`) over adding to what it \
+already has plenty of. A sound fund that has pulled back (above its 200-day, under its high) is a \
+better price, not a warning.
+- Each row carries `fee_pct`, `return_pct`/`worst_drop_pct` over 1y/3y/5y, and `same_index_as`. \
+The server routes the buy to the cheapest fund holding the same index (or the copy already held), \
+so name whichever fund in the group you want; the share is then 1 share of that copy."""
+
 
 
 # ======================================================================================

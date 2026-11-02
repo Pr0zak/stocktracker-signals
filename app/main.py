@@ -40,6 +40,7 @@ from .analyst import (
     ETF_REVIEW_NOTE,
     ETF_STRATEGY_NOTE,
     SINGLE_SHARE_DAILY_NOTE,
+    ONE_ETF_DAILY_NOTE,
 )
 from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
@@ -3760,7 +3761,8 @@ async def _run_extra_arm(
                 cash_today=sandbox_job.cash_for_prompt(
                     blob, equity=book.get("total_value"),
                     now=now),
-                extra_system=SINGLE_SHARE_DAILY_NOTE if settings.get("single_share") else (ETF_DAILY_NOTE if etf else None),
+                extra_system=((ONE_ETF_DAILY_NOTE if etf else SINGLE_SHARE_DAILY_NOTE)
+                              if settings.get("single_share") else (ETF_DAILY_NOTE if etf else None)),
                 extra_payload=_extra_payload)
             usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
             _arm_orders = [o.model_dump() for o in decision.orders]

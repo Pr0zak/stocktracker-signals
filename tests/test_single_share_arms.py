@@ -252,7 +252,45 @@ def test_ensure_single_share_arms(store):
     assert arm_rules["settings"]["allow_sells"] is False
     assert arm_rules["settings"]["master_enabled"] is True
 
+    arm_etf = store.get("oneetf")
+    assert arm_etf["engine"] == "llm"
+    assert arm_etf["settings"]["single_share"] is True
+    assert arm_etf["settings"]["universe"] == "etf"
+    assert arm_etf["settings"]["funding_mode"] == "jit"
+    assert arm_etf["settings"]["allow_sells"] is False
+    assert arm_etf["settings"]["master_enabled"] is True
+
     # Idempotent
     store.ensure_single_share_arms()
     assert store.list_arms().count("oneshare") == 1
     assert store.list_arms().count("oneshare-rules") == 1
+    assert store.list_arms().count("oneetf") == 1
+
+
+def test_one_etf_arm_buys_one_share_of_a_fund_and_refuses_a_stock():
+    """`oneetf`: one share, no caps, and only funds on the ETF list — the fund-list check comes from
+    the arm's ETF universe, not from the single-share mode."""
+    from app import etf_arm
+    from app.main import _arm_fill_rules
+    settings = {"single_share": True, "universe": "etf", "allow_sells": False,
+                "cash_floor_pct": 0.0, "slippage_bps": 0}
+    blob = {"cash": 700.0, "funded_total": 700.0, "positions": [], "settings": settings}
+    orders = [
+        {"symbol": "AAPL", "side": "buy", "conviction": 95, "shares": 1.0},
+        {"symbol": "VOO", "side": "buy", "conviction": 90, "shares": 1.0},
+    ]
+    _, filled, skipped = sandbox_job.validate_and_fill(
+        blob, orders, price_of=lambda s: 600.0, **_arm_fill_rules(settings, None))
+    assert [f["symbol"] for f in filled] == ["VOO"]
+    assert filled[0]["shares"] == 1.0
+    assert skipped[0]["symbol"] == "AAPL"
+    assert skipped[0]["skip_reason"] == sandbox_job.ALLOWED_BUYS_SKIP
+    assert etf_arm.is_etf_arm(settings)
+
+
+def test_one_etf_arm_gets_its_own_note():
+    from app import analyst
+    note = analyst.ONE_ETF_DAILY_NOTE
+    assert "EXACTLY 1 share" in note and "ETF" in note
+    # The ETF note's group-cap rules must not ride along: this arm has no caps.
+    assert "CAPS ARE PER GROUP" not in note
