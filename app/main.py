@@ -1062,8 +1062,8 @@ async def heatmap_endpoint(mode: str = "market", limit: int = 80, refresh: bool 
     runs on the device against the real width.
     """
     assert _http is not None
-    if mode not in ("market", "signals"):
-        raise HTTPException(status_code=422, detail="mode must be 'market' or 'signals'")
+    if mode not in ("market", "signals", "etf"):
+        raise HTTPException(status_code=422, detail="mode must be 'market', 'signals' or 'etf'")
     limit = max(1, min(200, limit))
     cfg = settings_store.get()
     now = time.time()
@@ -1079,6 +1079,9 @@ async def heatmap_endpoint(mode: str = "market", limit: int = 80, refresh: bool 
                      "tier — not by price. Context, not a buy signal."),
             "cached": False,
         }
+
+    if mode == "etf":
+        return await _etf_heatmap(refresh=refresh, now=now)
 
     key = ("heatmap_market", limit)
     hit = _cache.get(key)
@@ -1126,6 +1129,40 @@ async def heatmap_endpoint(mode: str = "market", limit: int = 80, refresh: bool 
         "session": phase,
         "note": ("Sized by market cap, coloured by the move for the session in progress"
                  + (f" ({phase})." if phase else ".")),
+        "cached": False,
+    }
+    _cache[key] = (now, payload)
+    return payload
+
+
+async def _etf_heatmap(*, refresh: bool, now: float) -> dict:
+    """mode=etf: the fund catalogue's ETFs, sized by fund assets (square-root scale), coloured by
+    the session's move, grouped by fund type. Same 60-second quote cache as the market map."""
+    key = ("heatmap_etf",)
+    hit = _cache.get(key)
+    if hit and not refresh and now - hit[0] < 60:
+        return {**hit[1], "cached": True, "cached_age_seconds": int(now - hit[0])}
+    build = await fund_catalog.explore(_http, saved=_EXPENSE_RATIO_PCT, saved_as_of=_EXPENSE_RATIO_AS_OF)
+    funds = build.get("funds") or []
+    syms = [f["symbol"] for f in funds if f.get("kind") == "etf"]
+    try:
+        quotes = await market_now.fetch_quotes(_http, syms)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"quote fetch failed: {redact.redact(e)}")
+    try:
+        phase = market_now.session_phase()
+    except Exception:  # noqa: BLE001
+        phase = None
+    tiles, unpriced = heatmap.etf_tiles(funds, dict(fund_catalog.CATEGORIES), quotes, phase=phase)
+    if not tiles:
+        raise HTTPException(status_code=502, detail="no ETF tiles could be priced")
+    up = sum(1 for t in tiles if t["value"] > 0)
+    payload = {
+        "mode": "etf", "as_of": now, "tiles": tiles, "unpriced": unpriced,
+        "advancing": up, "declining": len(tiles) - up,
+        "scale": "price", "session": phase,
+        "note": ("Sized by fund assets on a square-root scale, coloured by the move for the session "
+                 "in progress" + (f" ({phase})." if phase else ".")),
         "cached": False,
     }
     _cache[key] = (now, payload)

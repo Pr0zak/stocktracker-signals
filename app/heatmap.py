@@ -135,3 +135,44 @@ def signal_tiles(scan: dict | None, *, limit: int) -> tuple[list[dict], list[str
         })
     tiles.sort(key=lambda t: -t["size"])
     return tiles[:limit], skipped
+
+
+def etf_tiles(funds: list[dict], categories: dict[str, str], quotes: dict, *,
+              phase: str | None = None) -> tuple[list[dict], list[str]]:
+    """The ETF map: one tile per catalogue ETF, grouped by its catalogue type, coloured by the move
+    for the session in progress.
+
+    AREA is the square root of the fund's assets. On a linear scale VOO alone ($1.7T) outweighs
+    every sector, bond and crypto fund together, and the map becomes four S&P 500 copies with
+    slivers around them; the root keeps the order (bigger fund, bigger tile) while leaving the small
+    ones big enough to read. The app's legend says so.
+
+    Mutual funds are left out: they price once a day after the close, so they have no move to show
+    during the session. A fund with no quote or no asset figure is named in `unpriced`, never
+    drawn at a made-up size.
+    """
+    tiles: list[dict] = []
+    unpriced: list[str] = []
+    for f in funds:
+        if f.get("kind") != "etf":
+            continue
+        sym = f["symbol"]
+        q = quotes.get(sym) or {}
+        price = q.get("price")
+        pct = _session_pct(q, phase)
+        assets = f.get("net_assets")
+        if price is None or pct is None or not isinstance(assets, (int, float)) or assets <= 0:
+            unpriced.append(sym)
+            continue
+        tiles.append({
+            "symbol": sym,
+            "name": f.get("name") or sym,
+            "size": round((float(assets) / 1e9) ** 0.5, 3),
+            "value": round(float(pct), 2),
+            "scale": "price",
+            "price": round(float(price), 2),
+            "sector": categories.get(f.get("category") or ""),
+            # The real figure, for the tile's detail; `size` is only the drawing scale.
+            "net_assets_b": round(float(assets) / 1e9, 2),
+        })
+    return tiles, unpriced

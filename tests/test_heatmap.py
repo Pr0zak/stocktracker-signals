@@ -115,3 +115,41 @@ def test_a_missing_session_figure_falls_back_rather_than_dropping_the_tile():
     q = {"AAPL": {"price": 300.0, "pct": 2.0}}          # no pre_pct at all
     tiles, unpriced = h.market_tiles(uni, q, limit=5, phase="PRE")
     assert tiles[0]["value"] == 2.0 and unpriced == []
+
+
+CATS = {"us": "US stocks", "bonds": "Bonds & cash"}
+
+
+def test_etf_tiles_sqrt_size_category_block_and_skip_mutual_funds():
+    funds = [
+        {"symbol": "VOO", "name": "S&P 500", "category": "us", "kind": "etf", "net_assets": 1600e9},
+        {"symbol": "BND", "name": "US bonds", "category": "bonds", "kind": "etf", "net_assets": 100e9},
+        {"symbol": "FXAIX", "name": "S&P 500", "category": "us", "kind": "mutual_fund", "net_assets": 600e9},
+    ]
+    q = {"VOO": {"price": 600.0, "pct": -0.5}, "BND": {"price": 72.0, "pct": 0.1}}
+    tiles, unpriced = h.etf_tiles(funds, CATS, q)
+    by = {t["symbol"]: t for t in tiles}
+    assert set(by) == {"VOO", "BND"}            # the mutual fund has no intraday move
+    assert by["VOO"]["size"] == 40.0             # sqrt(1600)
+    assert by["BND"]["size"] == 10.0
+    assert by["VOO"]["net_assets_b"] == 1600.0
+    assert by["BND"]["sector"] == "Bonds & cash"
+    assert by["VOO"]["value"] == -0.5 and by["VOO"]["scale"] == "price"
+    assert unpriced == []
+
+
+def test_etf_tiles_name_unpriced_and_unsized_never_guess():
+    funds = [
+        {"symbol": "A", "category": "us", "kind": "etf", "net_assets": 5e9},
+        {"symbol": "B", "category": "us", "kind": "etf", "net_assets": None},
+    ]
+    tiles, unpriced = h.etf_tiles(funds, CATS, {"B": {"price": 1.0, "pct": 1.0}})
+    assert tiles == []
+    assert unpriced == ["A", "B"]
+
+
+def test_etf_tiles_use_the_premarket_move_before_the_open():
+    funds = [{"symbol": "VOO", "category": "us", "kind": "etf", "net_assets": 1e9}]
+    q = {"VOO": {"price": 600.0, "pct": 1.2, "pre_pct": -0.4}}
+    tiles, _ = h.etf_tiles(funds, CATS, q, phase="PRE")
+    assert tiles[0]["value"] == -0.4
