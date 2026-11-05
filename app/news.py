@@ -245,6 +245,36 @@ async def earnings_on(
     return {s for s in want if _match_keys(s) & reported}, True
 
 
+async def _calendar_rows(
+    client: httpx.AsyncClient, start: str, end: str, *, wait: float = _DEFAULT_WAIT,
+) -> list | None:
+    """Every market-wide calendar row from `start` to `end` (inclusive), or None if any part of the
+    window could not be read. A window at the truncation cap is halved and each half fetched; a
+    single day at the cap is unknowable and returns None."""
+    body = await _get(client, "/calendar/earnings", {"from": start, "to": end},
+                      what=f"earnings calendar {start}..{end}", wait=wait)
+    if not isinstance(body, dict):
+        return None
+    cal = body.get("earningsCalendar")
+    if not isinstance(cal, list):
+        return None
+    if len(cal) < _CALENDAR_ROW_CAP:
+        return cal
+    d0, d1 = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
+    if d0 >= d1:
+        log.warning("news: earnings calendar for %s returned %d rows — at the truncation cap even "
+                    "for one day, so it is unknown rather than read", start, len(cal))
+        return None
+    mid = d0 + (d1 - d0) // 2
+    left = await _calendar_rows(client, start, mid.isoformat(), wait=wait)
+    if left is None:
+        return None
+    right = await _calendar_rows(client, (mid + dt.timedelta(days=1)).isoformat(), end, wait=wait)
+    if right is None:
+        return None
+    return left + right
+
+
 async def earnings_between(
     client: httpx.AsyncClient, start: str, end: str, symbols: list[str] | set[str], *,
     wait: float = _DEFAULT_WAIT,
@@ -253,23 +283,20 @@ async def earnings_between(
     YYYY-MM-DD, inclusive), in ONE market-wide request. Returns (dates, ok).
 
     For the Daily Pick's earnings blackout: a week of the calendar is a few hundred rows, well under
-    `_CALENDAR_ROW_CAP`, so one call answers the whole shortlist instead of one call per name. A result
-    AT the cap is treated as unknown (ok False), exactly as earnings_on does — the cap truncates to
-    the tail, so a capped week would silently drop its first days.
+    `_CALENDAR_ROW_CAP`, so one call answers the whole shortlist instead of one call per name.
+
+    Except in peak earnings season, when it is not: every run from 2026-10-28 to 11-05 hit exactly
+    1500 rows for its 7-day window, refused the result as the cap requires, and the Daily Pick ran
+    seven straight mornings with no earnings blackout at all. A window that reaches the cap is now
+    split in half and each half asked again, down to single days (~35-300 rows even in season). Only
+    a single day at the cap, or any failed request, leaves the answer unknown (ok False) — the cap
+    truncates to the tail, so a capped result is never read.
     """
     want = [str(s).strip().upper() for s in symbols if str(s).strip()]
     if not want:
         return {}, True
-    body = await _get(client, "/calendar/earnings", {"from": start, "to": end},
-                      what=f"earnings calendar {start}..{end}", wait=wait)
-    if not isinstance(body, dict):
-        return {}, False
-    cal = body.get("earningsCalendar")
-    if not isinstance(cal, list):
-        return {}, False
-    if len(cal) >= _CALENDAR_ROW_CAP:
-        log.warning("news: earnings calendar %s..%s returned %d rows — at the truncation cap, so "
-                    "the window is unknown rather than read", start, end, len(cal))
+    cal = await _calendar_rows(client, start, end, wait=wait)
+    if cal is None:
         return {}, False
     first: dict[str, str] = {}
     for r in cal:
@@ -289,6 +316,15 @@ async def earnings_between(
     return out, True
 
 
+def _is_mutual_fund(symbol: str) -> bool:
+    """Five letters ending in X is the NASDAQ suffix reserved for mutual funds (PTDAX, PIODX). Funds
+    file no earnings and Finnhub's free tier answers both company-news and the per-symbol calendar
+    for them with HTTP 403 — two wasted requests per fund per scan out of a 60-a-minute budget, which
+    on 2026-11-05 left NVDA's earnings lookup skipped for want of a slot."""
+    s = str(symbol or "").strip().upper()
+    return len(s) == 5 and s.isalpha() and s.endswith("X")
+
+
 async def fetch_next_earnings(
     client: httpx.AsyncClient, symbol: str, *, wait: float = _DEFAULT_WAIT,
 ) -> EarningsLookup:
@@ -297,6 +333,8 @@ async def fetch_next_earnings(
     Split out of `fetch_context` for NEWS-7: callers that want only the date were paying for a
     headline fetch they then threw away, which doubled the demand on a 60-a-minute budget.
     """
+    if _is_mutual_fund(symbol):
+        return EarningsLookup(None, True)  # a fund reports no earnings; that is a checked answer
     today = dt.date.today()
     body = await _get(
         client, "/calendar/earnings",
@@ -327,6 +365,8 @@ async def fetch_headlines(
     client: httpx.AsyncClient, symbol: str, *, wait: float = _DEFAULT_WAIT,
 ) -> list[str] | None:
     """A few recent headlines for the analyst snapshot. None means the lookup failed."""
+    if _is_mutual_fund(symbol):
+        return None  # not covered on the free tier; absent, not "no news"
     today = dt.date.today()
     news = await _get(
         client, "/company-news",

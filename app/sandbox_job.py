@@ -1231,7 +1231,11 @@ def next_deposit(blob: dict, *, now: dt.datetime | None = None) -> dict | None:
         else:
             opens = first_next
         d = next_trading_day_on_or_after(opens)
-    return {"date": d.isoformat(), "dollars": round(amount, 2)}
+    # The weekday and day count are for the model, not the code. On 2026-11-05 the main arm was
+    # given "2026-11-16" and wrote "Deposits arriving 11 Nov" in its posture — the month read as
+    # the day. Three plainly stated forms of one date leave nothing to parse.
+    return {"date": d.isoformat(), "weekday": d.strftime("%A"), "days_away": (d - today).days,
+            "dollars": round(amount, 2)}
 
 
 def next_trading_day_on_or_after(d: dt.date) -> dt.date:

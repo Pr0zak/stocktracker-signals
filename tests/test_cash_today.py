@@ -24,7 +24,8 @@ def _nd(settings, day, last):
 
 def test_semimonthly_after_the_15th_is_next_month_first_trading_day():
     # 2026-11-01 is a Sunday, so the deposit lands Monday the 2nd — the case behind this file.
-    assert _nd(SEMI, "2026-10-30", "2026-10-H2") == {"date": "2026-11-02", "dollars": 250.0}
+    assert _nd(SEMI, "2026-10-30", "2026-10-H2") == {"date": "2026-11-02", "weekday": "Monday",
+                                                    "days_away": 3, "dollars": 250.0}
 
 
 def test_open_but_unpaid_window_lands_on_the_next_tick():
@@ -102,3 +103,11 @@ def test_review_and_decision_payloads_carry_the_new_blocks(monkeypatch):
     # Absent stays absent: no empty block asserting a calm backdrop.
     asyncio.run(analyst.review_decision(dec, book, [], cash=50.0, settings={}, strategy_note=None))
     assert "macro" not in seen[2]
+
+
+def test_next_deposit_spells_the_date_three_ways():
+    """The model misread an ISO date once ("2026-11-16" became "11 Nov"); weekday + count can't be."""
+    nxt = _nd(SEMI, "2026-11-05", "2026-11-H1")
+    assert nxt["date"] == "2026-11-16"
+    assert nxt["weekday"] == "Monday"
+    assert nxt["days_away"] == 11

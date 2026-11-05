@@ -477,3 +477,63 @@ def test_a_short_test_window_is_not_shackled_by_the_per_second_rule():
     sub-second test window would silently inherit a 1-second ceiling."""
     r = _RateLimiter(per_window=10, window=0.20)
     assert r._rules == [(0.20, 10)]
+
+
+def test_a_capped_window_is_split_until_each_part_reads():
+    """Peak earnings season: a 7-day window reaches the 1500-row cap. Halving it until each part is
+    under the cap must recover the full answer rather than give up (2026-10-28..11-05 gave up)."""
+    from app.news import earnings_between
+
+    asked: list[tuple[str, str]] = []
+
+    def handler(req):
+        a, b = req.url.params["from"], req.url.params["to"]
+        asked.append((a, b))
+        if a != b:  # any multi-day window looks truncated
+            return _calendar([{"symbol": f"F{i}", "date": a} for i in range(news._CALENDAR_ROW_CAP)])
+        rows = [{"symbol": f"D{i}", "date": a} for i in range(300)]
+        if a == "2026-11-03":
+            rows.append({"symbol": "SYM7", "date": a})
+        return _calendar(rows)
+
+    async def body():
+        async with _client(handler) as c:
+            return await earnings_between(c, "2026-11-01", "2026-11-07", WATCHLIST)
+
+    dates, ok = run(body())
+    assert ok is True
+    assert dates == {"SYM7": "2026-11-03"}
+    assert {a for a, b in asked if a == b} == {f"2026-11-0{d}" for d in range(1, 8)}
+
+
+def test_a_single_capped_day_still_leaves_the_window_unknown():
+    from app.news import earnings_between
+
+    def handler(req):
+        return _calendar([{"symbol": f"F{i}", "date": req.url.params["from"]}
+                          for i in range(news._CALENDAR_ROW_CAP)])
+
+    async def body():
+        async with _client(handler) as c:
+            return await earnings_between(c, "2026-11-01", "2026-11-02", WATCHLIST)
+
+    assert run(body()) == ({}, False)
+
+
+def test_a_mutual_fund_spends_no_finnhub_requests():
+    """Finnhub's free tier 403s funds; asking costs budget slots other symbols needed."""
+    calls: list[httpx.Request] = []
+
+    def handler(req):
+        calls.append(req)
+        return httpx.Response(403)
+
+    async def body():
+        async with _client(handler) as c:
+            return await fetch_context(c, "PTDAX"), await fetch_next_earnings(c, "PIODX")
+
+    ctx, earn = run(body())
+    assert calls == []
+    assert ctx == {}
+    assert earn == EarningsLookup(None, True)
+    assert news._is_mutual_fund("NVDA") is False and news._is_mutual_fund("GOOGL") is False
