@@ -1,0 +1,100 @@
+{
+  "arms": [
+    {
+      "arm": "main",
+      "enabled": false,
+      "engine": "llm",
+      "filled": [],
+      "label": "Main",
+      "last_tick_date": null,
+      "posture": "",
+      "ran": false,
+      "skipped": [],
+      "universe": "all"
+    },
+    {
+      "arm": "oneetf",
+      "enabled": true,
+      "engine": "llm",
+      "filled": [],
+      "label": "One ETF Daily (Analyst)",
+      "last_tick_date": null,
+      "posture": "",
+      "ran": false,
+      "skipped": [],
+      "universe": "etf"
+    },
+    {
+      "arm": "oneshare",
+      "enabled": true,
+      "engine": "llm",
+      "filled": [],
+      "label": "One Share Daily (Analyst)",
+      "last_tick_date": null,
+      "posture": "",
+      "ran": false,
+      "skipped": [],
+      "universe": "all"
+    },
+    {
+      "arm": "oneshare-rules",
+      "enabled": true,
+      "engine": "rules",
+      "filled": [],
+      "label": "One Share Daily (Rules)",
+      "last_tick_date": null,
+      "posture": "",
+      "ran": false,
+      "skipped": [],
+      "universe": "all"
+    },
+    {
+      "arm": "options-rules",
+      "enabled": true,
+      "engine": "rules",
+      "filled": [
+        {
+          "gross": 1645.0,
+          "instrument": "option",
+          "price": 16.45,
+          "shares": 1,
+          "side": "buy",
+          "symbol": "SPY $760 CALL EXP 2027-01-16"
+        },
+        {
+          "gross": 1240.0,
+          "instrument": "option",
+          "price": 12.4,
+          "shares": 1,
+          "side": "sell",
+          "symbol": "QQQ $670 PUT EXP 2027-01-16"
+        }
+      ],
+      "label": "Options (no AI)",
+      "last_tick_date": "2026-11-15",
+      "posture": "",
+      "ran": true,
+      "skipped": [
+        {
+          "gross": null,
+          "instrument": "option",
+          "price": null,
+          "reason": "conviction 40 under the 55 floor",
+          "shares": 0,
+          "side": "buy",
+          "symbol": "IWM CALL"
+        }
+      ],
+      "universe": "options"
+    }
+  ],
+  "date": "2026-11-15",
+  "ran_at": null,
+  "totals": {
+    "bought": 1645.0,
+    "buys": 1,
+    "sells": 1,
+    "skipped": 1,
+    "sold": 1240.0
+  }
+}

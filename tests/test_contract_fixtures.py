@@ -332,3 +332,81 @@ def test_write_scan_latest_fixture(client, monkeypatch, tmp_path):
     assert near_miss_symbols == {"MSFT"}
 
     _write_fixture("scan_latest.json", body)
+
+
+# ---------------------------------------------------------------- long-options arm (0.49.0)
+
+def test_write_options_fixtures(client, monkeypatch):
+    """The options arm's three app-facing payloads, from the real fill code and the real routes:
+    /sandbox/state (one held contract with a fresh mark, one valued from a stale mark), the trade log
+    (an open, a close at a loss with its index comparison, a skip), and /sandbox/today. The app decodes
+    these with its own Http.json, so a type it reads wrongly (an int written as a float) fails there."""
+    import app.main as m
+    import app.options_arm as oa
+    import app.sandbox_store as ss
+    from tests.test_options_arm import _blob, _cand, _contract, _fill, _quote
+
+    prices = {"^GSPC": 750.0}
+
+    async def fake_quotes(http, syms):
+        return {s: ({"price": prices[s]} if prices.get(s) is not None else None) for s in syms}
+
+    monkeypatch.setattr(m.market_now, "fetch_quotes", fake_quotes)
+    r = client.post("/sandbox/arms", json={"arm": "options-rules", "engine": "rules", "label": "Options (no AI)",
+                                            "fund": 10000.0, "settings": {"universe": "options"}})
+    assert r.status_code == 200, r.text
+
+    # One run through the real ledger: close a QQQ put at the bid (a loss), open a SPY call at the
+    # ask, and have a third order refused.
+    held = _contract("QQQ", "put", strike=670, premium=17.99, count=1, spot_at_open=680.0)
+    blob = {**_blob(contracts=[held]), **{k: v for k, v in ss.get("options-rules").items()
+                                          if k in ("benchmark", "funded_total", "created_at", "arm", "label")}}
+    blob["engine"] = "rules"
+    close_q = _quote("QQQ", "put", 670, bid=12.40, ask=12.70, delta=0.40, spot=692.0)
+    close_q["contract_symbol"] = held["contract_symbol"]
+    orders = [
+        {"symbol": "QQQ", "underlying": "QQQ", "right": "put", "action": "close", "reason": "score turned up"},
+        {"symbol": "SPY", "underlying": "SPY", "right": "call", "action": "open", "conviction": 62,
+         "reason": "directional score 62: MACD positive"},
+        {"symbol": "IWM", "underlying": "IWM", "right": "call", "action": "open", "conviction": 40,
+         "reason": "directional score 60"},
+    ]
+    nb, filled, skipped = _fill(blob, orders, [_cand("SPY", score=62), _cand("IWM", score=60)],
+                                marks={held["contract_symbol"]: close_q}, spy=760.0)
+    assert {f["side"] for f in filled} == {"sell_to_close", "buy_to_open"}, (filled, skipped)
+    assert skipped
+    # A second contract with no quote today: valued from its last mark and flagged stale.
+    nb["options"]["contracts"].append(_contract("AAPL", "call", strike=360, premium=12.65, count=1,
+                                                spot_at_open=340.0))
+    nb["last_tick_date"] = filled[0]["date"]
+    ss.save(nb, arm="options-rules")
+    for row in filled + skipped:
+        ss.append_trade(row, arm="options-rules")
+
+    spy_open = nb["options"]["contracts"][0]
+    fresh = _quote("SPY", "call", spy_open["strike"], bid=17.10, ask=17.30, delta=0.53, spot=756.0)
+    fresh["contract_symbol"] = spy_open["contract_symbol"]
+
+    async def fake_context(http, *, rows, held, now_ts, earnings_of, is_fund, settings, record_iv):
+        return {"marks": {fresh["contract_symbol"]: fresh}, "candidates": []}
+
+    monkeypatch.setattr(m.options_arm, "build_context", fake_context)
+    prices["^GSPC"] = 760.0
+
+    state = client.get("/sandbox/state?arm=options-rules")
+    assert state.status_code == 200, state.text
+    st = state.json()
+    assert st["positions"] == [] and len(st["contracts"]) == 2
+    by = {c["underlying"]: c for c in st["contracts"]}
+    assert by["SPY"]["mark_stale"] is False and by["AAPL"]["mark_stale"] is True
+    assert st["options_scorecard"]["closed"] == 1
+    trades = client.get("/sandbox/trades?arm=options-rules&limit=50")
+    assert trades.status_code == 200, trades.text
+    today = client.get("/sandbox/today?show_options=true")
+    assert today.status_code == 200, today.text
+    assert any(a["arm"] == "options-rules" and a["filled"] for a in today.json()["arms"])
+
+    _write_fixture("options_state.json", st)
+    _write_fixture("options_trades.json", trades.json())
+    _write_fixture("options_today.json", today.json())
+    assert oa.UNIVERSE_OPTIONS == "options"
