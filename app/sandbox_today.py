@@ -21,6 +21,9 @@ from __future__ import annotations
 import re
 
 _TRADE_SIDES = ("buy", "sell")
+# The long-options arms write their own side values (see options_arm.SIDES) so share readers skip
+# them by construction; this card is one reader that wants them, folded onto buy/sell.
+_OPTION_SIDES = {"buy_to_open": "buy", "sell_to_close": "sell", "expired": "sell", "settled": "sell"}
 
 # Skip reasons are written for the log and run long (a reviewer's reason can be a paragraph). The card
 # has one line per order, so the common ones get a short plain name and the rest their first clause.
@@ -48,13 +51,16 @@ def short_reason(reason: str | None) -> str:
 
 
 def _order(row: dict) -> dict:
+    side = str(row.get("side") or "").lower()
     out = {
-        "symbol": str(row.get("symbol") or "").upper(),
-        "side": str(row.get("side") or "").lower(),
+        "symbol": str(row.get("display") or row.get("symbol") or "").upper(),
+        "side": _OPTION_SIDES.get(side, side),
         "shares": row.get("shares"),
         "price": row.get("price"),
         "gross": row.get("gross"),
     }
+    if row.get("instrument") == "option":
+        out["instrument"] = "option"
     if row.get("status") == "skipped":
         out["reason"] = short_reason(row.get("skip_reason"))
     return out
@@ -80,7 +86,8 @@ def summarize(arms: list[dict], trades: dict[str, list[dict]], ran_at: dict[str,
         filled, skips = [], []
         if ran:
             for t in trades.get(arm, []):
-                if str(t.get("date")) != day or str(t.get("side") or "").lower() not in _TRADE_SIDES:
+                _side = str(t.get("side") or "").lower()
+                if str(t.get("date")) != day or (_side not in _TRADE_SIDES and _side not in _OPTION_SIDES):
                     continue
                 if t.get("status") == "filled":
                     filled.append(_order(t))

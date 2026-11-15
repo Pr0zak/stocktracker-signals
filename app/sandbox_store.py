@@ -214,6 +214,20 @@ DEFAULT_SETTINGS = {
     "funding_mode": "cash",
     # When False, sells are prohibited (pure buy-and-hold accumulation)
     "allow_sells": True,
+    # The long-calls-and-puts arms (universe "options", app/options_arm.py). Mirrors
+    # options_arm.DEFAULTS — a test asserts the two agree — so an options arm's limits ride in its
+    # settings block like every other arm's and the twins can be told apart by a diff of two blocks.
+    "opt_max_premium_pct": 15.0,     # premium on one contract position, % of equity
+    "opt_max_at_risk_pct": 30.0,     # all open premium together, % of equity
+    "opt_max_open": 6,
+    "opt_max_new_per_tick": 2,
+    "opt_exit_dte": 21,              # close at or under this many days to expiry
+    "opt_stop_pct": -50.0,           # close at this loss on the premium
+    "opt_target_pct": 100.0,         # close at this gain on the premium
+    "opt_max_spread_pct": 10.0,      # (ask - bid) / mid, percent, to be bought at all
+    "opt_min_oi": 250,
+    "opt_pause_drawdown_pct": 10.0,  # a drawdown this deep pauses new entries ...
+    "opt_pause_ticks": 5,            # ... for this many runs
 }
 
 
@@ -230,6 +244,10 @@ def _defaults(arm: str = MAIN_ARM, *, engine: str = "llm", label: str | None = N
         "cash": 0.0,
         "realized_pl_total": 0.0,
         "positions": [],   # [{symbol, shares, avg_cost, exposure_group, opened_at, last_add_at}]
+        # The long-calls-and-puts arms keep their book HERE, never in `positions`: a contract is a
+        # hundred shares of something else with its own quote and an expiry, and every reader of
+        # `positions` sizes by shares. See app/options_arm.py. Empty and unread on every other arm.
+        "options": {"contracts": [], "signals": {}, "pause_ticks_left": 0, "marks_as_of": None},
         "benchmark": {"symbol": "^GSPC", "shares": 0.0, "cost_basis": 0.0},
         "settings": dict(DEFAULT_SETTINGS),
         "last_tick_date": None,           # ET yyyy-mm-dd — idempotency cursor

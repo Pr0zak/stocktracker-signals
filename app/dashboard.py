@@ -1439,7 +1439,7 @@ PAGE = """<!doctype html>
     try {
       const [st, td] = await Promise.all([
         (await afetch("/sandbox/state?arm=" + encodeURIComponent(id))).json(),
-        (await afetch("/sandbox/today?arm=" + encodeURIComponent(id))).json().catch(() => ({orders: [], skipped: []})),
+        (await afetch("/sandbox/today?show_options=true&arm=" + encodeURIComponent(id))).json().catch(() => ({orders: [], skipped: []})),
       ]);
 
       if (st.note && (st.note.notes || st.note.themes)) {
@@ -1549,7 +1549,7 @@ PAGE = """<!doctype html>
 
   async function loadArms() {
     try {
-      const r = await (await afetch("/sandbox/arms")).json();
+      const r = await (await afetch("/sandbox/arms?show_options=true")).json();
       ARMS = r.arms || [];
     } catch (e) {
       $("arms-body").innerHTML = '<tr><td colspan="9" class="err-t">couldn’t load arms</td></tr>';

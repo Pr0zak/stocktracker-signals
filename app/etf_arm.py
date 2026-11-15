@@ -51,7 +51,10 @@ from .sandbox_job import (BTC_ETFS, GOLD_ETFS, effective_age, prefer_vehicle)
 
 UNIVERSE_ALL = "all"
 UNIVERSE_ETF = "etf"
-UNIVERSES = (UNIVERSE_ALL, UNIVERSE_ETF)
+# "options" is the long-calls-and-puts arms' universe (app/options_arm.py). Listed here because this
+# tuple is what the settings endpoint validates against; nothing else in this module reads it, and
+# is_etf_arm stays an exact match on "etf".
+UNIVERSES = (UNIVERSE_ALL, UNIVERSE_ETF, "options")
 
 DEFAULT_BROAD_POSITION_PCT = 60.0
 

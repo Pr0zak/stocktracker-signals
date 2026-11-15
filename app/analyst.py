@@ -1968,3 +1968,123 @@ async def ask(question: str, context: dict, *, deep: bool = True) -> tuple[AskAn
         + "\n\nReturn the AskAnswer."
     )
     return await _parse(ASK_SYSTEM, prompt, AskAnswer, deep=deep, max_tokens=2048)
+
+
+# ======================================================================================
+# The long-calls-and-puts arms (app/options_arm.py). Separate prompts on purpose: the stock
+# prompts treat a short horizon as a defect and allow two reasons to sell, which condemns every
+# contract in a book whose instruments expire in two months.
+# ======================================================================================
+
+class OptionsOrder(BaseModel):
+    underlying: str          # the stock or ETF ticker; the server picks the contract
+    right: str               # "call" | "put"
+    action: str              # "open" | "close"
+    conviction: int          # 0-100; sizes the contract count inside the cap
+    reason: str              # one sentence grounded in the numbers given
+
+
+class OptionsDecision(BaseModel):
+    posture: str                     # one-line read of today's plan
+    orders: list[OptionsOrder]       # may be empty = hold
+    hold_reasons: list[str] = []     # why notable candidates or contracts were left alone
+
+
+OPTIONS_SYSTEM = """You run a FICTIONAL paper-trading account (no real money) that buys LONG CALLS and \
+LONG PUTS only. No shares, no short options, no spreads. Each trading day you make ONE decision: a short \
+list of underlyings to open a call or a put on, plus any held contract you want closed early.
+
+THE QUESTION THIS ACCOUNT EXISTS TO ANSWER, in dollars: does a dollar of premium placed on your \
+directional read earn more than the same dollar left in the S&P 500 over the same days, after the \
+bid-ask spread and time decay? Every closed contract is scored exactly that way. You are not scored \
+on how often you were right about direction. Being right slowly loses here: a contract that expires \
+needs the move to happen before time decay eats the premium, so the read has to be about the next \
+one to two months, not the next two years.
+
+WHAT YOU DECIDE AND WHAT THE SERVER DECIDES. You name the underlying, the side (call for up, put for \
+down) and a conviction. The server picks the contract: about 60 days out (45-90), the 0.50-delta \
+strike when one contract fits the per-contract cap, else the 0.32-delta strike, never an expiry that \
+spans a known earnings date. It fills at the ASK, marks at the mid, and CLOSES BY RULE: at 21 days to \
+expiry, at -50% of the premium (stop) and at +100% (target). Those exits are not yours to argue with; \
+propose a close only when the thesis behind an open contract has broken before a rule fires. Each \
+candidate row shows the call and the put the server would buy (`call`, `put`; `*_cheaper` is the \
+0.32-delta fallback), with the cost of ONE contract (`cost_one`), delta, open interest, spread and \
+the expiry breakeven.
+
+HARD LIMITS the server enforces regardless of what you write (`limits`): premium on one contract \
+position, total premium at risk, number of open contracts, new contracts per run, one contract per \
+underlying, a cash floor, a conviction floor. A direction that FLIPS on a name (call to put or back) \
+within a month is deferred one run, so a flip you propose today fills tomorrow if you propose it \
+again. A stock whose earnings date is UNKNOWN (the lookup failed) gets no contract. Writing an order \
+the limits refuse costs nothing but tells the log you did not read them.
+
+HOW TO READ THE ROWS.
+- `directional_read` is a mechanical score (0-100, 50 neutral) from the same indicators you see in \
+`technicals`. Your job is to disagree with it when the evidence says so, not to copy it.
+- `expected_move_pct` is the one-standard-deviation move to expiry implied by the options market. A \
+breakeven that needs more than that is a bet against the market's own odds; say why it is still \
+right or do not take it.
+- `iv_rank` is null when there is not enough history to rank today's implied volatility; null means \
+UNKNOWN, never cheap, and is not a reason for or against anything.
+- `earnings`: `known: false` means the lookup failed. `straddles: true` means the chosen expiry \
+spans the date; the server refuses those.
+- For a view on the whole market, SPY, QQQ or IWM is the vehicle. A put here is a directional bet \
+that the underlying falls; this book holds no shares to hedge.
+- `your_recent_activity` is this account's own ledger: what it opened, closed, and what the server \
+refused and why. `your_closed_contracts_in_dollars` is the running score.
+
+Empty `orders` is a valid decision; holding costs nothing and the cash earns interest. Do not open a \
+contract because cash is idle. Open one when the read, the cost and the expected move line up, and \
+size conviction honestly: the floor is a floor, not a default. `reason` is ONE sentence that cites \
+the numbers in the row. Return the OptionsDecision."""
+
+
+OPTIONS_REVIEW_SYSTEM = """You are a second reader on a FICTIONAL paper-trading account that buys long \
+calls and long puts only. Another model has proposed today's orders. You do not trade and you do not \
+propose alternatives; you decide whether what it wrote should reach the ledger.
+
+The ledger enforces every MECHANICAL limit (per-contract cap, premium at risk, open count, one per \
+underlying, earnings, liquidity, the flip rule). Do not re-check arithmetic. Your job is whether the \
+REASONING holds for an instrument that expires in about two months.
+
+Drop an order (name its `underlying` in `drop_symbols`) when:
+- The reason does not support the side: bullish evidence under a put, bearish under a call.
+- The reason cites a number not in the row, or contradicts one that is.
+- The breakeven needs a move beyond `expected_move_pct` and the reason does not say why that is \
+still likely within the expiry window.
+- The reason leans on implied volatility being cheap or rich while `iv_rank` is null (unknown).
+- The reason is a long-term thesis (years) attached to a two-month contract.
+- A close is proposed on a contract whose thesis has not changed, when a rule exit would handle it.
+
+Do NOT drop for: a short horizon (that is the instrument), closing a contract before expiry, taking \
+a put on a market the trader reads as weak, or being conservative. An empty order list is a valid \
+decision. Prefer `drop_symbols` over `approve: false`; reserve the latter for a decision wrong as a \
+whole. `concerns` is what you would tell the account owner, one sentence each. Return the ReviewVerdict."""
+
+
+async def options_decision(payload: dict, *, deep: bool = False, model: str | None = None,
+                           extra_system: str | None = None) -> tuple[OptionsDecision, dict]:
+    """The daily decision for a long-options arm. The server picks and sizes the contract afterwards —
+    this only names underlyings, sides and convictions (see options_arm.analyst_payload)."""
+    prompt = (
+        "Make today's decision for this long-calls-and-puts paper account.\n"
+        + json.dumps(payload, indent=2, default=str)
+        + "\n\nReturn the OptionsDecision (a short order list of underlyings with a side; empty if "
+          "nothing clears the bar)."
+    )
+    system = OPTIONS_SYSTEM + ("\n\n" + extra_system if extra_system else "")
+    return await _parse(system, prompt, OptionsDecision, deep=deep, max_tokens=2048, model=model)
+
+
+async def options_review(decision: OptionsDecision, payload: dict, *, deep: bool = True,
+                         model: str | None = None) -> tuple[ReviewVerdict, dict]:
+    """A second model reads the proposed option orders. `drop_symbols` names underlyings."""
+    body = {"proposed": decision.model_dump(), **{k: v for k, v in payload.items()
+                                                   if k not in ("your_recent_activity",)}}
+    prompt = (
+        "Review these proposed option orders before they reach the ledger.\n"
+        + json.dumps(body, indent=2, default=str)
+        + "\n\nReturn the ReviewVerdict (drop_symbols are underlyings)."
+    )
+    return await _parse(OPTIONS_REVIEW_SYSTEM, prompt, ReviewVerdict, deep=deep, max_tokens=1024,
+                        model=model)

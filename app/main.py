@@ -32,6 +32,8 @@ from .analyst import (
     plan_entry,
     rebalance_portfolio,
     recommend,
+    options_decision,
+    options_review,
     review_decision,
     review_portfolio,
     sandbox_decision,
@@ -46,7 +48,7 @@ from .discover import WIDE_SCREENS, discover
 from .market import fetch_series, summarize
 from .news import earnings_on, fetch_context, fetch_dated_news, fetch_next_earnings
 from . import analyst, prices, profile, sandbox_today
-from . import etf_arm, etf_pick, fund_catalog, fund_cost, fund_overlap, macro, scan_job, sectors
+from . import etf_arm, etf_pick, fund_catalog, fund_cost, fund_overlap, macro, options_arm, scan_job, sectors
 from .macro_job import run_macro
 from .scan_job import LATEST, run_scan
 
@@ -3605,6 +3607,7 @@ async def _run_extra_arm(
     candidates: list[dict], macro_block, force: bool, held_rows: list[dict] | None = None,
     rejected: dict[str, list[dict]] | None = None,
     gate: dict | None = None, bench=None, etf_ctx: dict | None = None,
+    opt_ctx: dict | None = None,
 ) -> dict:
     """One decision cycle for a NON-main arm, against the market snapshot main already fetched.
 
@@ -3626,8 +3629,15 @@ async def _run_extra_arm(
     its own weekly plan from the fund catalogue; the `rules` one follows a fixed target-date mix. Both
     use the ETF arms' own cap groups, route every buy to the cheapest copy of its index, and may buy
     nothing outside the fund list. `etf_ctx` carries the tick's shared fund data: the catalogue
-    build, each arm's candidate pool, and the candidate rows (built once for all ETF arms)."""
+    build, each arm's candidate pool, and the candidate rows (built once for all ETF arms).
+
+    LONG-OPTIONS ARMS (settings.universe == "options", see app/options_arm.py) leave this function
+    at once for `_run_options_arm`: nothing below — the share book, the plan, the fill rules — applies
+    to a book of contracts, and the dispatch sits first so no share path can ever touch one."""
     blob = sandbox_store.get(arm)
+    if options_arm.is_options_arm(blob.get("settings")):
+        return await _run_options_arm(arm, now=now, spy_price=spy_price, macro_block=macro_block,
+                                      force=force, opt_ctx=opt_ctx)
     engine = blob.get("engine", "llm")
     label = blob.get("label") or arm
     proceed, status = sandbox_job.tick_gate(blob, now=now, force=force)
@@ -3920,6 +3930,191 @@ async def _run_extra_arm(
     sandbox_store.append_nav(nav, arm)
     return {"arm": arm, "label": label, "engine": engine, "status": "ok", "posture": posture,
             "orders_filled": filled, "orders_skipped": skipped, "nav": nav, "warnings": warnings}
+
+
+def _is_fund_for_options(symbol: str) -> bool:
+    """Whether an options underlying is a fund (no earnings to look up). The index ETFs by name, and
+    anything the fund-cost table knows a fee for."""
+    s = (symbol or "").upper()
+    return s in options_arm.INDEX_ETFS or _expense_ratio(s) is not None
+
+
+async def _options_context(ids: list[str], *, candidates: list[dict], held_rows: list[dict],
+                           bench_closes) -> dict:
+    """The long-options arms' ONE chain snapshot for this tick: marks for every contract any of them
+    holds, and a priced candidate row per underlying — main's candidate pool plus the index ETFs,
+    which get a technicals row of their own when main's pool did not carry one."""
+    assert _http is not None
+    rows = list(candidates) + list(held_rows)
+    have = {str(r.get("symbol") or "").upper() for r in rows}
+    missing = [x for x in options_arm.INDEX_ETFS if x not in have]
+    if missing:
+        rows += [c for c in await asyncio.gather(
+            *[_sandbox_candidate(x, bench_closes, set()) for x in missing]) if c]
+    held = [c for a in ids for c in options_arm.contracts_of(sandbox_store.get(a))]
+    return await options_arm.build_context(
+        _http, rows=rows, held=held, now_ts=time.time(),
+        earnings_of=lambda x: fetch_next_earnings(_http, x),
+        is_fund=_is_fund_for_options,
+        settings=sandbox_store.get(ids[0]).get("settings"), log=_log)
+
+
+async def _close_on_date(symbol: str, iso: str) -> float | None:
+    """The underlying's close on `iso` (YYYY-MM-DD), for settling a contract that reached expiry.
+    None when the bar is not there — the caller then holds the contract and says so."""
+    assert _http is not None
+    try:
+        series = await fetch_series(_http, symbol)
+    except Exception:  # noqa: BLE001
+        return None
+    want = str(iso).replace("-", "")
+    for d, c in zip(series.dates, series.closes):
+        if str(d) == want and c:
+            return float(c)
+    return None
+
+
+async def _run_options_arm(arm: str, *, now, spy_price: float | None, macro_block, force: bool,
+                           opt_ctx: dict | None) -> dict:
+    """One decision cycle for a long-calls-and-puts arm (app/options_arm.py), on the chain snapshot
+    the tick built once for every such arm.
+
+    Order of business, and why: interest and the deposit first, as on every arm; then today's marks
+    onto the held contracts; then anything past expiry is settled against the underlying's close on
+    its expiry date; then the drawdown pause is counted; then the RULE EXITS are computed — before
+    the decision, so a stop or a days-to-expiry close runs on a day the analyst is unavailable, the
+    pause is on, or no chain came back (the days-to-expiry exit needs no quote). Only then the
+    decision: the directional score for the `rules` engine, the analyst for `llm`. Fills are closes
+    first at the bid, opens at the ask, every limit in options_arm.fill.
+
+    With no snapshot (`opt_ctx` None) the arm still marks NAV from its last marks, says so, and opens
+    nothing. Failures are contained exactly as for every other arm: this function's exceptions are
+    caught by the tick's arm loop and never reach main."""
+    blob = sandbox_store.get(arm)
+    engine = blob.get("engine", "llm")
+    label = blob.get("label") or arm
+    proceed, status = sandbox_job.tick_gate(blob, now=now, force=force)
+    if not proceed:
+        return {"arm": arm, "label": label, "engine": engine, "status": status}
+    settings = blob["settings"]
+    warnings: list[str] = []
+    st = options_arm.state(blob)
+    today = sandbox_job.today_et_str(now)
+    now_ts = time.time()
+    exclude = {str(x).upper() for x in (settings.get("exclusions") or [])}
+
+    earned = sandbox_job.accrue_cash_interest(blob, now=now)
+    if earned > 0:
+        sandbox_store.append_trade({
+            "ts": now_ts, "date": today, "symbol": "CASH", "side": "interest", "status": "filled",
+            "shares": 0.0, "price": None, "gross": earned, "cash_after": round(blob["cash"], 2),
+            "source": "cash_yield", "reason": f"Interest on idle cash at {settings.get('cash_apy_pct')}% APY"}, arm)
+    dep = float(settings.get("monthly_deposit") or 0.0)
+    due = sandbox_job.due_deposit_periods(blob, now=now)
+    if due and not spy_price:
+        warnings.append("recurring deposit deferred — no benchmark quote; will retry next tick")
+    else:
+        for period in due:
+            sandbox_store.append_trade(sandbox_job.apply_recurring_deposit(
+                blob, amount=dep, spy_price=spy_price, period=period, now=now), arm)
+
+    marks: dict[str, dict] = (opt_ctx or {}).get("marks") or {}
+    if opt_ctx is None:
+        warnings.append("option chains unavailable — no fresh marks, no new contracts; held contracts "
+                        "valued at their last mark, exits by days-to-expiry only")
+    stale = options_arm.apply_marks(st["contracts"], marks, today=today)
+    if marks:
+        st["marks_as_of"] = today
+    if stale:
+        warnings.append(f"no fresh quote for {', '.join(stale)} — valued at the last mark")
+
+    settled_rows: list[dict] = []
+    past = options_arm.expired(st["contracts"], now_ts=now_ts)
+    if past:
+        closes = {c["contract_symbol"]: await _close_on_date(c["underlying"], c["expiry"]) for c in past}
+        settled_rows = options_arm.settle_expired(blob, closes, now_ts=now_ts, spy_price=spy_price)
+
+    dd = sandbox_job.drawdown_stats(sandbox_store.read_nav(arm=arm)).get("current_drawdown_pct")
+    note = options_arm.update_pause(blob, current_drawdown_pct=dd, settings=settings)
+    if note:
+        warnings.append(note)
+
+    orders: list[dict] = options_arm.rule_exits(st["contracts"], marks, now_ts=now_ts, settings=settings)
+    source = "rules_tick" if engine == "rules" else "haiku_tick"
+    posture = ""
+    held_unds = [c["underlying"] for c in st["contracts"]]
+    cands = options_arm.candidate_rows((opt_ctx or {}).get("candidates") or [], held=held_unds, exclusions=exclude)
+    equity = round(float(blob["cash"]) + options_arm.contracts_value(st["contracts"], marks), 2)
+    review_rows: list[dict] = []
+    if opt_ctx is None:
+        posture = "No chain snapshot today — exits by days-to-expiry only, no new contracts."
+    elif engine == "rules":
+        d = options_arm.rules_decision(cands, settings=settings)
+        orders += d["orders"]
+        posture = d["posture"]
+        blob["last_decision_date"] = today
+    else:
+        try:
+            trades = sandbox_store.read_trades(300, arm)
+            payload = options_arm.analyst_payload(
+                blob, cands, marks, equity=equity, cash=float(blob["cash"]), spy_price=spy_price,
+                now_ts=now_ts, settings=settings, macro=macro_block,
+                recent_activity=options_arm.recent_activity(trades, today=today),
+                scorecard=options_arm.scorecard(trades, st["contracts"]))
+            model = (str(settings.get("model")).strip() or None) if settings.get("model") else None
+            decision, usage = await options_decision(payload, model=model)
+            usage_store.record(usage, symbol=f"SANDBOX:{arm}", kind="sandbox_tick")
+            proposed = [{"symbol": o.underlying.upper(), **o.model_dump(), "underlying": o.underlying.upper(),
+                         "right": o.right.lower(), "action": o.action.lower()} for o in decision.orders]
+            if settings.get("review_enabled") and proposed:
+                try:
+                    verdict, rusage = await options_review(decision, payload, model=model)
+                    usage_store.record(rusage, symbol=f"SANDBOX:{arm}", kind="sandbox_review")
+                    _v = verdict.model_dump()
+                    kept, dropped = sandbox_job.apply_review(proposed, _v)
+                    blob["last_review"] = {"date": today, "approve": _v.get("approve", True),
+                                           "dropped": dropped, "concerns": _v.get("concerns") or [],
+                                           "note": _v.get("note") or ""}
+                    if dropped:
+                        review_rows = options_arm.review_skips(
+                            [o for o in proposed if o["symbol"] in set(dropped)], _v, now_ts=now_ts, today=today)
+                        warnings.append(f"review dropped {len(dropped)} order(s): {', '.join(dropped)}")
+                    proposed = kept
+                except Exception as e:  # noqa: BLE001
+                    warnings.append(f"review model unavailable, orders NOT reviewed: {e}")
+            orders += proposed
+            posture = decision.posture
+            blob["last_decision_date"] = today
+        except Exception as e:  # noqa: BLE001 — a failed decision = rule exits only, still mark NAV
+            warnings.append(f"decision failed: {e}")
+            posture = "No decision (analyst unavailable) — rule exits only."
+
+    try:
+        new_blob, filled, skipped = options_arm.fill(
+            blob, orders, candidates=(opt_ctx or {}).get("by_underlying") or {}, marks=marks,
+            spy_price=spy_price, now_ts=now_ts, source=source, settings=settings, exclude=exclude, today=today)
+    except AssertionError as e:
+        _log.error("sandbox arm %s ABORTED (cash not conserved): %s", arm, e)
+        return {"arm": arm, "label": label, "engine": engine, "status": "aborted",
+                "warnings": [f"cash not conserved: {e}"]}
+    st2 = options_arm.state(new_blob)
+    pv = options_arm.contracts_value(st2["contracts"], marks)
+    nav = sandbox_job.nav_row(new_blob, positions_val=pv, spy_price=spy_price)
+    nav["num_positions"] = len(st2["contracts"])
+    new_blob["last_tick_date"] = today
+    new_blob["last_posture"] = posture or ""
+    sandbox_store.save(new_blob, arm)
+    settled_ok = [r for r in settled_rows if r.get("status") == "filled"]
+    settled_skip = [r for r in settled_rows if r.get("status") != "filled"]
+    for r in settled_rows + filled + skipped + review_rows:
+        sandbox_store.append_trade(r, arm)
+    if cands:
+        sandbox_store.append_inputs({"ts": now_ts, "date": today, "arm": arm,
+                                     "candidates": options_arm.fingerprint(cands)}, arm)
+    sandbox_store.append_nav(nav, arm)
+    return {"arm": arm, "label": label, "engine": engine, "status": "ok", "posture": posture,
+            "orders_filled": settled_ok + filled, "orders_skipped": settled_skip + skipped + review_rows,
+            "nav": nav, "warnings": warnings}
 
 
 async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict:
@@ -4490,6 +4685,23 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         etf_ctx = {"build": etf_build, "pools": etf_pools, "rows": etf_rows,
                    "price_of": etf_price_of}
 
+        # The long-options arms' chain snapshot (app/options_arm.py): built ONCE here, after main has
+        # persisted and only when such an arm will actually decide today, inside its own try. Both
+        # options arms read this one snapshot, which is what makes them comparable; a failure leaves
+        # it None, and each arm then marks from its last marks, opens nothing, and says so.
+        opt_ctx: dict | None = None
+        _opt_ids = [a for a in sandbox_store.list_arms() if a != sandbox_store.MAIN_ARM
+                    and options_arm.is_options_arm(sandbox_store.get(a).get("settings"))
+                    and sandbox_job.tick_gate(sandbox_store.get(a), now=now, force=force)[0]]
+        if _opt_ids:
+            try:
+                opt_ctx = await _options_context(
+                    _opt_ids, candidates=candidates, held_rows=held_rows,
+                    bench_closes=(bench_series.closes if bench_series is not None else None))
+            except Exception:  # noqa: BLE001 — main has persisted; the options arms lose their day's chains
+                _log.warning("sandbox tick: option chains failed for the options arms", exc_info=True)
+                opt_ctx = None
+
         # ---- comparison arms, on the snapshot main just used ----
         # Only once main has proceeded, because that is where the prices come from. A day main sat
         # out (closed, already run, disabled) is a day no arm advances either — which keeps the
@@ -4507,7 +4719,7 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
                     shared_plan=new_blob.get("last_strategy_note"), candidates=candidates,
                     held_rows=held_rows,
                     macro_block=macro_block, force=force, rejected=rejected_by_arm,
-                    gate=gate_verdict, bench=bench_series, etf_ctx=etf_ctx))
+                    gate=gate_verdict, bench=bench_series, etf_ctx=etf_ctx, opt_ctx=opt_ctx))
             except Exception as e:  # noqa: BLE001 — a side arm must never break the real account
                 _log.exception("sandbox arm %s failed", _arm)
                 arms.append({"arm": _arm, "status": "error", "warnings": [str(e)]})
@@ -4608,6 +4820,8 @@ async def sandbox_state_endpoint(arm: str = sandbox_store.MAIN_ARM) -> dict:
     assert _http is not None
     arm = _arm_or_400(arm)
     blob = sandbox_store.get(arm)
+    if options_arm.is_options_arm(blob.get("settings")):
+        return await _options_state(arm, blob)
     held = [p["symbol"].upper() for p in blob["positions"]]
     prices = await _sandbox_prices(held, []) if (held or blob["benchmark"]["shares"]) else {}
     def price_of(sym: str):
@@ -4683,11 +4897,11 @@ async def sandbox_nav_endpoint(days: int = 120, arm: str = sandbox_store.MAIN_AR
 
 
 @app.get("/sandbox/today", dependencies=[Depends(require_api_token)])
-async def sandbox_today_endpoint() -> dict:
+async def sandbox_today_endpoint(show_options: bool = False) -> dict:
     """TODAY-1 — every arm's most recent run in one answer: what each bought, sold and skipped, and
     which arms held or did not run at all. Behind the token because it discloses the paper books."""
     arms, trades, ran_at = [], {}, {}
-    for a in sandbox_store.list_arms():
+    for a in _list_arms(show_options):
         b = sandbox_store.get(a)
         day = b.get("last_tick_date")
         arms.append({"arm": a, "label": b.get("label") or a, "engine": b.get("engine", "llm"),
@@ -4717,15 +4931,82 @@ class SandboxArmCreate(BaseModel):
     clone_from: str | None = None
 
 
+def _list_arms(show_options: bool) -> list[str]:
+    """Arm ids for the list endpoints. The long-options arms are hidden until the app that draws
+    contracts as contracts ships: the installed app files every non-ETF universe under stocks and
+    would show each as a share account holding nothing. The dashboard and the new app ask for them."""
+    ids = sandbox_store.list_arms()
+    if show_options:
+        return ids
+    return [a for a in ids if not options_arm.is_options_arm(sandbox_store.get(a).get("settings"))]
+
+
+async def _options_state(arm: str, blob: dict) -> dict:
+    """/sandbox/state for a long-options arm: the contracts marked from their chains, the premium at
+    risk, the running score in dollars. `positions` is always empty here — a reader that sizes by
+    shares must never be handed a contract."""
+    assert _http is not None
+    st = options_arm.state(blob)
+    now_ts = time.time()
+    marks: dict[str, dict] = {}
+    if st["contracts"]:
+        try:
+            ctx = await options_arm.build_context(
+                _http, rows=[], held=st["contracts"], now_ts=now_ts,
+                earnings_of=lambda x: fetch_next_earnings(_http, x), is_fund=_is_fund_for_options,
+                settings=blob.get("settings"), record_iv=False)
+            marks = ctx["marks"]
+        except Exception:  # noqa: BLE001 — valued at the last marks, flagged below
+            _log.warning("options state %s: chains unavailable", arm, exc_info=True)
+    spy = None
+    try:
+        spy = (await market_now.fetch_quotes(_http, ["^GSPC"])).get("^GSPC", {}).get("price")
+    except Exception:  # noqa: BLE001
+        pass
+    pv = options_arm.contracts_value(st["contracts"], marks)
+    cash = round(float(blob["cash"]), 2)
+    equity = round(cash + pv, 2)
+    bench = blob["benchmark"]
+    bench_val = round(bench["shares"] * spy, 2) if spy and bench["shares"] else None
+    funded = float(blob.get("funded_total") or 0.0)
+    trades = sandbox_store.read_trades(5000, arm)
+    rows = options_arm.open_contract_rows(st["contracts"], marks, now_ts=now_ts)
+    return {
+        "arm": arm, "label": blob.get("label") or arm, "engine": blob.get("engine", "llm"),
+        "universe": options_arm.UNIVERSE_OPTIONS,
+        "cash": cash, "equity": equity, "positions_value": round(pv, 2),
+        "funded_total": round(funded, 2), "realized_pl_total": blob.get("realized_pl_total", 0.0),
+        "interest_total": round(float(blob.get("interest_total") or 0.0), 2),
+        "total_return_pct": round((equity / funded - 1) * 100, 2) if funded else None,
+        "cash_pct": round(cash / equity * 100, 1) if equity else None,
+        "benchmark_value": bench_val,
+        "vs_benchmark_pct": round((equity - bench_val) / bench_val * 100, 2) if bench_val else None,
+        "positions": [],
+        "contracts": rows,
+        "stale_marks": [r["contract_symbol"] for r in rows if r.get("mark_stale")],
+        "marks_as_of": st.get("marks_as_of"),
+        "premium_at_risk_usd": options_arm.premium_at_risk(st["contracts"]),
+        "options_scorecard": options_arm.scorecard(trades, st["contracts"]),
+        "new_entries_paused_runs_left": int(st.get("pause_ticks_left") or 0),
+        "settings": {**blob["settings"], "current_age": sandbox_job.effective_age(blob["settings"])},
+        "enabled": blob["settings"]["master_enabled"],
+        "last_tick_date": blob.get("last_tick_date"),
+        "last_posture": blob.get("last_posture") or None,
+        "last_review": blob.get("last_review") or None,
+        **sandbox_job.drawdown_stats(sandbox_store.read_nav(arm=arm)),
+        "last_weekly_review_date": None, "last_strategy_note": None, "created_at": blob.get("created_at"),
+    }
+
+
 @app.get("/sandbox/arms", dependencies=[Depends(require_api_token)])
-async def sandbox_arms_endpoint() -> dict:
+async def sandbox_arms_endpoint(show_options: bool = False) -> dict:
     """Every arm with a comparable scoreboard: equity, return, and return vs its OWN benchmark shadow.
 
     Comparing arms to each other on raw equity would be meaningless when they were funded with
     different amounts on different days, so the honest cross-arm number is each arm's excess over the
     same-money-in-the-S&P shadow it carries."""
     assert _http is not None
-    ids = sandbox_store.list_arms()
+    ids = _list_arms(show_options)
     blobs = {a: sandbox_store.get(a) for a in ids}
     held = sorted({p["symbol"].upper() for b in blobs.values() for p in b.get("positions") or []})
     prices = await _sandbox_prices(held, [])
@@ -4736,7 +5017,11 @@ async def sandbox_arms_endpoint() -> dict:
     out = []
     for a in ids:
         b = blobs[a]
-        pv = sandbox_job.positions_value(b.get("positions") or [], price_of)
+        _opt = options_arm.is_options_arm(b.get("settings"))
+        # A long-options arm is valued from its stored marks here (the list is cheap by design; the
+        # state endpoint re-marks from the chains). `positions` counts its contracts.
+        pv = (options_arm.contracts_value(options_arm.contracts_of(b), {}) if _opt
+              else sandbox_job.positions_value(b.get("positions") or [], price_of))
         cash = round(float(b.get("cash") or 0.0), 2)
         equity = round(cash + pv, 2)
         funded = float(b.get("funded_total") or 0.0)
@@ -4748,7 +5033,9 @@ async def sandbox_arms_endpoint() -> dict:
             "single_share": bool((b.get("settings") or {}).get("single_share", False)),
             "enabled": bool((b.get("settings") or {}).get("master_enabled")),
             "cash": cash, "equity": equity, "positions_value": round(pv, 2),
-            "funded_total": round(funded, 2), "positions": len(b.get("positions") or []),
+            "funded_total": round(funded, 2),
+            "positions": len(options_arm.contracts_of(b)) if _opt else len(b.get("positions") or []),
+            **({"marks_as_of": (b.get("options") or {}).get("marks_as_of")} if _opt else {}),
             "cash_pct": round(cash / equity * 100, 1) if equity else None,
             "total_return_pct": round((equity / funded - 1) * 100, 2) if funded else None,
             "benchmark_value": bval,
@@ -4759,7 +5046,7 @@ async def sandbox_arms_endpoint() -> dict:
 
 
 @app.get("/sandbox/arms/nav", dependencies=[Depends(require_api_token)])
-async def sandbox_arms_nav_endpoint(days: int = 180) -> dict:
+async def sandbox_arms_nav_endpoint(days: int = 180, show_options: bool = False) -> dict:
     """Every arm's equity curve on ONE shared date axis, for charting them against each other.
 
     Aligned here rather than on the client because the arms do not share a history: `main` has weeks
@@ -4772,7 +5059,7 @@ async def sandbox_arms_nav_endpoint(days: int = 180) -> dict:
     `common_start` is the first date on which EVERY arm has a value. That is the only honest place to
     base an indexed comparison: before it, at least one arm did not exist, and normalising there would
     credit or blame it for a period it never traded."""
-    ids = sandbox_store.list_arms()
+    ids = _list_arms(show_options)
     series = {a: sandbox_store.read_nav(days, a) for a in ids}
     dates = sorted({str(r.get("date")) for rows in series.values() for r in rows if r.get("date")})
     out = []
