@@ -555,17 +555,10 @@ def fill(blob: dict, orders: list[dict], *, candidates: dict[str, dict], marks: 
         if not cand:
             skip(f"no priced contract on {und} today")
             continue
-        if cand.get("market_state") and cand["market_state"] != MARKET_OPEN_STATE:
-            skip(f"quotes not live ({cand['market_state']}) — no entry outside the regular session")
+        blocked = entry_block(cand)
+        if blocked:
+            skip(blocked)
             continue
-        earn = cand.get("earnings") or {}
-        if not cand.get("is_fund", False):
-            if not earn.get("known", False):
-                skip("earnings date unknown (lookup failed) — no new contract on a stock without it")
-                continue
-            if earn.get("straddles"):
-                skip(f"expiry {cand.get('expiry')} spans earnings on {earn.get('date')}")
-                continue
         why = flip_block(st["signals"], und, right, today=today)
         if why:
             skip(why)
@@ -623,12 +616,31 @@ def candidate_rows(all_candidates: Iterable[dict], *, held: Iterable[str], exclu
             and str(c.get("symbol") or "").upper() not in ex]
 
 
+def entry_block(cand: dict) -> str | None:
+    """Why the ledger would refuse ANY new contract on this candidate today, before sizing: quotes
+    not live, or a stock whose earnings date is unknown or falls inside the expiry. One place, read
+    by the fill and by the rules twin — the twin has two slots a run and must not spend them on
+    names the ledger is certain to refuse (the 2026-11-15 dry run did exactly that and filled nothing)."""
+    if cand.get("market_state") and cand["market_state"] != MARKET_OPEN_STATE:
+        return f"quotes not live ({cand['market_state']}) — no entry outside the regular session"
+    earn = cand.get("earnings") or {}
+    if not cand.get("is_fund", False):
+        if not earn.get("known", False):
+            return "earnings date unknown (lookup failed) — no new contract on a stock without it"
+        if earn.get("straddles"):
+            return f"expiry {cand.get('expiry')} spans earnings on {earn.get('date')}"
+    return None
+
+
 def rules_decision(cands: list[dict], *, settings: dict | None) -> dict:
     """The no-model twin: the directional score reads call at or above 55 and put at or below 45,
     conviction is the score's distance in that direction, and the strongest reads go first. It
-    proposes only a side that has a liquid contract today, like the analyst is only shown such."""
+    proposes only a side that has a liquid contract today and only names the ledger will not refuse
+    outright (entry_block), like the analyst is only shown such."""
     orders: list[dict] = []
     for c in cands:
+        if entry_block(c):
+            continue
         d = c.get("directional") or directional(c.get("technicals"))
         score = int(d.get("score", 50))
         if score >= options.BULLISH_SCORE:

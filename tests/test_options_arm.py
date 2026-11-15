@@ -350,6 +350,21 @@ def test_rules_decision_reads_calls_above_55_puts_below_45_strongest_first():
     assert options_arm.rules_decision([_cand("SPY", score=50)], settings=s)["orders"] == []
 
 
+def test_rules_twin_skips_names_the_ledger_would_refuse_instead_of_spending_its_slots():
+    """Measured 2026-11-15: the twin's two slots went to AAPL (score 85) and SOFI (16), both stocks
+    with a failed earnings lookup; the ledger refused both and the run filled nothing while QQQ and
+    SPY puts at 81 and 77 sat unproposed."""
+    s = sandbox_store.DEFAULT_SETTINGS
+    cands = [_cand("AAPL", score=85, is_fund=False, earnings_known=False),
+             _cand("SOFI", score=16, is_fund=False, earnings_known=False),
+             _cand("NVDA", score=18, is_fund=False, straddles=True),
+             _cand("QQQ", score=19), _cand("SPY", score=23), _cand("IWM", score=35, state="CLOSED")]
+    d = options_arm.rules_decision(cands, settings=s)
+    assert [(o["underlying"], o["right"], o["conviction"]) for o in d["orders"]] == [("QQQ", "put", 81), ("SPY", "put", 77)]
+    assert options_arm.entry_block(_cand("SPY")) is None
+    assert "not live" in options_arm.entry_block(_cand("SPY", state="CLOSED"))
+
+
 def test_rank_underlyings_index_first_then_strongest_reads_no_crypto_no_penny():
     rows = [{"symbol": "BTC-USD", "price": 90000, "technicals": {"macd_hist": 1}},
             {"symbol": "F", "price": 4.5, "technicals": {"macd_hist": 1}},

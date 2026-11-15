@@ -25,7 +25,7 @@ LIVE = "--live-quotes" in sys.argv
 POOL = ["AAPL", "NVDA", "AMD", "SOFI", "F", "MSFT", "TSLA", "GOOGL", "META", "AMZN", "PLTR", "INTC"]
 
 
-def _mk(arm: str, engine: str) -> None:
+def _mk(arm: str, engine: str, spy: float) -> None:
     if arm in sandbox_store.list_arms():
         return
     sandbox_store.create_arm(arm, engine=engine, label=f"Options ({engine})", settings={
@@ -35,7 +35,7 @@ def _mk(arm: str, engine: str) -> None:
     b = sandbox_store.get(arm)
     b["cash"] = 10_000.0
     b["funded_total"] = 10_000.0
-    b["benchmark"] = {"symbol": "^GSPC", "shares": round(10_000 / 750.0, 6), "cost_basis": 10_000.0}
+    b["benchmark"] = {"symbol": "^GSPC", "shares": round(10_000 / spy, 6), "cost_basis": 10_000.0}
     b["last_deposit_period"] = sandbox_job.due_deposit_periods(b)[-1] if sandbox_job.due_deposit_periods(b) else None
     sandbox_store.save(b, arm)
 
@@ -43,8 +43,9 @@ def _mk(arm: str, engine: str) -> None:
 async def run() -> None:
     async with httpx.AsyncClient(timeout=30) as client:
         main._http = client
-        _mk("options", "llm")
-        _mk("options-rules", "rules")
+        spy0 = (await main.market_now.fetch_quotes(client, ["^GSPC"])).get("^GSPC", {}).get("price")
+        _mk("options", "llm", spy0)
+        _mk("options-rules", "rules", spy0)
         ids = ["options", "options-rules"]
         t0 = time.monotonic()
         rows = [c for c in await asyncio.gather(*[main._sandbox_candidate(s, None, set()) for s in POOL]) if c]
