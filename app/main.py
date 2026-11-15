@@ -3959,6 +3959,26 @@ async def _options_context(ids: list[str], *, candidates: list[dict], held_rows:
         settings=sandbox_store.get(ids[0]).get("settings"), log=_log)
 
 
+async def _maybe_options_context(*, now, force: bool, candidates: list[dict], held_rows: list[dict],
+                                 bench_series) -> dict | None:
+    """The options arms' snapshot, or None. NEVER raises: it runs inside main's tick after main has
+    persisted and before the eleven comparison arms, so an exception here — in the arm filter as much
+    as in the chain fetch — would cost every other arm its day. Everything, the filter included, is
+    inside the try."""
+    try:
+        ids = [a for a in sandbox_store.list_arms() if a != sandbox_store.MAIN_ARM
+               and options_arm.is_options_arm(sandbox_store.get(a).get("settings"))
+               and sandbox_job.tick_gate(sandbox_store.get(a), now=now, force=force)[0]]
+        if not ids:
+            return None
+        return await _options_context(
+            ids, candidates=candidates, held_rows=held_rows,
+            bench_closes=(bench_series.closes if bench_series is not None else None))
+    except Exception:  # noqa: BLE001 — the options arms lose their day's chains; nothing else does
+        _log.warning("sandbox tick: option chains failed for the options arms", exc_info=True)
+        return None
+
+
 async def _close_on_date(symbol: str, iso: str) -> float | None:
     """The underlying's close on `iso` (YYYY-MM-DD), for settling a contract that reached expiry.
     None when the bar is not there — the caller then holds the contract and says so."""
@@ -4084,6 +4104,11 @@ async def _run_options_arm(arm: str, *, now, spy_price: float | None, macro_bloc
                     warnings.append(f"review model unavailable, orders NOT reviewed: {e}")
             orders += proposed
             posture = decision.posture
+            # Why it held, kept with the posture: a one-word "flat" on a day it opened nothing is
+            # indistinguishable from a model that did not look.
+            _holds = [str(h).strip() for h in (decision.hold_reasons or []) if str(h).strip()]
+            if _holds:
+                posture = f"{posture} — held: {'; '.join(_holds[:3])}"
             blob["last_decision_date"] = today
         except Exception as e:  # noqa: BLE001 — a failed decision = rule exits only, still mark NAV
             warnings.append(f"decision failed: {e}")
@@ -4689,18 +4714,8 @@ async def run_sandbox_tick(*, force: bool = False, manual: bool = False) -> dict
         # persisted and only when such an arm will actually decide today, inside its own try. Both
         # options arms read this one snapshot, which is what makes them comparable; a failure leaves
         # it None, and each arm then marks from its last marks, opens nothing, and says so.
-        opt_ctx: dict | None = None
-        _opt_ids = [a for a in sandbox_store.list_arms() if a != sandbox_store.MAIN_ARM
-                    and options_arm.is_options_arm(sandbox_store.get(a).get("settings"))
-                    and sandbox_job.tick_gate(sandbox_store.get(a), now=now, force=force)[0]]
-        if _opt_ids:
-            try:
-                opt_ctx = await _options_context(
-                    _opt_ids, candidates=candidates, held_rows=held_rows,
-                    bench_closes=(bench_series.closes if bench_series is not None else None))
-            except Exception:  # noqa: BLE001 — main has persisted; the options arms lose their day's chains
-                _log.warning("sandbox tick: option chains failed for the options arms", exc_info=True)
-                opt_ctx = None
+        opt_ctx = await _maybe_options_context(
+            now=now, force=force, candidates=candidates, held_rows=held_rows, bench_series=bench_series)
 
         # ---- comparison arms, on the snapshot main just used ----
         # Only once main has proceeded, because that is where the prices come from. A day main sat

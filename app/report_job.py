@@ -305,7 +305,10 @@ async def build(kind: str, *, client: httpx.AsyncClient, end: dt.date | None = N
         series, failed = await _fetch_all(client, syms)
         log.info("report %s: fetched %d of %d symbols in %.1fs", rid, len(series), len(set(syms)),
                  time.monotonic() - t0)
-        arms = sandbox_store.list_arms()
+        # The long-options arms are left out until the app draws contracts (see main._list_arms):
+        # the report's arm table is rendered by the installed app as share accounts.
+        arms = [a for a in sandbox_store.list_arms()
+                if str((sandbox_store.get(a).get("settings") or {}).get("universe") or "") != "options"]
         rep = assemble(
             kind, start, end, series, failed, big,
             nav_by_arm={a: sandbox_store.read_nav(None, a) for a in arms},

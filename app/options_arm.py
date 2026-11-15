@@ -825,7 +825,15 @@ def update_pause(blob: dict, *, current_drawdown_pct: float | None, settings: di
         return None
     if current_drawdown_pct is None:
         return None
-    if abs(float(current_drawdown_pct)) >= setting(settings, "opt_pause_drawdown_pct"):
+    dd = abs(float(current_drawdown_pct))
+    # ONE pause per drawdown. Without this it re-armed the moment it expired, on the same drawdown,
+    # and the arm ran five runs off and one on for as long as it stayed under water. It re-arms only
+    # once the book is back within 1% of its peak, i.e. a new drawdown.
+    if dd < 1.0:
+        st["pause_spent"] = False
+        return None
+    if dd >= setting(settings, "opt_pause_drawdown_pct") and not st.get("pause_spent"):
+        st["pause_spent"] = True
         st["pause_ticks_left"] = int(setting(settings, "opt_pause_ticks"))
         return (f"drawdown {abs(float(current_drawdown_pct)):.1f}% — new entries paused for "
                 f"{int(setting(settings, 'opt_pause_ticks'))} runs (exits still run)")

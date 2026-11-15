@@ -403,7 +403,13 @@ def test_update_pause_starts_on_a_deep_drawdown_and_counts_down():
     for left in (4, 3, 2, 1, 0):
         assert options_arm.update_pause(b, current_drawdown_pct=-12.0, settings=b["settings"]) is None
         assert b["options"]["pause_ticks_left"] == left
-    assert options_arm.update_pause(b, current_drawdown_pct=-12.0, settings=b["settings"]) is not None
+    # the same drawdown does not re-arm the pause ...
+    for _ in range(8):
+        assert options_arm.update_pause(b, current_drawdown_pct=-13.0, settings=b["settings"]) is None
+        assert b["options"]["pause_ticks_left"] == 0
+    # ... a recovery to the peak and a NEW drawdown does
+    assert options_arm.update_pause(b, current_drawdown_pct=-0.5, settings=b["settings"]) is None
+    assert options_arm.update_pause(b, current_drawdown_pct=-11.0, settings=b["settings"]) is not None
 
 
 def test_analyst_payload_carries_limits_rows_and_unknown_iv_rank_as_null():
@@ -526,3 +532,39 @@ def test_options_arm_cycle_with_a_snapshot_fills_the_rules_pick_and_writes_rows(
     rows = store.read_trades(10, "options-rules")
     assert any(t.get("side") == "buy_to_open" for t in rows)
     assert all(t.get("side") not in ("buy", "sell") for t in rows if t.get("instrument") == "option")
+
+
+def test_the_tick_snapshot_never_raises_whatever_fails(store, monkeypatch):
+    """It runs inside main's tick before the eleven comparison arms; an exception would cost all of
+    them their day. Both the chain fetch and the arm filter itself are covered."""
+    from app import main
+    store.create_arm("options", engine="llm", label="Options",
+                     settings={"universe": "options", "master_enabled": True})
+    monkeypatch.setattr(main.sandbox_job, "tick_gate", lambda blob, **kw: (True, "ok"))
+
+    async def boom(*a, **k):
+        raise RuntimeError("yahoo down")
+    monkeypatch.setattr(main, "_options_context", boom)
+    out = asyncio.run(main._maybe_options_context(now=sandbox_job.now_et(), force=True, candidates=[],
+                                                  held_rows=[], bench_series=None))
+    assert out is None
+
+    def broken_list():
+        raise OSError("disk")
+    monkeypatch.setattr(main.sandbox_store, "list_arms", broken_list)
+    out = asyncio.run(main._maybe_options_context(now=sandbox_job.now_et(), force=True, candidates=[],
+                                                  held_rows=[], bench_series=None))
+    assert out is None
+
+
+def test_no_options_arm_means_no_chain_fetch(store, monkeypatch):
+    from app import main
+    called = []
+
+    async def spy(*a, **k):
+        called.append(1)
+        return {}
+    monkeypatch.setattr(main, "_options_context", spy)
+    out = asyncio.run(main._maybe_options_context(now=sandbox_job.now_et(), force=True, candidates=[],
+                                                  held_rows=[], bench_series=None))
+    assert out is None and called == []
