@@ -19,7 +19,8 @@ _DATA_DIR = Path(os.environ.get("SIGNALS_DATA_DIR", str(Path(__file__).resolve()
 _FILE = _DATA_DIR / "station_layout.json"
 _lock = threading.Lock()
 
-TYPES = ("quote", "chart", "watchlist", "gate", "pick", "movers", "brief", "arm", "race")
+TYPES = ("quote", "chart", "watchlist", "gate", "pick", "movers", "brief", "arm", "race",
+         "options", "today", "macro")
 COLS = 12
 MAX_ROWS = 60
 MAX_WIDGETS = 40

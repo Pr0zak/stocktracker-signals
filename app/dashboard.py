@@ -290,6 +290,18 @@ PAGE = """<!doctype html>
   .dr-range-btn.sel { background: var(--card); color: var(--accent); box-shadow: 0 1px 3px rgba(0,0,0,.15); }
   .ticker-link { cursor: pointer; color: var(--accent); text-decoration: none; font-weight: 600; }
   .ticker-link:hover { text-decoration: underline; }
+  .scan-tools { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; margin: 0 0 .7rem; }
+  .scan-chips { display: flex; gap: .35rem; flex-wrap: wrap; }
+  .scan-chip { background: none; border: 1px solid var(--outline); color: var(--ink); border-radius: .55rem;
+               padding: .28rem .7rem; font-size: .84rem; cursor: pointer; }
+  .scan-chip[aria-pressed="true"] { background: var(--chip-sel); border-color: transparent; }
+  #scan-q { flex: 1; min-width: 10rem; max-width: 22rem; }
+  .scan-sort { background: none; border: 0; padding: 0; color: inherit; font: inherit; text-transform: inherit;
+               letter-spacing: inherit; cursor: pointer; }
+  .scan-sort[aria-sort="ascending"]::after { content: " ▲"; } .scan-sort[aria-sort="descending"]::after { content: " ▼"; }
+  .scan-sig { font-size: .78rem; padding: .08rem .5rem; border-radius: 999px;
+              background: color-mix(in srgb, var(--c, var(--muted)) 15%, transparent); color: var(--c, var(--muted)); }
+  .scan-sig.buy { --c: var(--ok); } .scan-sig.sell { --c: var(--err); }
 /*SANDBOX_CSS*/
 /*STATION_CSS*/
 </style></head>
@@ -356,7 +368,13 @@ PAGE = """<!doctype html>
 
     <div class="card span2">
       <h2>Recent activity <span class="hint">last requests, in-memory since restart</span></h2>
+      <div class="scan-chips" style="margin-bottom:.6rem" role="group" aria-label="Show">
+        <button type="button" class="scan-chip log-f" data-f="all" aria-pressed="true">All</button>
+        <button type="button" class="scan-chip log-f" data-f="bad" aria-pressed="false">Failed only</button>
+        <button type="button" class="scan-chip log-f" data-f="slow" aria-pressed="false">Slower than 1 s</button>
+      </div>
       <div id="logs"><div class="loading">loading…</div></div>
+      <button type="button" class="secondary sm" id="logs-more" hidden style="margin-top:.5rem"></button>
       <div class="hint" id="errs-head" style="margin-top:.6rem"></div>
       <div id="errs"></div>
     </div>
@@ -401,8 +419,24 @@ PAGE = """<!doctype html>
 
     <div class="card span2">
       <h2>Latest scan <span class="hint" id="scan-count"></span></h2>
+      <div class="scan-tools">
+        <div class="scan-chips" role="group" aria-label="Show">
+          <button type="button" class="scan-chip scan-f" data-f="all" aria-pressed="true">All</button>
+          <button type="button" class="scan-chip scan-f" data-f="buy" aria-pressed="false">Buy</button>
+          <button type="button" class="scan-chip scan-f" data-f="sell" aria-pressed="false">Sell</button>
+          <button type="button" class="scan-chip scan-f" data-f="hold" aria-pressed="false">Hold</button>
+          <button type="button" class="scan-chip scan-f" data-f="changed" aria-pressed="false">Changed</button>
+          <button type="button" class="scan-chip scan-f" data-f="dip" aria-pressed="false">In a dip</button>
+        </div>
+        <input type="search" id="scan-q" placeholder="Find a symbol or word" aria-label="Find in the scan" autocomplete="off">
+      </div>
       <div class="scroll"><table class="tbl" id="scan-tbl">
-        <thead><tr><th>Sym</th><th>Signal</th><th>Conv</th><th>Dip</th><th>Sqz</th><th>&lt;200w</th><th>Thesis</th></tr></thead>
+        <thead><tr><th><button type="button" class="scan-sort" data-k="symbol">Symbol</button></th>
+          <th><button type="button" class="scan-sort" data-k="signal">Call</button></th>
+          <th class="num"><button type="button" class="scan-sort" data-k="conviction">Confidence</button></th>
+          <th><button type="button" class="scan-sort" data-k="dip">Dip</button></th>
+          <th><button type="button" class="scan-sort" data-k="squeeze">Short interest</button></th>
+          <th><button type="button" class="scan-sort" data-k="below_200wma">Under 200-week</button></th><th>Why</th></tr></thead>
         <tbody id="scan-body"><tr><td colspan="7" class="loading">loading…</td></tr></tbody>
       </table></div>
       <div class="hint" style="margin-top:.5rem">Changed rows are badged: <span class="badge flip">flip</span>
@@ -721,7 +755,7 @@ PAGE = """<!doctype html>
 
   async function load() {
     const s = await (await afetch("/api/settings")).json();
-    $("deep").value = s.deep_model; $("scan").value = s.scan_model; $("ttl").value = s.verdict_ttl_seconds;
+    $("deep").value = s.deep_model ?? ""; $("scan").value = s.scan_model ?? ""; $("ttl").value = s.verdict_ttl_seconds ?? "";
     $("provider").value = s.llm_provider || "api";
     $("cli-auth").innerHTML = s.cli_token_set
       ? 'CLI subscription token: <b class="ok-t">set</b> (' + esc(s.cli_token_hint) + ') — used when LLM backend is CLI.'
@@ -929,21 +963,55 @@ PAGE = """<!doctype html>
     const errs = (data.results || []).filter((r) => r.error);
     $("scan-count").textContent = data.generated_at
       ? "· " + rows.length + " scored" + (errs.length ? " · " + errs.length + " err" : "") : "· none yet";
+    SCAN_ROWS = rows;
+    renderScanTable();
+  }
+  // The Scan table can be filtered, searched and sorted in the page; the data is the same /scan/latest.
+  let SCAN_ROWS = [], SCAN_F = "all", SCAN_SORT = null, SCAN_DIR = 1;
+  const DIP_WORDS = { mega_dip: "Big dip", pullback_10: "10% pullback", pullback_5: "5% pullback", below_line: "Under the line" };
+  const SQZ_WORDS = { quiet: "–", fuel: "Heavy shorts", ignition: "Squeeze starting" };
+  const SIG_RANK = { buy: 0, hold: 1, sell: 2 };
+  function renderScanTable() {
     const body = $("scan-body");
-    if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="empty">no scan results yet — runs nightly at 06:30, or POST /scan/run</td></tr>'; return; }
+    if (!SCAN_ROWS.length) { body.innerHTML = '<tr><td colspan="7" class="empty">No scan results yet. The scan runs each night at 6:30.</td></tr>'; return; }
+    const q = ($("scan-q").value || "").trim().toLowerCase();
+    let rows = SCAN_ROWS.filter((r) => {
+      if (SCAN_F === "buy" || SCAN_F === "sell" || SCAN_F === "hold") { if (r.signal !== SCAN_F) return false; }
+      else if (SCAN_F === "changed") { if (!(r.flipped || r.dip_new || r.crossed_below_200wma)) return false; }
+      else if (SCAN_F === "dip") { if (!r.dip) return false; }
+      return !q || String(r.symbol).toLowerCase().includes(q) || String(r.thesis || "").toLowerCase().includes(q);
+    });
+    if (SCAN_SORT) {
+      const k = SCAN_SORT, val = (r) => k === "signal" ? (SIG_RANK[r.signal] ?? 9) : k === "below_200wma" ? (r[k] ? 0 : 1)
+        : k === "conviction" ? -(r[k] ?? -1) : String(r[k] ?? "~");
+      rows = rows.slice().sort((a, b) => { const x = val(a), y = val(b); return (x < y ? -1 : x > y ? 1 : 0) * SCAN_DIR; });
+    }
+    document.querySelectorAll(".scan-sort").forEach((b) => b.setAttribute("aria-sort", b.dataset.k === SCAN_SORT ? (SCAN_DIR > 0 ? "ascending" : "descending") : "none"));
+    if (!rows.length) { body.innerHTML = '<tr><td colspan="7" class="empty">Nothing matches. Clear the search or pick All.</td></tr>'; return; }
     body.innerHTML = rows.map((r) => {
       const changed = r.flipped || r.dip_new || r.crossed_below_200wma;
       const th = esc(r.thesis || "");
       return '<tr class="' + (changed ? "changed" : "") + '">' +
         '<td><b class="ticker-link" onclick="openTickerDrawer(\\'' + esc(r.symbol) + '\\')">' + esc(r.symbol) + "</b>" + scanBadges(r) + "</td>" +
-        '<td class="' + sigClass(r.signal) + '">' + esc(r.signal) + "</td>" +
+        '<td><span class="scan-sig ' + esc(r.signal || "") + '">' + esc(r.signal ? r.signal[0].toUpperCase() + r.signal.slice(1) : "–") + "</span></td>" +
         '<td class="num">' + (r.conviction != null ? esc(r.conviction) : "–") + "</td>" +
-        "<td>" + esc(r.dip || "–") + "</td>" +
-        "<td>" + esc(r.squeeze || "–") + "</td>" +
+        "<td>" + esc(DIP_WORDS[r.dip] || (r.dip ? String(r.dip).split("_").join(" ") : "–")) + "</td>" +
+        "<td>" + esc(SQZ_WORDS[r.squeeze] || r.squeeze || "–") + "</td>" +
         "<td>" + (r.below_200wma ? "yes" : "–") + "</td>" +
         '<td class="thesis" title="' + th + '">' + linkifyTickers(r.thesis || "") + "</td></tr>";
     }).join("");
   }
+
+  document.querySelectorAll(".scan-f").forEach((b) => b.onclick = () => {
+    SCAN_F = b.dataset.f;
+    document.querySelectorAll(".scan-f").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    renderScanTable();
+  });
+  document.querySelectorAll(".scan-sort").forEach((b) => b.onclick = () => {
+    if (SCAN_SORT === b.dataset.k) SCAN_DIR = -SCAN_DIR; else { SCAN_SORT = b.dataset.k; SCAN_DIR = 1; }
+    renderScanTable();
+  });
+  $("scan-q").oninput = renderScanTable;
 
   async function loadSources() {
     let data;
@@ -979,19 +1047,35 @@ PAGE = """<!doctype html>
 
   async function loadLogs() {
     let data; try { data = await (await afetch("/api/logs?limit=30")).json(); } catch (e) { $("logs").innerHTML = '<div class="empty">logs unavailable</div>'; return; }
-    const reqs = data.requests || [];
-    $("logs").innerHTML = reqs.length ? reqs.map((r) => {
-      const bad = r.status >= 400 || r.error;
-      return '<div class="logrow' + (bad ? " bad" : "") + '"><span class="m">' + esc(r.method) +
-        '</span><span class="p" title="' + esc(r.path) + '">' + esc(r.path) + '</span><span class="st">' +
-        r.status + '</span><span class="ms">' + Math.round(r.ms) + " ms</span></div>";
-    }).join("") : '<div class="empty">no requests recorded yet</div>';
+    LOG_REQS = data.requests || [];
+    renderLogs();
     const errs = data.errors || [];
     $("errs-head").textContent = errs.length ? "Recent errors (" + errs.length + "):" : "No errors since restart.";
     $("errs").innerHTML = errs.map((r) =>
       '<div class="logrow bad"><span class="p">' + esc(r.method) + " " + esc(r.path) +
       '</span><span class="st">' + r.status + "</span></div>").join("");
   }
+  // The request log shows 10 rows until asked for more, and can be narrowed to failures or slow calls.
+  let LOG_REQS = [], LOG_F = "all", LOG_ALL = false;
+  function renderLogs() {
+    const reqs = LOG_REQS.filter((r) => LOG_F === "bad" ? (r.status >= 400 || r.error) : LOG_F === "slow" ? r.ms >= 1000 : true);
+    const shown = LOG_ALL ? reqs : reqs.slice(0, 10);
+    const more = $("logs-more");
+    more.hidden = reqs.length <= 10;
+    more.textContent = LOG_ALL ? "Show fewer" : "Show all " + reqs.length;
+    $("logs").innerHTML = shown.length ? shown.map((r) => {
+      const bad = r.status >= 400 || r.error;
+      return '<div class="logrow' + (bad ? " bad" : "") + '"><span class="m">' + esc(r.method) +
+        '</span><span class="p" title="' + esc(r.path) + '">' + esc(r.path) + '</span><span class="st">' +
+        r.status + '</span><span class="ms">' + Math.round(r.ms) + " ms</span></div>";
+    }).join("") : '<div class="empty">' + (LOG_F === "all" ? "No requests recorded yet." : "None in the last 30 requests.") + '</div>';
+  }
+  document.querySelectorAll(".log-f").forEach((b) => b.onclick = () => {
+    LOG_F = b.dataset.f;
+    document.querySelectorAll(".log-f").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    renderLogs();
+  });
+  $("logs-more").onclick = () => { LOG_ALL = !LOG_ALL; renderLogs(); };
 
   $("prune").onclick = async () => {
     const ps = $("prune-status"); ps.textContent = "pruning…";

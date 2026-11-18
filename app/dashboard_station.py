@@ -174,6 +174,17 @@ CSS = r"""
   .st-bul { margin: 0; padding-left: 1rem; font-size: .84rem; line-height: 1.45; }
   .st-bul li { margin-bottom: .3rem; }
 
+  .st-opt { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: .15rem .5rem; align-items: center;
+            padding: .4rem 0; border-top: 1px solid var(--line); font-size: .86rem; }
+  .st-opt:first-child { border-top: 0; }
+  .st-opt .st-sym { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .st-opt .v { font-variant-numeric: tabular-nums; }
+  .st-opt .d { grid-column: 2 / -1; font-size: .78rem; }
+  .st-foot { color: var(--muted); font-size: .78rem; padding-top: .4rem; border-top: 1px solid var(--line); margin-top: .2rem; }
+  .st-tarm { font-size: .84rem; padding: .3rem 0; border-top: 1px solid var(--line); line-height: 1.4; }
+  .st-tarm:first-child { border-top: 0; }
+  .st-tarm b { font-weight: 500; }
+
   /* settings dialog */
   .st-dlg { border: 1px solid #ffffff14; border-radius: 1.25rem; background: var(--card); color: var(--ink);
             padding: 1.1rem 1.2rem; width: min(26rem, calc(100vw - 2rem)); }
@@ -219,6 +230,9 @@ JS = r"""
     brief:     { title: "Market brief", desc: "What the market is doing, in a few lines", w: 4, h: 4, cfg: {} },
     arm:       { title: "Sandbox account", desc: "One paper account: balance, against the S&P, its curve", w: 4, h: 3, cfg: { arm: "main" }, tok: true },
     race:      { title: "Sandbox race", desc: "Which accounts are beating the S&P", w: 4, h: 5, cfg: { group: "all" }, tok: true },
+    options:   { title: "Options contracts", desc: "An options account's contracts: value, gain or loss, days left, break-even", w: 4, h: 5, cfg: { arm: "options-rules" }, tok: true },
+    today:     { title: "Sandbox today", desc: "What every paper account bought, sold or skipped on the last run", w: 4, h: 4, cfg: {}, tok: true },
+    macro:     { title: "World news risk", desc: "The news the AI accounts weigh: wars, rates, trade", w: 4, h: 4, cfg: {} },
   };
   const ST_STARTER = [
     { type: "quote", x: 0, y: 0, cfg: { sym: "SPY" } }, { type: "quote", x: 3, y: 0, cfg: { sym: "QQQ" } },
@@ -415,6 +429,55 @@ JS = r"""
     },
   };
 
+  Object.assign(ST_RENDER, {
+    async options(w) {
+      // /sandbox/state prices live option chains on the server, so it is read every 5 minutes at most.
+      const st = await stData("/sandbox/state?arm=" + encodeURIComponent(w.cfg.arm), 300, true);
+      if (st.universe && st.universe !== "options")
+        return { head: "Options contracts", body: '<p class="st-msg">“' + esc(w.cfg.arm) + '” is not an options account. Pick one in this widget\'s settings.</p>' };
+      const cs = st.contracts || [], wk = st.weekly_budget;
+      const rows = cs.map(c => {
+        const stale = !!c.mark_stale, pl = stale ? null : c.pl_pct;
+        const be = c.premium_paid == null ? null : c.right === "put" ? c.strike - c.premium_paid : c.strike + c.premium_paid;
+        const sub = [pl == null ? "no live quote" + (c.mark_date ? " since " + shortDate(c.mark_date) : "") : sgn(pl, 1) + "%",
+          Math.floor(c.dte || 0) + " days left",
+          be != null ? "needs " + (c.right === "put" ? "below " : "above ") + usd(be) : null].filter(Boolean).join(" · ");
+        return '<div class="st-opt"><span class="pill ' + (c.right === "put" ? "down" : "up") + '">' + esc(String(c.right).toUpperCase()) + '</span>' +
+          '<button type="button" class="st-sym" data-sym="' + esc(c.underlying) + '">' + esc(c.count + " × " + c.display.replace(/ exp .*/, "")) + '</button>' +
+          '<span class="v' + (stale ? " amb-t" : "") + '">' + (c.value == null ? "—" : (stale ? "≈" : "") + usd(c.value, 0)) + '</span>' +
+          '<span class="d ' + (pl == null ? "amb-t" : pl >= 0 ? "up-t" : "down-t") + '">' + esc(sub) + '</span></div>';
+      }).join("");
+      return { head: st.label || w.cfg.arm, sub: cs.length + " held", open: w.cfg.arm,
+        body: '<div class="st-scroll">' + (rows || '<p class="st-msg">No contracts held.</p>') + '</div>' +
+              (wk ? '<div class="st-foot">' + esc(weekLine(wk)) + '</div>' : '') };
+    },
+    async today() {
+      const t = await stData("/sandbox/today?show_options=true", 120, true);
+      if (!t || !t.arms) return { head: "Sandbox today", body: '<p class="st-msg">No run yet. Accounts trade at 2:35 PM CT on market days.</p>' };
+      const tot = t.totals || {};
+      const held = t.arms.filter(a => a.ran && !(a.filled || []).length && !(a.skipped || []).length);
+      const acted = t.arms.filter(a => (a.filled || []).length || (a.skipped || []).length);
+      const when = (t.date ? shortDate(t.date) : "") + (t.ran_at ? ", " + new Date(t.ran_at * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "");
+      const pills = (tot.buys ? '<span class="pill up">' + tot.buys + ' bought, ' + usd(tot.bought, 0) + '</span>' : '') +
+        (tot.sells ? '<span class="pill down">' + tot.sells + ' sold, ' + usd(tot.sold, 0) + '</span>' : '') +
+        (tot.skipped ? '<span class="pill amb">' + tot.skipped + ' skipped</span>' : '') + '<span class="pill">' + held.length + ' held</span>';
+      const list = acted.map(a => '<div class="st-tarm"><b>' + esc(shortLabel(a)) + '</b> ' +
+        (a.filled || []).map(f => '<span class="' + (f.side === "sell" ? "down-t" : "up-t") + '">' + esc((f.side === "sell" ? "sold " : "") + String(f.symbol || "")) + '</span>').join(", ") +
+        ((a.skipped || []).length ? ' <span class="amb-t">skipped ' + esc((a.skipped || []).map(s => String(s.symbol || "").split(" ")[0]).join(", ")) + '</span>' : '') + '</div>').join("");
+      return { head: "Sandbox today", sub: when, body: '<div class="pills" style="margin:0 0 .5rem">' + pills + '</div><div class="st-scroll">' + list + '</div>' };
+    },
+    async macro() {
+      const m = await stData("/macro/catalysts", 900, false);
+      if (!m.available) return { head: "World news risk", body: '<p class="st-msg">No news read yet.</p>' };
+      const lvl = String(m.risk_level || "");
+      const tint = /high|severe|elevated/.test(lvl) ? "down" : /low|calm/.test(lvl) ? "up" : "";
+      return { head: "World news risk", sub: (m.stale ? "out of date, " : "") + (m.age_seconds == null ? "" : m.age_seconds < 3600 ? Math.max(1, Math.round(m.age_seconds / 60)) + " min old" : Math.round(m.age_seconds / 3600) + " h old"), tint,
+        body: '<div class="st-row1" style="margin-bottom:.35rem"><span class="pill ' + (tint === "down" ? "amb" : tint) + '">' + esc(lvl ? lvl[0].toUpperCase() + lvl.slice(1) : "—") + ' risk</span></div>' +
+              '<div class="st-head2">' + esc(m.headline || "") + '</div>' +
+              '<div class="st-scroll"><ul class="st-bul">' + (m.bullets || []).map(x => '<li>' + esc(x) + '</li>').join("") + '</ul></div>' };
+    },
+  });
+
   // ---------------------------------------------------------------- render
   function stPlace(el, w) {
     el.style.gridColumn = (w.x + 1) + " / span " + w.w;
@@ -458,7 +521,7 @@ JS = r"""
     catch (e) { out = { head: (w.cfg.title || T.title) + (w.cfg.sym ? " " + w.cfg.sym : ""), body: stFail(e) }; }
     if (!$("stw-" + w.id)) return;
     const h = el.querySelector(".st-h");
-    const title = w.cfg.title || out.head || T.title;
+    const title = w.cfg.title || out.head || T.title;   // out.head null: the widget's own name
     h.innerHTML = (out.symHead && !w.cfg.title ? '<button type="button" class="st-sym t" data-sym="' + esc(out.head) + '">' + esc(out.head) + '</button>'
       : '<span class="t">' + esc(title) + '</span>') + '<span class="s">' + esc(out.sub || "") + '</span>' + (out.extra || "");
     const body = el.querySelector(".st-b");
@@ -607,7 +670,7 @@ JS = r"""
     const w = stMake({ type, x: spot.x, y: spot.y });
     ST.widgets.push(w); ST.sel = w.id; stResolve(w); stRender(); stSave();
     const el = $("stw-" + w.id); el.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    if (["quote", "chart", "watchlist", "arm", "race"].includes(type)) stConfigure(w, true); else el.focus();
+    if (["quote", "chart", "watchlist", "arm", "race", "options"].includes(type)) stConfigure(w, true); else el.focus();
   }
   function stRemove(w) {
     ST.widgets = ST.widgets.filter(x => x !== w); if (ST.sel === w.id) ST.sel = null;
@@ -633,10 +696,11 @@ JS = r"""
            '><label for="st-src-c" style="margin:0">These symbols</label></div>' +
            '<textarea id="st-f-syms" placeholder="AAPL MSFT NVDA">' + esc((c.syms || []).join(" ")) + '</textarea>';
     }
-    if (w.type === "arm" || w.type === "race") {
+    if (w.type === "arm" || w.type === "race" || w.type === "options") {
       let arms = [];
       try { arms = ((await stData("/sandbox/arms", 60, true)).arms) || []; } catch (e) {}
-      if (w.type === "arm") {
+      if (w.type === "options") arms = arms.filter(a => a.universe === "options");
+      if (w.type === "arm" || w.type === "options") {
         h += '<label for="st-f-arm">Account</label><select id="st-f-arm">' + (arms.length ? arms.map(a => '<option value="' + esc(a.arm) + '"' +
           (a.arm === c.arm ? " selected" : "") + '>' + esc(shortLabel(a)) + '</option>').join("") : '<option value="' + esc(c.arm) + '">' + esc(c.arm) + '</option>') + '</select>';
       } else {
