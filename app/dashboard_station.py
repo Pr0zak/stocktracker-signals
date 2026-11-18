@@ -30,8 +30,9 @@ HTML = r"""
       <button type="button" class="sm" id="st-edit" aria-pressed="false">Edit layout</button>
     </div>
   </div>
-  <p class="st-help" id="st-help" hidden>Drag a widget to move it and drag its corner to resize it.
-    With a widget selected, the arrow keys move it, Shift + arrows resize it, Enter opens its settings and Delete removes it.</p>
+  <p class="st-help" id="st-help" hidden><span class="st-wide-only">Drag a widget to move it and drag its corner to resize it.
+    With a widget selected, the arrow keys move it, Shift + arrows resize it, Enter opens its settings and Delete removes it.</span>
+    <span class="st-narrow-only">Use ⚙ to change a widget and ✕ to remove it. To move or resize widgets, open this page on a wider screen.</span></p>
   <div class="st-tray" id="st-tray" hidden></div>
   <div class="st-grid" id="st-grid"></div>
   <div class="st-empty" id="st-empty" hidden>
@@ -94,7 +95,10 @@ CSS = r"""
           border-radius: 1.25rem; padding: .8rem .95rem .75rem; border: 1px solid #ffffff0d; overflow: hidden;
           background: radial-gradient(120% 140% at 100% 0%, var(--tint, transparent) 0%, transparent 60%), var(--card); }
   .st-w.up { --tint: rgba(94,221,156,.12); } .st-w.down { --tint: rgba(232,102,63,.12); }
-  .st-editing .st-w { cursor: grab; outline: 1px dashed #6B7787; outline-offset: -1px; user-select: none; touch-action: none; }
+  .st-editing .st-w { outline: 1px dashed #6B7787; outline-offset: -1px; }
+  .st-narrow-only { display: none; }
+  @media (min-width: 62.01rem) { .st-editing .st-w { cursor: grab; user-select: none; touch-action: none; } }
+  @media (max-width: 62rem) { .st-wide-only { display: none; } .st-narrow-only { display: inline; } }
   .st-editing .st-w:focus-visible, .st-w.st-sel { outline: 2px solid var(--accent); outline-offset: -2px; }
   .st-w.st-drag { cursor: grabbing; z-index: 5; box-shadow: 0 18px 40px #000a; opacity: .92; transition: none; }
   .st-ghost { border-radius: 1.25rem; border: 2px dashed var(--accent); background: rgba(180,160,255,.08);
@@ -247,9 +251,9 @@ JS = r"""
     return p;
   }
   const ST_RANGES = { "1d": ["1d", "5m", 30], "1mo": ["1mo", "1d", 600], "3mo": ["3mo", "1d", 600], "1y": ["1y", "1d", 1800] };
-  function stChart(sym, range) {
+  function stChart(sym, range, ttlSec) {
     const [r, i, ttl] = ST_RANGES[range] || ST_RANGES["1d"];
-    return stData("/prices/yahoo/v8/finance/chart/" + encodeURIComponent(sym) + "?range=" + r + "&interval=" + i, ttl, false)
+    return stData("/prices/yahoo/v8/finance/chart/" + encodeURIComponent(sym) + "?range=" + r + "&interval=" + i, ttlSec || ttl, false)
       .then(j => {
         const res = j && j.chart && j.chart.result && j.chart.result[0];
         if (!res) throw new Error("no data for " + sym);
@@ -326,8 +330,10 @@ JS = r"""
       }
       if (!syms.length) return { head: "Watchlist", sub, body: '<p class="st-msg">' + (w.cfg.src === "custom"
         ? "No symbols yet. Open this widget's settings to add some." : "Your phone hasn't synced a watchlist to the server yet.") + '</p>' };
-      const [scan, rows] = await Promise.all([stScanMap(), Promise.all(syms.slice(0, 40).map(s => stChart(s, "1d").catch(() => null)))]);
-      const html = syms.slice(0, 40).map((s, k) => {
+      // Every row is a price fetch, so a long list refreshes each 2 minutes rather than each 30 s.
+      const ttl = syms.length > 12 ? 120 : 30;
+      const [scan, rows] = await Promise.all([stScanMap(), Promise.all(syms.map(s => stChart(s, "1d", ttl).catch(() => null)))]);
+      const html = syms.map((s, k) => {
         const q = rows[k], r = scan[s], d = stDir(q && q.chg);
         const sig = r && r.signal ? '<span class="st-sig ' + esc(r.signal) + '" title="' + esc(r.thesis || "") + '">' +
           esc(r.signal[0].toUpperCase() + r.signal.slice(1)) + (r.conviction != null ? " " + r.conviction : "") + '</span>' : '<span class="st-sig">—</span>';
@@ -348,9 +354,12 @@ JS = r"""
     },
     async pick() {
       const [s, e] = await Promise.all([stData("/daily_pick", 300, false).catch(() => null), stData("/daily_pick?kind=etf", 300, false).catch(() => null)]);
+      // A run from an earlier day is never presented as today's pick: it gets no headline and says its date.
+      const fresh = (r) => r && r.available && !r.stale && (!r.today || r.date === r.today);
       const line = (r, kind) => {
         if (!r || !r.available) return '<p class="st-para"><b>' + kind + ':</b> no run yet.</p>';
-        const old = r.stale ? ' <span class="amb-t">(from ' + esc(r.date) + ')</span>' : '';
+        if (!fresh(r)) return '<p class="st-para"><b>' + kind + ':</b> no run yet today. <span class="amb-t">The last one was ' + esc(r.date) + '.</span></p>';
+        const old = '';
         if (r.status === "failed") return '<p class="st-para"><b>' + kind + ':</b> the run failed.' + old + '</p>';
         if (r.status === "pick" && r.pick) {
           const p = r.pick;
@@ -362,8 +371,9 @@ JS = r"""
           (r.gate && r.gate.passed === false ? "The market looks too risky today." : "Nothing scored high enough.");
         return '<p class="st-para"><b>' + kind + ':</b> none. ' + esc(why) + old + '</p>';
       };
-      const sp = s && s.status === "pick" && s.pick ? s.pick.symbol : null, ep = e && e.status === "pick" && e.pick ? e.pick.symbol : null;
-      const head = sp && ep ? "Picks: " + sp + " and " + ep : sp ? "Stock pick: " + sp : ep ? "ETF pick: " + ep : "No picks today";
+      const sp = fresh(s) && s.status === "pick" && s.pick ? s.pick.symbol : null, ep = fresh(e) && e.status === "pick" && e.pick ? e.pick.symbol : null;
+      const anyToday = fresh(s) || fresh(e);
+      const head = sp && ep ? "Picks: " + sp + " and " + ep : sp ? "Stock pick: " + sp : ep ? "ETF pick: " + ep : anyToday ? "No picks today" : "Today's run hasn't happened yet";
       return { head: "Today's pick", tint: sp || ep ? "up" : "", body: '<div class="st-head2">' + esc(head) + '</div><div class="st-scroll">' + line(s, "Stock") + line(e, "ETF") + '</div>' };
     },
     async movers() {
@@ -451,7 +461,12 @@ JS = r"""
     const title = w.cfg.title || out.head || T.title;
     h.innerHTML = (out.symHead && !w.cfg.title ? '<button type="button" class="st-sym t" data-sym="' + esc(out.head) + '">' + esc(out.head) + '</button>'
       : '<span class="t">' + esc(title) + '</span>') + '<span class="s">' + esc(out.sub || "") + '</span>' + (out.extra || "");
-    el.querySelector(".st-b").innerHTML = out.body;
+    const body = el.querySelector(".st-b");
+    if (body._html !== out.body) {
+      const sc = body.querySelector(".st-scroll"), top = sc ? sc.scrollTop : 0;
+      body.innerHTML = out.body; body._html = out.body;
+      const sc2 = body.querySelector(".st-scroll"); if (sc2 && top) sc2.scrollTop = top;
+    }
     el.classList.remove("up", "down"); if (out.tint) el.classList.add(out.tint);
     el.dataset.open = out.open || "";
     if (out.after) out.after(el);
@@ -587,6 +602,7 @@ JS = r"""
 
   // ---------------------------------------------------------------- add, remove, configure
   function stAdd(type) {
+    if (ST.widgets.length >= 40) { $("st-saved").textContent = "A station holds at most 40 widgets. Remove one first."; return; }
     const T = ST_TYPES[type], spot = stFreeSpot(T.w, T.h);
     const w = stMake({ type, x: spot.x, y: spot.y });
     ST.widgets.push(w); ST.sel = w.id; stResolve(w); stRender(); stSave();
@@ -678,7 +694,7 @@ JS = r"""
 
   // ---------------------------------------------------------------- saving and loading
   let stSaveT = null;
-  function stDoc() { return { name: ST.name, widgets: ST.widgets.map(w => ({ id: w.id, type: w.type, x: w.x, y: w.y, w: w.w, h: w.h, cfg: w.cfg })) }; }
+  function stDoc() { return { name: ST.name, widgets: ST.widgets.map(w => ({ id: w.id, type: w.type, x: w.x, y: Math.min(w.y, 60), w: w.w, h: w.h, cfg: w.cfg })) }; }
   function stSave() {
     const doc = stDoc();
     try { localStorage.setItem(ST_LS, JSON.stringify(doc)); } catch (e) {}
@@ -696,8 +712,9 @@ JS = r"""
   async function stLoad() {
     let doc = null, local = null;
     try { local = JSON.parse(localStorage.getItem(ST_LS) || "null"); } catch (e) {}
+    let pushLocal = false;
     if (apiToken()) {
-      try { const r = await afetch("/station/layout"); if (r.ok) { const j = await r.json(); if (j.saved) doc = j; } } catch (e) {}
+      try { const r = await afetch("/station/layout"); if (r.ok) { const j = await r.json(); if (j.saved) doc = j; else pushLocal = !!local; } } catch (e) {}
     }
     doc = doc || local;
     ST.name = (doc && doc.name) || "My station";
@@ -705,6 +722,8 @@ JS = r"""
       .map(w => ({ id: w.id || stId(), type: w.type, x: w.x | 0, y: w.y | 0, w: w.w || ST_TYPES[w.type].w, h: w.h || ST_TYPES[w.type].h,
                    cfg: Object.assign({}, ST_TYPES[w.type].cfg, w.cfg || {}) })) : stStarter();
     stResolve(null); ST.loaded = true; stRender();
+    // A layout made before the token was added lives only in this browser: put it on the server now.
+    if (pushLocal) stSave();
   }
 
   // ---------------------------------------------------------------- start and refresh
