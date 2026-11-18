@@ -5001,6 +5001,8 @@ async def _options_state(arm: str, blob: dict) -> dict:
         "stale_marks": [r["contract_symbol"] for r in rows if r.get("mark_stale")],
         "marks_as_of": st.get("marks_as_of"),
         "premium_at_risk_usd": options_arm.premium_at_risk(st["contracts"]),
+        "weekly_budget": options_arm.week_budget(st, equity=equity, settings=blob.get("settings"),
+                                                 today=sandbox_job.today_et_str()),
         "options_scorecard": options_arm.scorecard(trades, st["contracts"]),
         "new_entries_paused_runs_left": int(st.get("pause_ticks_left") or 0),
         "settings": {**blob["settings"], "current_age": sandbox_job.effective_age(blob["settings"])},

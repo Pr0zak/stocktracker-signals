@@ -70,7 +70,11 @@ DEFAULTS: dict[str, float] = {
     "opt_max_premium_pct": 15.0,     # premium on one contract position, % of equity
     "opt_max_at_risk_pct": 30.0,     # all open premium together, % of equity
     "opt_max_open": 6,               # open contract positions
-    "opt_max_new_per_tick": 2,
+    "opt_max_new_per_tick": 1,
+    # New premium opened in any WEEK_DAYS-day window, % of equity (2026-11-17). Paces the at-risk
+    # budget so the arm cannot fill it in two runs and then sit out a better read mid-month; a
+    # contract closed inside the window still counts, because the money was spent. 0 turns it off.
+    "opt_max_new_week_pct": 15.0,
     "opt_exit_dte": 21,              # close at or under this many calendar days to expiry
     "opt_stop_pct": -50.0,           # close when the mark is this far under the premium paid
     "opt_target_pct": 100.0,         # close when the mark is this far over the premium paid
@@ -100,6 +104,11 @@ def state(blob: dict) -> dict:
     st.setdefault("signals", {})          # underlying -> {"right", "date"}: the last proposed direction
     st.setdefault("pause_ticks_left", 0)
     st.setdefault("marks_as_of", None)    # ET date of the last fresh marks
+    if not isinstance(st.get("spend_log"), list):
+        # [{"date", "cost"}] per open, for the weekly budget. Seeded from the contracts still held,
+        # so an arm that predates the log counts what it opened this week (none had closed by then).
+        st["spend_log"] = [{"date": c.get("opened_date"), "cost": float(c.get("cost_total") or 0.0)}
+                           for c in st["contracts"] if c.get("opened_date")]
     return st
 
 
@@ -208,6 +217,36 @@ def contracts_value(contracts: Iterable[dict], marks: dict[str, dict]) -> float:
 
 def premium_at_risk(contracts: Iterable[dict]) -> float:
     return round(sum(float(c.get("cost_total") or 0.0) for c in contracts), 2)
+
+
+WEEK_DAYS = 7   # calendar days: five trading days in an ordinary week
+
+
+def week_budget(st: dict, *, equity: float, settings: dict | None, today: str) -> dict | None:
+    """The weekly pacing budget: what may be opened, what was opened in the last WEEK_DAYS days
+    (today included), what is left, and the date the oldest spend in the window stops counting.
+    None when the setting is 0 (off)."""
+    pct = setting(settings, "opt_max_new_week_pct")
+    if pct <= 0:
+        return None
+    inside = [r for r in (st.get("spend_log") or [])
+              if (d := _days_between(r.get("date"), today)) is not None and 0 <= d < WEEK_DAYS]
+    budget = round(pct / 100.0 * equity, 2)
+    spent = round(sum(float(r.get("cost") or 0.0) for r in inside), 2)
+    oldest = min((r["date"] for r in inside), default=None)
+    frees_on = (dt.date.fromisoformat(oldest) + dt.timedelta(days=WEEK_DAYS)).isoformat() if oldest else None
+    return {"pct": pct, "budget_usd": budget, "spent_usd": spent,
+            "room_usd": round(max(budget - spent, 0.0), 2), "frees_on": frees_on}
+
+
+def _prune_spend_log(st: dict, *, today: str) -> None:
+    st["spend_log"] = [r for r in st.get("spend_log") or []
+                       if (d := _days_between(r.get("date"), today)) is None or d < WEEK_DAYS]
+
+
+def _week_used(wk: dict) -> str:
+    return (f"weekly options budget used: ${wk['spent_usd']:,.0f} of ${wk['budget_usd']:,.0f}"
+            + (f" — more room from {wk['frees_on']}" if wk.get("frees_on") else ""))
 
 
 # ------------------------------------------------------------------ picking a contract
@@ -330,7 +369,8 @@ def settle_expired(blob: dict, closes: dict[str, float | None], *, now_ts: float
 # ------------------------------------------------------------------ sizing
 
 def size_open(cand: dict, right: str, *, equity: float, cash: float, at_risk: float,
-              conviction: int | None, settings: dict | None) -> tuple[dict | None, int, str | None]:
+              conviction: int | None, settings: dict | None,
+              week: dict | None = None) -> tuple[dict | None, int, str | None]:
     """(quote, count, skip_reason). The 0.50-delta contract if one fits the per-contract cap, else the
     0.32, else nothing. Count scales with conviction inside the cap and never breaches the at-risk
     cap or the cash floor; a single contract that fits the cap but not the remaining room is refused
@@ -338,11 +378,14 @@ def size_open(cand: dict, right: str, *, equity: float, cash: float, at_risk: fl
     cap = setting(settings, "opt_max_premium_pct") / 100.0 * equity
     room = setting(settings, "opt_max_at_risk_pct") / 100.0 * equity - at_risk
     floor = float((settings or {}).get("cash_floor_pct", 0.0) or 0.0) / 100.0 * equity
-    spend = min(cap, room, cash - floor)
+    week_room = week["room_usd"] if week else math.inf
+    spend = min(cap, room, cash - floor, week_room)
     side = cand.get("calls" if right == "call" else "puts") or {}
     if side.get("atm") is None and side.get("otm") is None:
         return None, 0, f"no liquid {right} on {cand.get('symbol')} today"
     if spend <= 0:
+        if week and week_room <= 0:
+            return None, 0, _week_used(week)
         if room <= 0:
             return None, 0, f"premium at risk is at its {setting(settings, 'opt_max_at_risk_pct'):g}% cap"
         return None, 0, f"cash floor of {float((settings or {}).get('cash_floor_pct', 0.0) or 0.0):g}% leaves nothing to spend"
@@ -360,6 +403,10 @@ def size_open(cand: dict, right: str, *, equity: float, cash: float, at_risk: fl
             count = 1
         if count >= 1:
             return q, count, None
+        if week and week_room <= min(room, cash - floor):
+            return None, 0, (f"one {right} costs ${one:,.0f}; ${spend:,.0f} left in the weekly options "
+                             f"budget (${week['spent_usd']:,.0f} of ${week['budget_usd']:,.0f} used"
+                             + (f", more room from {week['frees_on']})" if week.get("frees_on") else ")"))
         return None, 0, (f"one {right} costs ${one:,.0f}; ${spend:,.0f} left under the at-risk cap and cash floor")
     return None, 0, (f"no {right} at 0.50 or 0.32 delta fits the per-contract cap of ${cap:,.0f}")
 
@@ -476,6 +523,7 @@ def fill(blob: dict, orders: list[dict], *, candidates: dict[str, dict], marks: 
     st = state(b)
     today = today or today_et_str()
     exclude = {str(x).upper() for x in (exclude or set())}
+    _prune_spend_log(st, today=today)
     cash0 = round(float(b.get("cash") or 0.0), 2)
     filled: list[dict] = []
     skipped: list[dict] = []
@@ -563,8 +611,9 @@ def fill(blob: dict, orders: list[dict], *, candidates: dict[str, dict], marks: 
         if why:
             skip(why)
             continue
+        week = week_budget(st, equity=equity, settings=settings, today=today)
         q, count, reason = size_open(cand, right, equity=equity, cash=cash, at_risk=at_risk,
-                                     conviction=conv, settings=settings)
+                                     conviction=conv, settings=settings, week=week)
         if q is None:
             skip(reason or "could not size")
             continue
@@ -572,6 +621,7 @@ def fill(blob: dict, orders: list[dict], *, candidates: dict[str, dict], marks: 
         cash = round(cash - cost, 2)
         spent += cost
         at_risk = round(at_risk + cost, 2)
+        st["spend_log"].append({"date": today, "cost": cost})
         c = {
             "contract_symbol": q["contract_symbol"], "underlying": und, "right": right,
             "strike": q["strike"], "expiry_ts": q["expiry_ts"], "expiry": q["expiry"],
@@ -659,7 +709,10 @@ def rules_decision(cands: list[dict], *, settings: dict | None) -> dict:
             "reason": f"directional score {score}" + (f": {'; '.join(reasons)}" if reasons else ""),
         })
     orders.sort(key=lambda o: -o["conviction"])
-    orders = orders[:int(setting(settings, "opt_max_new_per_tick"))]
+    # A few more than the per-run cap: with one fill a run, a top read the ledger cannot size (LLY on
+    # 2026-11-16, no contract under the per-contract cap) must not cost the whole day. The ledger
+    # still fills at most opt_max_new_per_tick.
+    orders = orders[:int(setting(settings, "opt_max_new_per_tick")) + 2]
     calls = sum(1 for o in orders if o["right"] == "call")
     puts = len(orders) - calls
     posture = (f"Rules: {len(orders)} directional read(s) cleared the band — {calls} call, {puts} put."
@@ -717,6 +770,7 @@ def analyst_payload(blob: dict, cands: list[dict], marks: dict[str, dict], *, eq
             "per_contract_usd": round(cap, 2), "at_risk_room_usd": round(max(room, 0.0), 2),
             "max_open": int(setting(settings, "opt_max_open")),
             "new_per_run": int(setting(settings, "opt_max_new_per_tick")),
+            "weekly_budget": week_budget(st, equity=equity, settings=settings, today=today_et_str()),
             "cash_floor_pct": (settings or {}).get("cash_floor_pct"),
             "min_conviction": (settings or {}).get("min_conviction_to_trade"),
             "exits_by_code": {"days_to_expiry": int(setting(settings, "opt_exit_dte")),

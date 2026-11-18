@@ -2012,8 +2012,9 @@ candidate row shows the call and the put the server would buy (`call`, `put`; `*
 the expiry breakeven.
 
 HARD LIMITS the server enforces regardless of what you write (`limits`): premium on one contract \
-position, total premium at risk, number of open contracts, new contracts per run, one contract per \
-underlying, a cash floor, a conviction floor. A direction that FLIPS on a name (call to put or back) \
+position, total premium at risk, number of open contracts, new contracts per run, a WEEKLY budget \
+for new premium (`weekly_budget`: what is left this week; spend it on the best read, not the first), \
+one contract per underlying, a cash floor, a conviction floor. A direction that FLIPS on a name (call to put or back) \
 within a month is deferred one run, so a flip you propose today fills tomorrow if you propose it \
 again. A stock whose earnings date is UNKNOWN (the lookup failed) gets no contract. Writing an order \
 the limits refuse costs nothing but tells the log you did not read them.

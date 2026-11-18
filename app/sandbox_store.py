@@ -220,7 +220,8 @@ DEFAULT_SETTINGS = {
     "opt_max_premium_pct": 15.0,     # premium on one contract position, % of equity
     "opt_max_at_risk_pct": 30.0,     # all open premium together, % of equity
     "opt_max_open": 6,
-    "opt_max_new_per_tick": 2,
+    "opt_max_new_per_tick": 1,
+    "opt_max_new_week_pct": 15.0,    # new premium in any 7 days, % of equity (pacing)
     "opt_exit_dte": 21,              # close at or under this many days to expiry
     "opt_stop_pct": -50.0,           # close at this loss on the premium
     "opt_target_pct": 100.0,         # close at this gain on the premium

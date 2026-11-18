@@ -261,7 +261,7 @@ def test_fill_closes_at_the_bid_first_then_opens_and_scores_the_close():
 
 
 def test_fill_refuses_a_second_contract_on_one_underlying_and_counts_the_caps():
-    b = _blob(contracts=[_contract("SPY")])
+    b = _blob(contracts=[_contract("SPY")], opt_max_new_per_tick=2, opt_max_new_week_pct=0)
     orders = [{"symbol": "SPY", "underlying": "SPY", "right": "put", "action": "open", "conviction": 90, "reason": "x"},
               {"symbol": "QQQ", "underlying": "QQQ", "right": "call", "action": "open", "conviction": 80, "reason": "x"},
               {"symbol": "IWM", "underlying": "IWM", "right": "call", "action": "open", "conviction": 70, "reason": "x"},
@@ -568,3 +568,54 @@ def test_no_options_arm_means_no_chain_fetch(store, monkeypatch):
     out = asyncio.run(main._maybe_options_context(now=sandbox_job.now_et(), force=True, candidates=[],
                                                   held_rows=[], bench_series=None))
     assert out is None and called == []
+
+
+# ------------------------------------------------------------------ weekly pacing (2026-11-17)
+
+def _open(und, conv=93):
+    return {"symbol": und, "underlying": und, "right": "call", "action": "open", "conviction": conv, "reason": "x"}
+
+
+def test_weekly_budget_lets_one_contract_through_then_refuses_with_the_date_room_returns():
+    """The 2026-11-16/17 case: WELL ($1,410) on Monday, DUK ($1,230) on Tuesday. With a 15% weekly
+    budget Monday fills and Tuesday is refused, naming the spend and when room comes back."""
+    b = _blob(cash_floor_pct=0.0)
+    mon = TODAY.isoformat()
+    nb, filled, _ = _fill(b, [_open("QQQ")], [_cand("QQQ", spot=680, atm_call=14.10, otm_call=6.0)], today=mon)
+    assert [r["gross"] for r in filled] == [1410.0]
+    assert nb["options"]["spend_log"] == [{"date": mon, "cost": 1410.0}]
+    tue = (TODAY + dt.timedelta(days=1)).isoformat()
+    nb2, filled2, skipped2 = _fill(nb, [_open("IWM")], [_cand("IWM", spot=277, atm_call=12.30, otm_call=9.0)], today=tue)
+    assert not filled2
+    why = skipped2[0]["skip_reason"]
+    assert "weekly options budget" in why and "$1,410 of $1,5" in why
+    assert (TODAY + dt.timedelta(days=7)).isoformat() in why
+    # seven days on, Monday's spend no longer counts and the same read fills
+    later = (TODAY + dt.timedelta(days=7)).isoformat()
+    nb3, filled3, _ = _fill(nb2, [_open("IWM")], [_cand("IWM", spot=277, atm_call=12.30, otm_call=9.0)], today=later)
+    assert len(filled3) == 1
+    assert [r["date"] for r in nb3["options"]["spend_log"]] == [later]   # pruned
+
+
+def test_weekly_budget_counts_a_contract_closed_inside_the_week():
+    """Spending is spending: a stop-out on Tuesday does not hand Monday's money back to the week."""
+    st = options_arm.state({"options": {"contracts": [], "spend_log": [{"date": TODAY.isoformat(), "cost": 1400.0}]}})
+    wk = options_arm.week_budget(st, equity=10_000, settings={}, today=TODAY.isoformat())
+    assert wk["spent_usd"] == 1400.0 and wk["room_usd"] == 100.0
+
+
+def test_weekly_budget_seeds_from_held_contracts_and_can_be_switched_off():
+    held = _contract("WELL") | {"opened_date": TODAY.isoformat(), "cost_total": 1410.0}
+    st = options_arm.state({"options": {"contracts": [held]}})
+    assert st["spend_log"] == [{"date": TODAY.isoformat(), "cost": 1410.0}]
+    assert options_arm.week_budget(st, equity=10_000, settings={"opt_max_new_week_pct": 0}, today=TODAY.isoformat()) is None
+
+
+def test_one_new_contract_a_run_by_default_and_the_rules_twin_offers_spares():
+    assert options_arm.DEFAULTS["opt_max_new_per_tick"] == 1
+    b = _blob(cash_floor_pct=0.0, opt_max_new_week_pct=0)
+    nb, filled, skipped = _fill(b, [_open("QQQ"), _open("IWM", 80)], [_cand("QQQ", spot=680), _cand("IWM", spot=277)])
+    assert [r["underlying"] for r in filled] == ["QQQ"] and "per-run cap" in skipped[0]["skip_reason"]
+    cands = [_cand(s, score=sc) for s, sc in (("A", 90), ("B", 80), ("C", 70), ("D", 60))]
+    orders = options_arm.rules_decision(cands, settings=sandbox_store.DEFAULT_SETTINGS)["orders"]
+    assert [o["symbol"] for o in orders] == ["A", "B", "C"]

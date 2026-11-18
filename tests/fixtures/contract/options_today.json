@@ -59,7 +59,7 @@
           "price": 16.45,
           "shares": 1,
           "side": "buy",
-          "symbol": "SPY $760 CALL EXP 2027-01-16"
+          "symbol": "SPY $760 CALL EXP 2027-01-18"
         },
         {
           "gross": 1240.0,
@@ -67,11 +67,11 @@
           "price": 12.4,
           "shares": 1,
           "side": "sell",
-          "symbol": "QQQ $670 PUT EXP 2027-01-16"
+          "symbol": "QQQ $670 PUT EXP 2027-01-18"
         }
       ],
       "label": "Options (no AI)",
-      "last_tick_date": "2026-11-15",
+      "last_tick_date": "2026-11-17",
       "posture": "",
       "ran": true,
       "skipped": [
@@ -79,7 +79,7 @@
           "gross": null,
           "instrument": "option",
           "price": null,
-          "reason": "conviction 40 under the 55 floor",
+          "reason": "1 new today",
           "shares": 0,
           "side": "buy",
           "symbol": "IWM CALL"
@@ -88,7 +88,7 @@
       "universe": "options"
     }
   ],
-  "date": "2026-11-15",
+  "date": "2026-11-17",
   "ran_at": null,
   "totals": {
     "bought": 1645.0,
