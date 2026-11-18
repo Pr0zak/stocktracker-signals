@@ -23,6 +23,8 @@ unchanged, so the existing script keeps driving them.
 """
 from __future__ import annotations
 
+from . import dashboard_sandbox as _sbx
+
 PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -36,17 +38,19 @@ PAGE = """<!doctype html>
          headline figures on the usage and cost cards), so dark mode was the failing case.
      The replacements are 6.0:1 / 5.9:1 and 6.9:1 / 7.4:1 against their own grounds. Names are kept
      so the ~40 existing references inherit the fix with no call-site edits. */
+  /* The phone app's dark palette (app ui/theme/Color.kt), dark only since 2026-11-18: the user reads
+     StockTracker in dark mode and asked for this page to look like the app. Contrast against the
+     card #1C232C: ink 13.2:1, muted 7.0:1, indigo 7.8:1, gain 10.2:1, loss 5.3:1, amber 5.3:1. */
   :root {
-    color-scheme: light dark;
-    --accent:#1d4ed8; --ok:#0f7a34; --err:#c02626; --warn:#96590d;
-    --muted:#5b6270; --line:#d9dce3; --card:#ffffff; --bg:#f6f7f9; --ink:#16181d;
-    --radius:.85rem;
+    color-scheme: dark;
+    --accent:#B4A0FF; --ok:#5EDD9C; --err:#E8663F; --warn:#D3A23F; --amber:#C99A35;
+    --muted:#A3ADBA; --line:#2C343F; --outline:#6B7787; --card:#1C232C; --card2:#151A21; --bg:#0D1116; --ink:#E7EBF0;
+    --on-accent:#2A1E52; --chip-sel:#4A4458; --bench:#8A94A2;
+    --sans: Roboto, "Segoe UI", system-ui, -apple-system, sans-serif;
+    --mono: "Roboto Mono", "Noto Sans Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --radius:1rem;
     /* Spacing and density scale with the viewport rather than being fixed at desktop values. */
     --pad:.8rem; --gap:.7rem; --card-pad:.85rem .9rem; --cell-pad:.34rem .45rem;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root { --accent:#7ea6ff; --ok:#4cc172; --err:#ff6f6f; --warn:#e0a63f;
-            --muted:#9aa2b1; --line:#333a45; --card:#1c212a; --bg:#0d0f13; --ink:#e7eaf0; }
   }
   @media (min-width: 46rem) {
     :root { --pad:1rem; --gap:1rem; --card-pad:1rem 1.1rem; --cell-pad:.42rem .6rem; }
@@ -57,7 +61,7 @@ PAGE = """<!doctype html>
      where "Last scan" was hiding. 8rem clears the title, subtitle and tabs at phone widths, where
      the header is tallest because the tab strip wraps closest to the text above it. */
   html { scroll-padding-top: 8rem; }
-  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; line-height: 1.5;
+  body { font-family: var(--sans); margin: 0; line-height: 1.5;
          background: var(--bg); color: var(--ink); }
   .wrap { max-width: 82rem; margin: 0 auto; padding: 0 var(--pad) 3rem; }
 
@@ -72,7 +76,7 @@ PAGE = """<!doctype html>
   .tab { padding: .5rem .9rem; font-size: .88rem; font-weight: 600; color: var(--muted);
          background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer;
          white-space: nowrap; border-radius: 0; }
-  .tab:hover { color: CanvasText; }
+  .tab:hover { color: var(--ink); }
   .tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
   .panel[hidden] { display: none; }
 
@@ -98,9 +102,9 @@ PAGE = """<!doctype html>
      it refuses to shrink below its content's intrinsic width — so a wide table inside a card made the
      CARD wide, and the `.scroll { overflow-x:auto }` wrapper around every table never engaged. The
      wrappers were correct all along and could not fire. */
-  .card { min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); padding: var(--card-pad);
+  .card { min-width: 0; border: 1px solid #ffffff0a; border-radius: var(--radius); padding: var(--card-pad);
           background: var(--card); }
-  .card h2 { font-size: .95rem; margin: 0 0 .8rem; display: flex; align-items: baseline;
+  .card h2 { font-size: 1rem; font-weight: 500; margin: 0 0 .8rem; display: flex; align-items: baseline;
              gap: .5rem; flex-wrap: wrap; }
   .card h2 .hint { font-weight: 400; }
 
@@ -115,14 +119,14 @@ PAGE = """<!doctype html>
   .row input, .row select { flex: 1; min-width: 6rem; }
   .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .1rem .8rem; }
   button { padding: .5rem 1rem; font-size: .9rem; border: 0; border-radius: .45rem;
-           background: var(--accent); color: #fff; cursor: pointer; white-space: nowrap; font-family: inherit; }
+           background: var(--accent); color: var(--on-accent); font-weight: 600; cursor: pointer; white-space: nowrap; font-family: inherit; }
   button:disabled { opacity: .5; cursor: default; }
   button.secondary { background: #8883; color: inherit; }
   button.ok { background: var(--ok); }
   button.danger { background: transparent; color: var(--err); border: 1px solid var(--err); }
   button.sm { padding: .3rem .6rem; font-size: .78rem; }
   .chips { margin-top: .5rem; min-height: 1.1rem; }
-  .chip { display: inline-flex; align-items: center; background: rgba(37,99,235,.15);
+  .chip { display: inline-flex; align-items: center; background: rgba(180,160,255,.14);
           border-radius: 1rem; padding: .2rem .65rem; margin: .12rem .22rem .12rem 0; font-size: .82rem; }
   .empty { color: var(--muted); font-size: .82rem; }
   .synced { font-size: .82rem; margin: .1rem 0 .5rem; color: var(--muted); }
@@ -207,7 +211,7 @@ PAGE = """<!doctype html>
   table.tbl td.num { text-align: right; font-variant-numeric: tabular-nums; }
   table.tbl td.thesis { max-width: 15rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   table.tbl tr.changed td:first-child { border-left: 3px solid var(--warn); padding-left: calc(.45rem - 3px); }
-  table.tbl tr.sel td { background: rgba(37,99,235,.09); }
+  table.tbl tr.sel td { background: rgba(180,160,255,.1); }
   .pos { color: var(--ok); } .neg { color: var(--err); }
 
   .src { display: flex; align-items: center; gap: .5rem; padding: .3rem 0; border-bottom: 1px solid #8882; }
@@ -285,6 +289,7 @@ PAGE = """<!doctype html>
   .dr-range-btn.sel { background: var(--card); color: var(--accent); box-shadow: 0 1px 3px rgba(0,0,0,.15); }
   .ticker-link { cursor: pointer; color: var(--accent); text-decoration: none; font-weight: 600; }
   .ticker-link:hover { text-decoration: underline; }
+/*SANDBOX_CSS*/
 </style></head>
 <body>
 <header>
@@ -356,149 +361,7 @@ PAGE = """<!doctype html>
 </section>
 
 <!-- ============================== SANDBOX =============================== -->
-<section class="panel" id="p-sandbox" hidden>
-  <div class="grid one">
-    <div class="card">
-      <h2>Arms <span class="hint" id="arms-when"></span></h2>
-      <p class="hint" style="margin:.1rem 0 .7rem">
-        Independent paper ledgers run against the same market snapshot on the same tick, so the
-        difference between them is the strategy rather than the weather. Compared on excess over each
-        arm's own S&amp;P shadow — raw equity is not comparable when arms are funded with different
-        amounts on different days.
-      </p>
-      <div class="scroll"><table class="tbl stack" id="arms-tbl">
-        <thead><tr>
-          <th>Arm</th><th>Engine</th><th>Model</th><th class="num">Equity</th><th class="num">Cash</th>
-          <th class="num">Return</th><th class="num">vs S&amp;P</th><th>State</th><th></th>
-        </tr></thead>
-        <tbody id="arms-body"><tr><td colspan="9" class="loading">loading…</td></tr></tbody>
-      </table></div>
-      <div class="hint" id="arms-spread" style="margin-top:.6rem"></div>
-
-      <div class="arm-edit" id="arm-edit" hidden>
-        <h2 style="margin-bottom:.5rem">Edit <span id="arm-edit-name"></span></h2>
-        <div class="fields">
-          <div>
-            <label for="a-label">Label</label>
-            <input id="a-label" autocomplete="off">
-          </div>
-          <div>
-            <label for="a-engine">Engine</label>
-            <select id="a-engine">
-              <option value="llm">llm — the analyst decides</option>
-              <option value="rules">rules — mechanical, no model</option>
-            </select>
-          </div>
-          <div>
-            <label for="a-model">Model <span class="hint">— blank = service default</span></label>
-            <input id="a-model" autocomplete="off" placeholder="e.g. claude-opus-5">
-          </div>
-          <div>
-            <label for="a-risk">Risk tolerance</label>
-            <select id="a-risk">
-              <option value="conservative">conservative</option>
-              <option value="balanced">balanced</option>
-              <option value="aggressive">aggressive</option>
-            </select>
-          </div>
-          <div>
-            <label for="a-maxnew">Max new positions / tick</label>
-            <input id="a-maxnew" type="number" min="0" max="20">
-          </div>
-          <div>
-            <label for="a-maxtrades">Max trades / tick</label>
-            <input id="a-maxtrades" type="number" min="0" max="20">
-          </div>
-          <div>
-            <label for="a-maxpos">Max position %</label>
-            <input id="a-maxpos" type="number" min="5" max="100" step="0.5">
-          </div>
-          <div>
-            <label for="a-floor">Cash floor %</label>
-            <input id="a-floor" type="number" min="0" max="90" step="0.5">
-          </div>
-          <div>
-            <label for="a-turnover">Max turnover %</label>
-            <input id="a-turnover" type="number" min="0" max="100" step="0.5">
-          </div>
-          <div>
-            <label for="a-conv">Min conviction</label>
-            <input id="a-conv" type="number" min="0" max="100">
-          </div>
-        </div>
-        <div class="row" style="margin-top:.9rem">
-          <button type="button" id="a-save">Save arm</button>
-          <button type="button" class="secondary" id="a-toggle">Pause</button>
-          <button type="button" class="secondary" id="a-cancel">Close</button>
-          <span style="flex:1"></span>
-          <button type="button" class="danger sm" id="a-delete">Delete arm</button>
-        </div>
-        <div id="a-status" class="hint" style="margin-top:.5rem"></div>
-        <p class="note" id="a-mainnote" hidden>
-          This is the real account. Its engine cannot be changed to <code>rules</code> here and it
-          cannot be deleted — create a separate arm for that.
-        </p>
-      </div>
-
-      <!-- Selected arm's holdings & today's activity -->
-      <div class="arm-edit" id="arm-details" hidden>
-        <h2 style="margin-bottom:.5rem">Positions &amp; Activity <span class="hint" id="arm-positions-count"></span></h2>
-        
-        <!-- Today's Orders / Skips -->
-        <div id="arm-today-box" style="margin-bottom:.9rem">
-          <div class="hint" style="font-weight:600;margin-bottom:.3rem">TODAY'S ACTIVITY</div>
-          <div id="arm-today-orders" class="hint">loading…</div>
-        </div>
-
-        <!-- Strategy Note -->
-        <div id="arm-note-box" style="margin-bottom:.9rem" hidden>
-          <div class="hint" style="font-weight:600;margin-bottom:.3rem">LATEST STRATEGY NOTE</div>
-          <p class="note" id="arm-note-text" style="margin:0"></p>
-        </div>
-
-        <!-- Holdings Table -->
-        <div class="hint" style="font-weight:600;margin-bottom:.3rem">CURRENT HOLDINGS</div>
-        <div class="scroll"><table class="tbl" id="arm-pos-tbl">
-          <thead><tr>
-            <th>Symbol</th><th class="num">Shares</th><th class="num">Avg Cost</th>
-            <th class="num">Last Price</th><th class="num">Value</th><th class="num">Unrealized</th>
-          </tr></thead>
-          <tbody id="arm-pos-body"><tr><td colspan="6" class="loading">loading…</td></tr></tbody>
-        </table></div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>New arm</h2>
-      <p class="hint" style="margin:.1rem 0 .7rem">
-        A clone starts from another arm's book — cash, positions and benchmark shadow — so the two
-        share a starting line and everything after it is attributable to the strategy rather than to
-        a head start. Change ONE thing per arm; an arm with two variables measures neither.
-      </p>
-      <div class="fields">
-        <div><label for="n-id">Id <span class="hint">— a-z 0-9 _ -</span></label>
-          <input id="n-id" autocomplete="off" placeholder="conservative"></div>
-        <div><label for="n-label">Label</label>
-          <input id="n-label" autocomplete="off" placeholder="Conservative analyst"></div>
-        <div><label for="n-engine">Engine</label>
-          <select id="n-engine">
-            <option value="llm">llm — the analyst decides</option>
-            <option value="rules">rules — mechanical, no model</option>
-          </select></div>
-        <div><label for="n-clone">Clone book from</label>
-          <select id="n-clone"></select></div>
-        <div><label for="n-model">Model <span class="hint">— blank = service default</span></label>
-          <input id="n-model" autocomplete="off"></div>
-        <div><label for="n-fund">Fund <span class="hint">— only if not cloning</span></label>
-          <input id="n-fund" type="number" min="0" step="100" value="0"></div>
-      </div>
-      <div class="row" style="margin-top:.9rem">
-        <button type="button" id="n-create">Create arm</button>
-        <span class="hint" id="n-status" style="flex:1"></span>
-      </div>
-    </div>
-  </div>
-</section>
+<!--SANDBOX_HTML-->
 
 <!-- =============================== SCAN ================================= -->
 <section class="panel" id="p-scan" hidden>
@@ -1184,12 +1047,12 @@ PAGE = """<!doctype html>
       t.setAttribute("aria-selected", on ? "true" : "false");
       $(t.dataset.panel).hidden = !on;
     });
-    if (location.hash.slice(1) !== id) history.replaceState(null, "", "#" + id);
+    if (location.hash.slice(1).split("/")[0] !== id) history.replaceState(null, "", "#" + id);
   }
   tabs.forEach(t => t.onclick = () => showTab(t.dataset.panel));
   // Deep-linkable, so "the sandbox page" can be bookmarked and a reload does not bounce to Overview.
-  showTab(tabs.some(t => t.dataset.panel === location.hash.slice(1))
-          ? location.hash.slice(1) : "p-overview");
+  const hash0 = location.hash.slice(1).split("/")[0];
+  showTab(tabs.some(t => t.dataset.panel === hash0) ? hash0 : "p-overview");
 
   // ---------------------------------------------------------------- ticker drawer & links
   const COMMON_WORDS = new Set(["A", "I", "AND", "OR", "THE", "NOT", "FOR", "IN", "ON", "AT", "TO", "IS", "ARE", "OF", "BY", "BUT", "BE", "SO", "DO", "IF", "NO", "WE", "MY", "HE", "UP", "AS", "IT", "AN", "ALL", "NEW", "MAX", "MIN", "NOW", "OFF", "SET", "GET", "PUT", "RUN", "DAY", "TOP", "LOW", "DIP", "BUY", "OUT"]);
@@ -1393,7 +1256,7 @@ PAGE = """<!doctype html>
   async function loadDrawerSandboxHolding(sym) {
     try {
       const holdings = [];
-      await Promise.all(ARMS.map(async a => {
+      await Promise.all(ARMS.filter(a => a.universe !== "options").map(async a => {
         try {
           const st = await (await afetch("/sandbox/state?arm=" + encodeURIComponent(a.arm))).json();
           const pos = (st.positions || []).find(p => p.symbol.toUpperCase() === sym);
@@ -1428,307 +1291,13 @@ PAGE = """<!doctype html>
     }
   }
 
-  async function loadArmDetails(id) {
-    const det = $("arm-details");
-    if (!det) return;
-    det.hidden = false;
-    $("arm-today-orders").innerHTML = '<span class="loading">loading today’s activity…</span>';
-    $("arm-pos-body").innerHTML = '<tr><td colspan="6" class="loading">loading positions…</td></tr>';
-    $("arm-note-box").hidden = true;
-
-    try {
-      const [st, td] = await Promise.all([
-        (await afetch("/sandbox/state?arm=" + encodeURIComponent(id))).json(),
-        (await afetch("/sandbox/today?show_options=true&arm=" + encodeURIComponent(id))).json().catch(() => ({orders: [], skipped: []})),
-      ]);
-
-      if (st.note && (st.note.notes || st.note.themes)) {
-        $("arm-note-box").hidden = false;
-        let txt = st.note.notes || "";
-        if (st.note.themes) txt += (txt ? " · " : "") + "Themes: " + st.note.themes;
-        $("arm-note-text").innerHTML = linkifyTickers(txt);
-      }
-
-      const orders = td.orders || [];
-      const skipped = td.skipped || [];
-      if (!orders.length && !skipped.length) {
-        $("arm-today-orders").innerHTML = '<span class="empty">No orders or skips recorded today</span>';
-      } else {
-        let html = "";
-        if (orders.length) {
-          html += orders.map(o => {
-            const isBuy = o.action === "BUY";
-            return '<div style="padding:.2rem 0;border-bottom:1px solid #8882">' +
-              '<span class="badge ' + (isBuy ? 'on' : 'cross') + '">' + esc(o.action) + '</span> ' +
-              '<b class="ticker-link" onclick="openTickerDrawer(\\'' + esc(o.symbol) + '\\')">' + esc(o.symbol) + '</b> ' +
-              o.shares + ' sh @ ' + money(o.price) +
-              (o.reason ? ' <span class="hint">— ' + linkifyTickers(o.reason) + '</span>' : '') +
-            '</div>';
-          }).join("");
-        }
-        if (skipped.length) {
-          html += skipped.map(s => {
-            return '<div style="padding:.2rem 0;color:var(--muted)">' +
-              '<span class="badge eng">SKIP ' + esc(s.action || "") + '</span> ' +
-              '<b class="ticker-link" onclick="openTickerDrawer(\\'' + esc(s.symbol) + '\\')">' + esc(s.symbol) + '</b>' +
-              (s.reason ? ' <span class="hint">— ' + linkifyTickers(s.reason) + '</span>' : '') +
-            '</div>';
-          }).join("");
-        }
-        $("arm-today-orders").innerHTML = html;
-      }
-
-      const pos = st.positions || [];
-      $("arm-positions-count").textContent = "· " + pos.length + " position" + (pos.length === 1 ? "" : "s");
-      if (!pos.length) {
-        $("arm-pos-body").innerHTML = '<tr><td colspan="6" class="empty">no positions currently held</td></tr>';
-      } else {
-        $("arm-pos-body").innerHTML = pos.map(p => {
-          const basis = p.shares * p.avg_cost;
-          const val = p.value || (p.price ? p.shares * p.price : basis);
-          const pnl = val - basis;
-          const up = pnl >= 0;
-          return '<tr>' +
-            '<td><b class="ticker-link" onclick="openTickerDrawer(\\'' + esc(p.symbol) + '\\')">' + esc(p.symbol) + '</b></td>' +
-            '<td class="num">' + p.shares + '</td>' +
-            '<td class="num">' + money(p.avg_cost) + '</td>' +
-            '<td class="num">' + money(p.price) + '</td>' +
-            '<td class="num">' + money(val) + '</td>' +
-            '<td class="num ' + (up ? 'pos' : 'neg') + '">' + (up ? '+' : '') + money(pnl) + (p.unrealized_pct != null ? ' (' + (up ? '+' : '') + p.unrealized_pct.toFixed(2) + '%)' : '') + '</td>' +
-          '</tr>';
-        }).join("");
-      }
-    } catch (e) {
-      $("arm-pos-body").innerHTML = '<tr><td colspan="6" class="err-t">could not load positions: ' + esc(e.message) + '</td></tr>';
-    }
-  }
-
-  // ---------------------------------------------------------------- arms
-  let ARMS = [], selArm = null;
-
-  const armPct = (v, dp) => (v === null || v === undefined) ? "—"
-        : (v >= 0 ? "+" : "") + v.toFixed(dp === undefined ? 2 : dp) + "%";
-  const armMoney = (v) => (v === null || v === undefined) ? "—"
-        : "$" + v.toLocaleString(undefined, {maximumFractionDigits: 0});
-
-  function armRow(a) {
-    const tr = document.createElement("tr");
-    if (a.arm === selArm) tr.className = "sel";
-    const vs = a.vs_benchmark_pct;
-    // An arm with no benchmark shadow yet has no comparable number. "—", never a confident 0.00%.
-    const vsCls = vs === null || vs === undefined ? "" : (vs >= 0 ? "pos" : "neg");
-    // `data-l` is what lets the phone layout drop the header row and still label every value — see
-    // `table.tbl.stack td::before`. The labels must match the <thead> text or the two layouts would
-    // be naming the same number differently.
-    tr.innerHTML =
-      '<td data-l="Arm"><b></b><div class="hint"></div></td>' +
-      '<td data-l="Engine"><span class="badge eng"></span></td>' +
-      '<td data-l="Model" class="hint"></td>' +
-      '<td data-l="Equity" class="num"></td><td data-l="Cash" class="num"></td>' +
-      '<td data-l="Return" class="num"></td><td data-l="vs S&amp;P" class="num ' + vsCls + '"></td>' +
-      '<td data-l="State"></td><td></td>';
-    const td = tr.children;
-    td[0].querySelector("b").textContent = a.label || a.arm;
-    td[0].querySelector(".hint").textContent = a.arm;
-    td[1].querySelector(".eng").textContent = a.engine;
-    td[2].textContent = a.model || "default";
-    td[3].textContent = armMoney(a.equity);
-    td[4].textContent = a.cash_pct === null || a.cash_pct === undefined ? "—" : a.cash_pct.toFixed(1) + "%";
-    td[5].textContent = armPct(a.total_return_pct);
-    td[6].textContent = vs === null || vs === undefined ? "—" : armPct(vs);
-    const st = document.createElement("span");
-    st.className = "badge " + (a.enabled ? "on" : "off");
-    st.textContent = a.enabled ? "live" : "paused";
-    td[7].appendChild(st);
-    const b = document.createElement("button");
-    b.className = "secondary sm"; b.textContent = "Edit";
-    b.onclick = () => selectArm(a.arm);
-    td[8].appendChild(b);
-    return tr;
-  }
-
-  async function loadArms() {
-    try {
-      const r = await (await afetch("/sandbox/arms?show_options=true")).json();
-      ARMS = r.arms || [];
-    } catch (e) {
-      $("arms-body").innerHTML = '<tr><td colspan="9" class="err-t">couldn’t load arms</td></tr>';
-      return;
-    }
-    // The per-arm model lives in settings, which /sandbox/arms does not carry. One extra fetch per
-    // arm keeps the column honest rather than showing "default" for an arm that has pinned one.
-    await Promise.all(ARMS.map(async a => {
-      try {
-        const s = await (await afetch("/sandbox/settings?arm=" + encodeURIComponent(a.arm))).json();
-        a._settings = s; a.model = s.model || null;
-      } catch (e) { a._settings = null; }
-    }));
-    const body = $("arms-body"); body.textContent = "";
-    if (!ARMS.length) {
-      body.innerHTML = '<tr><td colspan="9" class="empty">no arms</td></tr>';
-    } else {
-      ARMS.forEach(a => body.appendChild(armRow(a)));
-    }
-    const measured = ARMS.map(a => a.vs_benchmark_pct).filter(v => v !== null && v !== undefined);
-    $("arms-spread").textContent = measured.length >= 2
-      ? "Spread: " + (Math.max(...measured) - Math.min(...measured)).toFixed(2) +
-        " points between best and worst. Weeks, not ticks — this means nothing yet."
-      : "";
-    $("arms-when").textContent = ARMS.length
-      ? "last tick " + (ARMS[0].last_tick_date || "never") : "";
-    // Clone-source options, refreshed with the list so a deleted arm cannot linger as a choice.
-    const sel = $("n-clone"); const keep = sel.value;
-    sel.textContent = "";
-    const none = document.createElement("option"); none.value = ""; none.textContent = "— none (start empty) —";
-    sel.appendChild(none);
-    ARMS.forEach(a => {
-      const o = document.createElement("option");
-      o.value = a.arm; o.textContent = a.label || a.arm;
-      sel.appendChild(o);
-    });
-    sel.value = keep || "main";
-    if (selArm && !ARMS.some(a => a.arm === selArm)) closeArmEditor();
-  }
-
-  function closeArmEditor() {
-    selArm = null;
-    $("arm-edit").hidden = true;
-    if ($("arm-details")) $("arm-details").hidden = true;
-    loadArms();
-  }
-
-  function selectArm(id) {
-    const a = ARMS.find(x => x.arm === id); if (!a) return;
-    selArm = id;
-    const s = a._settings || {};
-    $("arm-edit").hidden = false;
-    $("arm-edit-name").textContent = (a.label || a.arm) + " (" + a.arm + ")";
-    $("a-label").value = a.label || "";
-    $("a-engine").value = a.engine || "llm";
-    $("a-model").value = s.model || "";
-    $("a-risk").value = s.risk_tolerance || "balanced";
-    $("a-maxnew").value = s.max_new_positions_per_tick ?? "";
-    $("a-maxtrades").value = s.max_trades_per_tick ?? "";
-    $("a-maxpos").value = s.max_position_pct ?? "";
-    $("a-floor").value = s.cash_floor_pct ?? "";
-    $("a-turnover").value = s.max_turnover_pct ?? "";
-    $("a-conv").value = s.min_conviction_to_trade ?? "";
-    $("a-toggle").textContent = a.enabled ? "Pause" : "Resume";
-    // main is the real account: it is not deletable, and flipping it to the mechanical engine would
-    // silently retire the analyst on the book that matters rather than on a control arm.
-    const isMain = a.arm === "main";
-    $("a-delete").style.display = isMain ? "none" : "";
-    $("a-engine").disabled = isMain;
-    $("a-mainnote").hidden = !isMain;
-    $("a-status").textContent = "";
-    loadArms();
-    loadArmDetails(id);
-    $("arm-edit").scrollIntoView({behavior: "smooth", block: "nearest"});
-  }
-
-  async function saveArm() {
-    if (!selArm) return;
-    const st = $("a-status"); st.textContent = "saving…"; st.className = "hint";
-    const num = (id) => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
-    const patch = {
-      label: $("a-label").value.trim() || null,
-      model: $("a-model").value.trim(),          // "" clears the pin back to the service default
-      risk_tolerance: $("a-risk").value,
-      max_new_positions_per_tick: num("a-maxnew"),
-      max_trades_per_tick: num("a-maxtrades"),
-      max_position_pct: num("a-maxpos"),
-      cash_floor_pct: num("a-floor"),
-      max_turnover_pct: num("a-turnover"),
-      min_conviction_to_trade: num("a-conv"),
-    };
-    if (!$("a-engine").disabled) patch.engine = $("a-engine").value;
-    try {
-      const r = await afetch("/sandbox/settings?arm=" + encodeURIComponent(selArm),
-        {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch)});
-      if (!r.ok) throw new Error(((await r.json().catch(() => ({}))).detail) || r.status);
-      st.textContent = "✓ saved"; st.className = "ok-t";
-      await loadArms();
-    } catch (e) { st.textContent = "✗ " + e.message; st.className = "err-t"; }
-  }
-
-  async function toggleArm() {
-    if (!selArm) return;
-    const a = ARMS.find(x => x.arm === selArm); if (!a) return;
-    const st = $("a-status"); st.textContent = "…"; st.className = "hint";
-    try {
-      const r = await afetch("/sandbox/settings?arm=" + encodeURIComponent(selArm),
-        {method: "POST", headers: {"Content-Type": "application/json"},
-         body: JSON.stringify({master_enabled: !a.enabled})});
-      if (!r.ok) throw new Error(r.status);
-      st.textContent = a.enabled ? "paused" : "resumed"; st.className = "ok-t";
-      await loadArms();
-      const nx = ARMS.find(x => x.arm === selArm);
-      if (nx) $("a-toggle").textContent = nx.enabled ? "Pause" : "Resume";
-    } catch (e) { st.textContent = "✗ failed"; st.className = "err-t"; }
-  }
-
-  async function deleteArm() {
-    if (!selArm || selArm === "main") return;
-    // Irreversible and it takes the arm's whole history with it, so it asks — and names the arm,
-    // because "are you sure?" on the wrong row is how the wrong book gets deleted.
-    if (!confirm("Delete arm '" + selArm + "' and its entire trade history? This cannot be undone."))
-      return;
-    const st = $("a-status"); st.textContent = "deleting…"; st.className = "hint";
-    try {
-      const r = await afetch("/sandbox/arms/" + encodeURIComponent(selArm), {method: "DELETE"});
-      if (!r.ok) throw new Error(((await r.json().catch(() => ({}))).detail) || r.status);
-      closeArmEditor();
-    } catch (e) { st.textContent = "✗ " + e.message; st.className = "err-t"; }
-  }
-
-  async function createArm() {
-    const st = $("n-status"); const btn = $("n-create");
-    const id = $("n-id").value.trim().toLowerCase();
-    if (!id) { st.textContent = "an id is required"; st.className = "err-t"; return; }
-    btn.disabled = true; st.textContent = "creating…"; st.className = "hint";
-    const clone = $("n-clone").value || null;
-    const body = {
-      arm: id,
-      engine: $("n-engine").value,
-      label: $("n-label").value.trim() || null,
-      clone_from: clone,
-      // Funding a clone on top of the copied book would double-count it — the clone already carries
-      // the source's cash and its benchmark shadow.
-      fund: clone ? 0 : Number($("n-fund").value || 0),
-      enabled: true,
-    };
-    const model = $("n-model").value.trim();
-    try {
-      const r = await afetch("/sandbox/arms",
-        {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
-      if (!r.ok) throw new Error(((await r.json().catch(() => ({}))).detail) || r.status);
-      if (model) {
-        await afetch("/sandbox/settings?arm=" + encodeURIComponent(id),
-          {method: "POST", headers: {"Content-Type": "application/json"},
-           body: JSON.stringify({model: model})});
-      }
-      st.textContent = "✓ created"; st.className = "ok-t";
-      $("n-id").value = ""; $("n-label").value = ""; $("n-model").value = "";
-      await loadArms();
-    } catch (e) { st.textContent = "✗ " + e.message; st.className = "err-t"; }
-    finally { btn.disabled = false; }
-  }
-
-  $("a-save").onclick = saveArm;
-  $("a-toggle").onclick = toggleArm;
-  $("a-cancel").onclick = closeArmEditor;
-  $("a-delete").onclick = deleteArm;
-  $("n-create").onclick = createArm;
-  // Funding is meaningless for a clone; grey it out rather than silently ignoring what was typed.
-  $("n-clone").onchange = () => {
-    const cloning = !!$("n-clone").value;
-    $("n-fund").disabled = cloning;
-    $("n-fund").title = cloning ? "a clone already carries the source arm's cash" : "";
-  };
-
-  loadArms();
-  setInterval(loadArms, 60000);
+/*SANDBOX_JS*/
 
 </script>
 </body></html>
 """
+
+# The Sandbox tab lives in dashboard_sandbox.py (raw strings, so its JS needs no Python escaping).
+PAGE = (PAGE.replace("<!--SANDBOX_HTML-->", _sbx.HTML)
+            .replace("/*SANDBOX_CSS*/", _sbx.CSS)
+            .replace("/*SANDBOX_JS*/", _sbx.JS))
