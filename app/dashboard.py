@@ -562,29 +562,68 @@ PAGE = """<!doctype html>
   //
   // Kept in localStorage rather than a cookie: a cookie would be sent automatically on every
   // request including cross-site ones, and this page has no CSRF protection to go with it.
-  function apiToken() { try { return localStorage.getItem("signals_token") || ""; } catch (e) { return ""; } }
-  function setApiToken(t) { try { localStorage.setItem("signals_token", (t || "").trim()); } catch (e) {} }
+  // The token is kept in localStorage; if the browser refuses storage (a private window, blocked
+  // site data) it falls back to sessionStorage, then to memory, and says so instead of looping.
+  let MEM_TOKEN = "";
+  function apiToken() {
+    try { const t = localStorage.getItem("signals_token"); if (t) return t; } catch (e) {}
+    try { const t = sessionStorage.getItem("signals_token"); if (t) return t; } catch (e) {}
+    return MEM_TOKEN;
+  }
+  function setApiToken(t) {
+    MEM_TOKEN = t;
+    try { localStorage.setItem("signals_token", t); if (localStorage.getItem("signals_token") === t) return "kept"; } catch (e) {}
+    try { sessionStorage.setItem("signals_token", t); if (sessionStorage.getItem("signals_token") === t) return "session"; } catch (e) {}
+    return "memory";
+  }
+  // Accept what people actually paste: the whole .env line, quotes, spaces or a line break.
+  function cleanToken(raw) {
+    let t = String(raw || "").trim();
+    const eq = t.indexOf("=");
+    if (t.toUpperCase().startsWith("SIGNALS_API_TOKEN") && eq > 0) t = t.slice(eq + 1);
+    if (t.toLowerCase().startsWith("bearer ")) t = t.slice(7);
+    return t.split("").filter(c => c > " " && c !== '"' && c !== "'").join("");
+  }
   async function afetch(url, opts) {
     const o = Object.assign({}, opts || {});
     const t = apiToken();
     if (t) { o.headers = Object.assign({}, o.headers || {}, { "Authorization": "Bearer " + t }); }
     const r = await fetch(url, o);
-    if (r.status === 401) { showTokenPrompt(); }
+    if (r.status === 401) { showTokenPrompt(!!t); }
     return r;
   }
-  function showTokenPrompt() {
+  function showTokenPrompt(hadToken) {
     if (document.getElementById("tokbar")) return;
     const bar = document.createElement("div");
     bar.id = "tokbar";
-    bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#B0872B;color:#0D1116;padding:10px 14px;font:14px system-ui;display:flex;gap:8px;align-items:center";
-    bar.innerHTML = '<span>This dashboard needs the access token (SIGNALS_API_TOKEN on the container).</span>'
-      + '<input id="tokin" type="password" placeholder="paste token" style="flex:0 1 320px;padding:4px 8px">'
-      + '<button id="toksave" style="padding:4px 10px">Save</button>';
+    bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#C99A35;color:#0D1116;padding:10px 14px;font:14px system-ui;display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+    bar.innerHTML = '<span id="tokmsg"></span>'
+      + '<input id="tokin" type="password" autocomplete="off" placeholder="paste the token" style="flex:0 1 320px;padding:4px 8px;color:#0D1116;background:#fff;border:0;border-radius:4px">'
+      + '<button id="toksave" style="padding:4px 12px">Save token</button>';
     document.body.appendChild(bar);
-    document.getElementById("toksave").onclick = function () {
-      setApiToken(document.getElementById("tokin").value);
-      location.reload();
+    const msg = document.getElementById("tokmsg");
+    msg.textContent = hadToken
+      ? "The saved access token was refused. Paste it again (SIGNALS_API_TOKEN in /opt/signals/.env on the container)."
+      : "This dashboard needs the access token (SIGNALS_API_TOKEN in /opt/signals/.env on the container).";
+    const save = async function () {
+      const t = cleanToken(document.getElementById("tokin").value);
+      if (!t) { msg.textContent = "Paste the token first."; return; }
+      msg.textContent = "Checking…";
+      let ok = false;
+      try { ok = (await fetch("/api/settings", { headers: { "Authorization": "Bearer " + t } })).ok; } catch (e) {}
+      if (!ok) { msg.textContent = "That token was refused (" + t.length + " characters). Copy only the part after SIGNALS_API_TOKEN= and try again."; return; }
+      const where = setApiToken(t);
+      if (where === "kept") { location.reload(); return; }
+      msg.textContent = where === "session"
+        ? "Token accepted, but this browser only keeps it until the tab closes (site data is restricted)."
+        : "Token accepted, but this browser won't store it (private window or blocked site data). It works until you reload.";
+      document.getElementById("tokin").remove(); document.getElementById("toksave").remove();
+      setTimeout(() => bar.remove(), 6000);
+      if (typeof loadStatus === "function") { try { loadStatus(); } catch (e) {} }
+      if (typeof bootSandbox === "function") { try { bootSandbox(); } catch (e) {} }
     };
+    document.getElementById("toksave").onclick = save;
+    document.getElementById("tokin").onkeydown = (e) => { if (e.key === "Enter") save(); };
   }
   const $ = (id) => document.getElementById(id);
 
