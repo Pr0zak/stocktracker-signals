@@ -24,6 +24,7 @@ unchanged, so the existing script keeps driving them.
 from __future__ import annotations
 
 from . import dashboard_sandbox as _sbx
+from . import dashboard_station as _stn
 
 PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -290,14 +291,16 @@ PAGE = """<!doctype html>
   .ticker-link { cursor: pointer; color: var(--accent); text-decoration: none; font-weight: 600; }
   .ticker-link:hover { text-decoration: underline; }
 /*SANDBOX_CSS*/
+/*STATION_CSS*/
 </style></head>
 <body>
 <header>
   <div class="head-in">
     <h1>StockTracker Signals</h1>
-    <p class="sub">Tier-2 Claude analyst — operations &amp; configuration</p>
+    <p class="sub">Your market station, the paper-trading sandbox, and the server that runs them</p>
     <div class="tabs" role="tablist">
-      <button class="tab" role="tab" data-panel="p-overview" aria-selected="true">Overview</button>
+      <button class="tab" role="tab" data-panel="p-station" aria-selected="true">Station</button>
+      <button class="tab" role="tab" data-panel="p-overview" aria-selected="false">Server</button>
       <button class="tab" role="tab" data-panel="p-sandbox" aria-selected="false">Sandbox</button>
       <button class="tab" role="tab" data-panel="p-scan" aria-selected="false">Scan</button>
       <button class="tab" role="tab" data-panel="p-settings" aria-selected="false">Settings</button>
@@ -308,7 +311,7 @@ PAGE = """<!doctype html>
 <div class="wrap">
 
 <!-- ============================== OVERVIEW ============================== -->
-<section class="panel" id="p-overview">
+<section class="panel" id="p-overview" hidden>
   <div class="grid">
     <div class="card span2" id="status-card">
       <h2>Status <span class="hint" id="uptime"></span></h2>
@@ -359,6 +362,9 @@ PAGE = """<!doctype html>
     </div>
   </div>
 </section>
+
+<!-- ============================== STATION =============================== -->
+<!--STATION_HTML-->
 
 <!-- ============================== SANDBOX =============================== -->
 <!--SANDBOX_HTML-->
@@ -1091,11 +1097,13 @@ PAGE = """<!doctype html>
       $(t.dataset.panel).hidden = !on;
     });
     if (location.hash.slice(1).split("/")[0] !== id) history.replaceState(null, "", "#" + id);
+    document.body.dataset.tab = id;
+    document.dispatchEvent(new CustomEvent("tabshown", { detail: id }));
   }
   tabs.forEach(t => t.onclick = () => showTab(t.dataset.panel));
   // Deep-linkable, so "the sandbox page" can be bookmarked and a reload does not bounce to Overview.
   const hash0 = location.hash.slice(1).split("/")[0];
-  showTab(tabs.some(t => t.dataset.panel === hash0) ? hash0 : "p-overview");
+  showTab(tabs.some(t => t.dataset.panel === hash0) ? hash0 : "p-station");
 
   // ---------------------------------------------------------------- ticker drawer & links
   const COMMON_WORDS = new Set(["A", "I", "AND", "OR", "THE", "NOT", "FOR", "IN", "ON", "AT", "TO", "IS", "ARE", "OF", "BY", "BUT", "BE", "SO", "DO", "IF", "NO", "WE", "MY", "HE", "UP", "AS", "IT", "AN", "ALL", "NEW", "MAX", "MIN", "NOW", "OFF", "SET", "GET", "PUT", "RUN", "DAY", "TOP", "LOW", "DIP", "BUY", "OUT"]);
@@ -1335,6 +1343,7 @@ PAGE = """<!doctype html>
   }
 
 /*SANDBOX_JS*/
+/*STATION_JS*/
 
 </script>
 </body></html>
@@ -1343,4 +1352,7 @@ PAGE = """<!doctype html>
 # The Sandbox tab lives in dashboard_sandbox.py (raw strings, so its JS needs no Python escaping).
 PAGE = (PAGE.replace("<!--SANDBOX_HTML-->", _sbx.HTML)
             .replace("/*SANDBOX_CSS*/", _sbx.CSS)
-            .replace("/*SANDBOX_JS*/", _sbx.JS))
+            .replace("/*SANDBOX_JS*/", _sbx.JS)
+            .replace("<!--STATION_HTML-->", _stn.HTML)
+            .replace("/*STATION_CSS*/", _stn.CSS)
+            .replace("/*STATION_JS*/", _stn.JS))

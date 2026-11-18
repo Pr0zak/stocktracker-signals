@@ -6451,6 +6451,32 @@ async def daily_pick_settings_post(req: DailyPickSettingsRequest) -> dict:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
 
+# --- Station: the dashboard's user-built widget layout (Zote ytik5yyk) --------------------------------
+
+from . import station_store  # noqa: E402 — grouped with the feature it serves
+
+
+@app.get("/station/layout", dependencies=[Depends(require_api_token)])
+async def station_layout_get() -> dict:
+    """The saved Station layout, or `{"saved": false}` when none has been saved yet. Token-gated
+    because a layout names the symbols the user watches."""
+    doc = station_store.load()
+    return {"saved": False} if doc is None else {"saved": True, **doc}
+
+
+@app.post("/station/layout", dependencies=[Depends(require_api_token)])
+async def station_layout_post(request: Request) -> dict:
+    """Replace the Station layout. 422 names what was wrong with it."""
+    try:
+        body = await request.json()
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail="the body must be JSON") from e
+    try:
+        return {"saved": True, **station_store.save(body)}
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+
 # --- RPT-1: the weekly and monthly report -------------------------------------------------------------
 
 from . import report, report_job  # noqa: E402 — grouped with the feature it serves
