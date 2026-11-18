@@ -983,7 +983,7 @@ PAGE = """<!doctype html>
     });
     if (SCAN_SORT) {
       const k = SCAN_SORT, val = (r) => k === "signal" ? (SIG_RANK[r.signal] ?? 9) : k === "below_200wma" ? (r[k] ? 0 : 1)
-        : k === "conviction" ? -(r[k] ?? -1) : String(r[k] ?? "~");
+        : k === "conviction" ? (r[k] ?? -1) : String(r[k] ?? "~");
       rows = rows.slice().sort((a, b) => { const x = val(a), y = val(b); return (x < y ? -1 : x > y ? 1 : 0) * SCAN_DIR; });
     }
     document.querySelectorAll(".scan-sort").forEach((b) => b.setAttribute("aria-sort", b.dataset.k === SCAN_SORT ? (SCAN_DIR > 0 ? "ascending" : "descending") : "none"));
@@ -1008,7 +1008,7 @@ PAGE = """<!doctype html>
     renderScanTable();
   });
   document.querySelectorAll(".scan-sort").forEach((b) => b.onclick = () => {
-    if (SCAN_SORT === b.dataset.k) SCAN_DIR = -SCAN_DIR; else { SCAN_SORT = b.dataset.k; SCAN_DIR = 1; }
+    if (SCAN_SORT === b.dataset.k) SCAN_DIR = -SCAN_DIR; else { SCAN_SORT = b.dataset.k; SCAN_DIR = SCAN_SORT === "conviction" ? -1 : 1; }
     renderScanTable();
   });
   $("scan-q").oninput = renderScanTable;
