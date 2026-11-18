@@ -598,9 +598,13 @@ PAGE = """<!doctype html>
     bar.id = "tokbar";
     bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#C99A35;color:#0D1116;padding:10px 14px;font:14px system-ui;display:flex;gap:8px;align-items:center;flex-wrap:wrap";
     bar.innerHTML = '<span id="tokmsg"></span>'
-      + '<input id="tokin" type="password" autocomplete="off" placeholder="paste the token" style="flex:0 1 320px;padding:4px 8px;color:#0D1116;background:#fff;border:0;border-radius:4px">'
+      + '<input id="tokin" type="text" name="signals-access-token" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore placeholder="paste the token" style="flex:0 1 320px;padding:4px 8px;color:#0D1116;background:#fff;border:0;border-radius:4px;-webkit-text-security:disc">'
       + '<button id="toksave" style="padding:4px 12px">Save token</button>';
     document.body.appendChild(bar);
+    // A refused saved token is dropped, so the next paste starts clean. The field is a masked TEXT
+    // input, not type=password: a browser's password manager otherwise refills the first (wrong)
+    // value on every retry, which is exactly how one bad paste became a loop on 2026-11-18.
+    if (hadToken) { MEM_TOKEN = ""; try { localStorage.removeItem("signals_token"); } catch (e) {} try { sessionStorage.removeItem("signals_token"); } catch (e) {} }
     const msg = document.getElementById("tokmsg");
     msg.textContent = hadToken
       ? "The saved access token was refused. Paste it again (SIGNALS_API_TOKEN in /opt/signals/.env on the container)."

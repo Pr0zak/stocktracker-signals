@@ -98,6 +98,14 @@ async def require_api_token(request: Request) -> None:
     scheme, _, presented = (request.headers.get("authorization") or "").partition(" ")
     valid = bool(expected) and scheme.lower() == "bearer" and hmac.compare_digest(presented, expected)
     if not valid:
+        # Says WHY without disclosing anything: whether a header arrived, its scheme, the length and
+        # a 12-hex-digit hash of what was presented, so "refused" can be told apart from "never sent"
+        # and a wrong copy from a stripped header, by comparing with the expected token's hash.
+        import hashlib
+        _log.warning("api token refused for %s %s from %s: header=%s scheme=%r len=%d sha=%s",
+                     request.method, request.url.path, request.client.host if request.client else "?",
+                     bool(request.headers.get("authorization")), scheme, len(presented),
+                     hashlib.sha256(presented.encode()).hexdigest()[:12] if presented else "-")
         raise HTTPException(status_code=401, detail="missing or invalid API token")
 
 
